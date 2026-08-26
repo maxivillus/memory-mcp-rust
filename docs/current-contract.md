@@ -529,8 +529,10 @@ release acceptance is limited to real-service migration/isolation/conflict/
 lag/backoff measurements, the formatter/test/lint/AppSec/artifact/QA/PM gates,
 and a separate performance decision. No speedup claim is made here.
 
-The proposed architecture and recovery protocol are recorded in
-`docs/decisions/ADR-0001-redis-primary-with-sqlite-fallback.md`; its status
-remains Proposed until PM/TechLead acceptance. A reachable Redis endpoint now
-selects the coordinator's Redis-primary snapshot mode, and an unavailable
-endpoint falls back to SQLite without enabling a partial fact-only route.
+The architecture and recovery protocol are recorded in
+`docs/decisions/ADR-0001-redis-primary-with-sqlite-fallback.md`. The ADR is
+accepted for this implementation slice after the PM, QA, AppSec, artifact, and
+release readbacks. A reachable Redis endpoint now selects the coordinator's
+Redis-primary snapshot mode, and an unavailable endpoint falls back to SQLite
+without enabling a partial fact-only route; the recorded benchmark makes no
+speedup claim for this snapshot workload.
