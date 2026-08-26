@@ -475,6 +475,26 @@ pub struct EmbeddingBackfill {
     pub reason: String,
 }
 
+/// A stored vector together with the fact it belongs to.  The vector is kept
+/// out of `Fact` so the normal Redis/native projection remains small and
+/// backwards compatible with the pre-provider schema.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FactEmbedding {
+    pub fact: Fact,
+    pub vector: Vec<f32>,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactSearchMetadata {
+    pub category: Option<String>,
+    pub confirmed: bool,
+    pub invalid_at: String,
+    pub archived: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct AnchoredSearch {
     pub decisions: Vec<Decision>,
@@ -584,6 +604,7 @@ impl Deref for ConnectionSlot {
 pub struct Store {
     connection: ConnectionSlot,
     database_path: RefCell<Option<PathBuf>>,
+    default_database_path: RefCell<Option<PathBuf>>,
     database_root: Option<PathBuf>,
     memory_database_name: RefCell<Option<String>>,
 }
@@ -668,6 +689,7 @@ impl Store {
         let in_memory = database_path.is_none();
         let store = Self {
             connection: ConnectionSlot::new(connection),
+            default_database_path: RefCell::new(database_path.clone()),
             database_path: RefCell::new(database_path),
             database_root,
             memory_database_name: RefCell::new(in_memory.then(|| "memory".to_owned())),
@@ -694,6 +716,12 @@ impl Store {
                 strong INTEGER NOT NULL DEFAULT 0,
                 importance REAL NOT NULL DEFAULT 0.5,
                 lifecycle TEXT NOT NULL DEFAULT 'active',
+                invalid_at TEXT NOT NULL DEFAULT '',
+                superseded_by INTEGER,
+                confirmed INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                archived INTEGER NOT NULL DEFAULT 0,
+                revival_count INTEGER NOT NULL DEFAULT 0,
                 workspace_id TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(sha256, workspace_id)
@@ -1067,6 +1095,12 @@ impl Store {
             ("session_id", "TEXT NOT NULL DEFAULT ''"),
             ("access_count", "INTEGER NOT NULL DEFAULT 0"),
             ("last_accessed_at", "TEXT"),
+            ("invalid_at", "TEXT NOT NULL DEFAULT ''"),
+            ("superseded_by", "INTEGER"),
+            ("confirmed", "INTEGER NOT NULL DEFAULT 0"),
+            ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+            ("archived", "INTEGER NOT NULL DEFAULT 0"),
+            ("revival_count", "INTEGER NOT NULL DEFAULT 0"),
             ("lifecycle", "TEXT NOT NULL DEFAULT 'active'"),
             ("workspace_id", "TEXT NOT NULL DEFAULT ''"),
             // SQLite requires a constant default for ALTER TABLE ADD COLUMN.
@@ -1476,6 +1510,21 @@ impl Store {
         Ok(fact)
     }
 
+    pub fn fact_exists(&self, text: &str, workspace: &str) -> Result<bool, StoreError> {
+        let hash = sha256(text);
+        self.fact_by_hash(&hash, workspace)
+            .map(|fact| fact.is_some())
+    }
+
+    /// Resolve the durable id of an existing fact without exposing the
+    /// private lookup implementation to the pipeline/protocol adapters.
+    /// Hash lookup is the same identity rule used by `remember_fact`, so
+    /// absorb previews and commits cannot report a made-up duplicate id.
+    pub fn fact_id_for_text(&self, text: &str, workspace: &str) -> Result<Option<i64>, StoreError> {
+        let hash = sha256(text);
+        Ok(self.fact_by_hash(&hash, workspace)?.map(|fact| fact.id))
+    }
+
     pub fn absorb(&self, texts: &[String], workspace: &str) -> Result<Vec<Fact>, StoreError> {
         texts
             .iter()
@@ -1868,11 +1917,17 @@ impl Store {
         let Some(existing) = self.fact_by_id(id, workspace)? else {
             return Ok(None);
         };
-        if existing.validity != "valid" || existing.lifecycle != "active" {
-            self.connection.execute(
-                "UPDATE facts SET validity = 'valid', lifecycle = 'active' WHERE id = ?1",
-                params![id],
-            )?;
+        self.connection.execute(
+            "UPDATE facts
+             SET validity = 'valid', lifecycle = 'active', confirmed = 1,
+                 trust = 'high', updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1",
+            params![id],
+        )?;
+        if existing.validity != "valid"
+            || existing.lifecycle != "active"
+            || existing.trust != "high"
+        {
             self.record_fact_history(
                 id,
                 "confirmed",
@@ -1883,6 +1938,25 @@ impl Store {
             )?;
         }
         self.fact_by_id(id, workspace)
+    }
+
+    /// Return the SQLite timestamp used by context and handoff TTLs.  Keeping
+    /// the calculation in SQLite avoids a second clock format implementation
+    /// in the protocol layer and matches the store's validation rules.
+    pub fn expiry_after_seconds(&self, seconds: i64) -> Result<Option<String>, StoreError> {
+        if seconds < 0 {
+            return Err(StoreError::Invalid(
+                "ttl_seconds must not be negative".to_owned(),
+            ));
+        }
+        self.connection
+            .query_row(
+                "SELECT datetime('now', ?1)",
+                params![format!("+{seconds} seconds")],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .map_err(StoreError::from)
     }
 
     pub fn sweep_freshness(
@@ -1939,6 +2013,233 @@ impl Store {
             reason: "no embedding provider is configured; SQLite lexical retrieval remains active"
                 .to_owned(),
         })
+    }
+
+    /// Store one normalized provider vector after the fact transaction has
+    /// committed.  Embedding failures therefore never roll back or partially
+    /// commit the fact itself.
+    pub fn upsert_fact_embedding(
+        &self,
+        fact_id: i64,
+        vector: &[f32],
+        model: &str,
+        workspace: &str,
+    ) -> Result<(), StoreError> {
+        validate_graph_workspace(workspace)?;
+        if vector.is_empty() {
+            return Err(StoreError::Invalid(
+                "fact embedding vector must not be empty".to_owned(),
+            ));
+        }
+        if model.trim().is_empty() {
+            return Err(StoreError::Invalid(
+                "fact embedding model must not be empty".to_owned(),
+            ));
+        }
+        if self.fact_by_id(fact_id, workspace)?.is_none() {
+            return Err(StoreError::Invalid(format!("fact not found: {fact_id}")));
+        }
+        let bytes = vector
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        self.connection.execute(
+            "INSERT INTO fact_embeddings (fact_id, vector, model)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(fact_id) DO UPDATE SET vector=excluded.vector, model=excluded.model,
+                 created_at=CURRENT_TIMESTAMP",
+            params![fact_id, bytes, model],
+        )?;
+        Ok(())
+    }
+
+    /// Return facts without a vector, bounded to the provider batch size.
+    pub fn missing_fact_texts(
+        &self,
+        workspace: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, String)>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT f.id, f.text
+             FROM facts f
+             WHERE f.lifecycle != 'forgotten'
+               AND f.validity != 'invalid'
+               AND (f.workspace_id = '' OR f.workspace_id = ?1)
+               AND NOT EXISTS (SELECT 1 FROM fact_embeddings e WHERE e.fact_id = f.id)
+             ORDER BY f.id
+             LIMIT ?2",
+        )?;
+        let result = statement
+            .query_map(params![workspace, limit as i64], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from);
+        result
+    }
+
+    /// Read the current vector set without exposing SQLite internals to the
+    /// provider or protocol modules.
+    pub fn fact_embeddings(&self, workspace: &str) -> Result<Vec<FactEmbedding>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        let mut statement = self.connection.prepare(
+            "SELECT e.fact_id, e.vector, e.model
+             FROM fact_embeddings e
+             JOIN facts f ON f.id = e.fact_id
+             WHERE (f.workspace_id = '' OR f.workspace_id = ?1)
+             ORDER BY e.fact_id",
+        )?;
+        let rows = statement
+            .query_map(params![workspace], |row| {
+                let fact_id = row.get::<_, i64>(0)?;
+                let bytes = row.get::<_, Vec<u8>>(1)?;
+                let model = row.get::<_, String>(2)?;
+                Ok((fact_id, bytes, model))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut embeddings = Vec::with_capacity(rows.len());
+        for (fact_id, bytes, model) in rows {
+            let Some(fact) = self.fact_by_id(fact_id, workspace)? else {
+                continue;
+            };
+            if bytes.len() % std::mem::size_of::<f32>() != 0 {
+                return Err(StoreError::Invalid(format!(
+                    "fact embedding {fact_id} has an invalid byte length"
+                )));
+            }
+            let vector = bytes
+                .chunks_exact(std::mem::size_of::<f32>())
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect::<Vec<_>>();
+            embeddings.push(FactEmbedding {
+                fact,
+                vector,
+                model,
+            });
+        }
+        Ok(embeddings)
+    }
+
+    /// Assign an idempotent category to a fact.  Rules and the LLM pipeline
+    /// both use this seam, keeping category writes in the active backend.
+    pub fn set_fact_category(
+        &self,
+        fact_id: i64,
+        category: &str,
+        workspace: &str,
+    ) -> Result<Option<Fact>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        let category = category.trim();
+        if category.is_empty() {
+            return self.fact_by_id(fact_id, workspace);
+        }
+        let category_row = self.create_category(category, workspace)?;
+        if self.fact_by_id(fact_id, workspace)?.is_none() {
+            return Ok(None);
+        }
+        self.connection.execute(
+            "UPDATE facts SET category_id = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            params![category_row.id, fact_id],
+        )?;
+        self.fact_by_id(fact_id, workspace)
+    }
+
+    /// Mark an older fact invalid while retaining its row and history.  This
+    /// is the Rust equivalent of Python's bi-temporal supersession hook.
+    pub fn invalidate_fact(
+        &self,
+        old_id: i64,
+        new_id: i64,
+        workspace: &str,
+        reason: &str,
+    ) -> Result<bool, StoreError> {
+        validate_graph_workspace(workspace)?;
+        if old_id <= 0 || new_id <= 0 || old_id == new_id {
+            return Ok(false);
+        }
+        let Some(existing) = self.fact_by_id(old_id, workspace)? else {
+            return Ok(false);
+        };
+        if existing.strong {
+            return Ok(false);
+        }
+        self.connection.execute(
+            "UPDATE facts
+             SET validity = 'invalid', invalid_at = CURRENT_TIMESTAMP,
+                 superseded_by = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND (workspace_id = '' OR workspace_id = ?)",
+            params![new_id, old_id, workspace],
+        )?;
+        self.record_fact_history(
+            old_id,
+            "invalidated",
+            &existing.lifecycle,
+            &existing.lifecycle,
+            reason,
+            &existing.workspace,
+        )?;
+        Ok(true)
+    }
+
+    pub fn fact_by_id_for_pipeline(
+        &self,
+        id: i64,
+        workspace: &str,
+    ) -> Result<Option<Fact>, StoreError> {
+        self.fact_by_id(id, workspace)
+    }
+
+    /// Read a fact by its content hash for protocol/provider adapters without
+    /// exposing the store's private query helpers.
+    pub fn fact_by_sha256_for_pipeline(
+        &self,
+        hash: &str,
+        workspace: &str,
+    ) -> Result<Option<Fact>, StoreError> {
+        self.fact_by_hash(hash, workspace)
+    }
+
+    pub fn fact_search_metadata(
+        &self,
+        fact_id: i64,
+        workspace: &str,
+    ) -> Result<Option<FactSearchMetadata>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        self.connection
+            .query_row(
+                "SELECT c.name, f.confirmed, f.invalid_at, f.archived,
+                        f.created_at, f.updated_at
+                 FROM facts f
+                 LEFT JOIN categories c ON c.id = f.category_id
+                 WHERE f.id = ?1 AND (f.workspace_id = '' OR f.workspace_id = ?2)",
+                params![fact_id, workspace],
+                |row| {
+                    Ok(FactSearchMetadata {
+                        category: row.get(0)?,
+                        confirmed: row.get::<_, i64>(1)? != 0,
+                        invalid_at: row.get(2)?,
+                        archived: row.get::<_, i64>(3)? != 0,
+                        created_at: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn category_name_for_fact(
+        &self,
+        fact_id: i64,
+        workspace: &str,
+    ) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .fact_search_metadata(fact_id, workspace)?
+            .and_then(|metadata| metadata.category))
     }
 
     pub fn fact_history(&self, id: i64, workspace: &str) -> Result<Vec<FactHistory>, StoreError> {
@@ -2215,6 +2516,39 @@ impl Store {
         })
     }
 
+    /// Create the private, generated workspace backup used by the Python
+    /// compatibility contract when no explicit output path is supplied.
+    pub fn backup_workspace_default(&self, workspace: &str) -> Result<WorkspaceBackup, StoreError> {
+        validate_context_workspace(workspace)?;
+        let base = self
+            .database_path
+            .borrow()
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let backup_dir = base.join("backups");
+        fs::create_dir_all(&backup_dir)?;
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &backup_dir,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )?;
+        let sequence = SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let output = backup_dir.join(format!(
+            "workspace-{workspace}.{}-{sequence}.json",
+            std::process::id()
+        ));
+        let output = output.to_string_lossy().into_owned();
+        let backup = self.backup_workspace(&output, workspace)?;
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            Path::new(&output),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )?;
+        Ok(backup)
+    }
+
     pub fn current_database(&self) -> Result<DatabaseInfo, StoreError> {
         if self.memory_database_name.borrow().is_some() {
             return self.memory_current_database();
@@ -2354,6 +2688,37 @@ impl Store {
         })
     }
 
+    /// Create the default timestamped backup used by the Python contract.
+    /// The caller supplies only an optional database name; the destination is
+    /// kept beside the active database in a private backups directory.
+    pub fn backup_database_default(
+        &self,
+        name: Option<&str>,
+    ) -> Result<DatabaseBackup, StoreError> {
+        let database = name.unwrap_or("current");
+        if database != "current" {
+            validate_database_name(database)?;
+        }
+        let base = self
+            .database_path
+            .borrow()
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let backup_dir = base.join("backups");
+        fs::create_dir_all(&backup_dir)?;
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &backup_dir,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )?;
+        let sequence = SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let output = backup_dir.join(format!("{database}.{}-{sequence}.db", std::process::id()));
+        let output = output.to_string_lossy().into_owned();
+        self.backup_database(database, &output)
+    }
+
     pub fn delete_database(&self, name: &str) -> Result<bool, StoreError> {
         validate_database_name(name)?;
         if self.memory_database_name.borrow().is_some() {
@@ -2382,6 +2747,16 @@ impl Store {
             return self.memory_select_database(name);
         }
         if name == "current" {
+            let Some(default_path) = self.default_database_path.borrow().clone() else {
+                return self.current_database();
+            };
+            if !self.is_active_path(&default_path) {
+                let candidate = Self::open(&default_path)?;
+                let replacement = candidate.into_connection();
+                let previous = self.connection.replace(replacement);
+                drop(previous);
+                *self.database_path.borrow_mut() = Some(default_path);
+            }
             return self.current_database();
         }
         validate_database_name(name)?;
@@ -2930,6 +3305,7 @@ impl Store {
              WHERE facts_fts MATCH ?1
                AND (f.workspace_id = '' OR f.workspace_id = ?2)
                AND f.lifecycle != 'forgotten'
+               AND f.validity != 'invalid'
                AND (?3 IS NULL OR f.source = ?3)
                AND (?4 IS NULL OR f.project = ?4)
                AND (?5 IS NULL OR f.domain = ?5)
@@ -2965,6 +3341,7 @@ impl Store {
              WHERE text LIKE ?1
                AND (workspace_id = '' OR workspace_id = ?2)
                AND lifecycle != 'forgotten'
+               AND validity != 'invalid'
                AND (?3 IS NULL OR source = ?3)
                AND (?4 IS NULL OR project = ?4)
                AND (?5 IS NULL OR domain = ?5)
@@ -3006,6 +3383,7 @@ impl Store {
              FROM facts
              WHERE (workspace_id = '' OR workspace_id = ?1)
                AND lifecycle != 'forgotten'
+               AND validity != 'invalid'
                AND (?2 IS NULL OR source = ?2)
                AND (?3 IS NULL OR project = ?3)
                AND (?4 IS NULL OR domain = ?4)
@@ -4037,6 +4415,77 @@ impl Store {
         })
     }
 
+    /// Export every workspace for the migration/backup tool.  The public
+    /// workspace export remains scoped, while the no-argument Python
+    /// `export` contract intentionally includes all fact rows, including
+    /// forgotten/invalid rows retained for migration history.
+    pub fn export_all(&self) -> Result<MemoryExport, StoreError> {
+        let mut workspaces = Vec::new();
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM workspaces
+             UNION SELECT DISTINCT workspace_id FROM facts WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM contexts WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM lifecycle_events WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM handoffs WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM entities WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM relations WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM decisions WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM evidence WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM categories WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM runs WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM measurement_observations WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM memory_feedback WHERE workspace_id <> ''
+             ORDER BY id",
+        )?;
+        for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+            let workspace = row?;
+            if !workspace.is_empty() && !workspaces.contains(&workspace) {
+                workspaces.push(workspace);
+            }
+        }
+
+        let mut export = MemoryExport {
+            facts: {
+                let mut statement = self.connection.prepare(
+                    "SELECT id, text, sha256, workspace_id, lifecycle,
+                            source, project, domain, trust, strong, importance, category_id,
+                            validity, session_id, access_count
+                     FROM facts ORDER BY id",
+                )?;
+                let rows = statement
+                    .query_map([], map_fact)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            },
+            contexts: Vec::new(),
+            events: Vec::new(),
+            handoffs: Vec::new(),
+            entities: Vec::new(),
+            relations: Vec::new(),
+            decisions: Vec::new(),
+            evidence: Vec::new(),
+            categories: Vec::new(),
+            runs: Vec::new(),
+            measurements: Vec::new(),
+            feedback: Vec::new(),
+        };
+        for workspace in workspaces {
+            let snapshot = self.export_snapshot(&workspace)?;
+            export.contexts.extend(snapshot.contexts);
+            export.events.extend(snapshot.events);
+            export.handoffs.extend(snapshot.handoffs);
+            export.entities.extend(snapshot.entities);
+            export.relations.extend(snapshot.relations);
+            export.decisions.extend(snapshot.decisions);
+            export.evidence.extend(snapshot.evidence);
+            export.categories.extend(snapshot.categories);
+            export.runs.extend(snapshot.runs);
+            export.measurements.extend(snapshot.measurements);
+            export.feedback.extend(snapshot.feedback);
+        }
+        Ok(export)
+    }
+
     pub fn export_rdf(&self, workspace: &str) -> Result<String, StoreError> {
         validate_graph_workspace(workspace)?;
         let mut statement = self.connection.prepare(
@@ -4197,6 +4646,33 @@ impl Store {
         Ok(rows)
     }
 
+    /// Return every workspace identifier represented by the store, including
+    /// legacy/imported rows that predate a row in the `workspaces` catalog.
+    /// Native Redis projection and recovery must not omit those implicit
+    /// workspaces when rebuilding or checkpointing the compatibility image.
+    pub fn list_workspace_ids(&self) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM workspaces
+             UNION SELECT DISTINCT workspace_id FROM facts WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM contexts WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM lifecycle_events WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM handoffs WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM entities WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM relations WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM decisions WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM evidence WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM categories WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM runs WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM measurement_observations WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM memory_feedback WHERE workspace_id <> ''
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn archive_workspace(&self, id: &str) -> Result<Option<Workspace>, StoreError> {
         validate_workspace(id)?;
         self.connection.execute(
@@ -4242,10 +4718,18 @@ impl Store {
             return Ok(None);
         };
         if existing.lifecycle == lifecycle {
+            let archived = i64::from(lifecycle == "forgotten");
+            self.connection.execute(
+                "UPDATE facts SET archived = ?1, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?2 AND (workspace_id = '' OR workspace_id = ?3)",
+                params![archived, id, workspace],
+            )?;
             return Ok(Some(existing));
         }
         self.connection.execute(
-            "UPDATE facts SET lifecycle = ?1
+            "UPDATE facts SET lifecycle = ?1,
+                    archived = CASE WHEN ?1 = 'forgotten' THEN 1 ELSE 0 END,
+                    updated_at = CURRENT_TIMESTAMP
              WHERE id = ?2 AND (workspace_id = '' OR workspace_id = ?3)",
             params![lifecycle, id, workspace],
         )?;

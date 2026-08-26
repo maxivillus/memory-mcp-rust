@@ -96,6 +96,27 @@ pub struct RedisNativeProjection {
     pub entities: Vec<RedisEntityRecord>,
 }
 
+/// One addressable native entity key removed by a pointwise projection
+/// update. The payload is deliberately absent: Redis only needs the key to
+/// remove from the entity hash and its workspace index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RedisNativeEntityKey {
+    pub kind: String,
+    pub id: String,
+}
+
+/// Pointwise update for one native projection scope. Unlike
+/// `RedisNativeProjection`, this type never asks Redis to replace a complete
+/// workspace image. The entity count is the post-update count used by the
+/// manifest and operation ledger.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RedisNativeDelta {
+    pub workspace: String,
+    pub upserts: Vec<RedisEntityRecord>,
+    pub deletes: Vec<RedisNativeEntityKey>,
+    pub entity_count: usize,
+}
+
 /// Metadata for one state-changing operation. Arguments are represented only
 /// by their SHA-256 idempotency key; raw request payloads never enter Redis.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,12 +214,18 @@ impl RedisAdapter {
 
     /// Read the small state revision key used by the bounded watcher.
     pub fn state_revision(&self) -> Result<u64, RedisError> {
-        let value = self
-            .command(vec![
-                b"GET".to_vec(),
-                self.state_revision_key().into_bytes(),
-            ])?
-            .into_bulk("GET")?;
+        let value = self.command(vec![
+            b"GET".to_vec(),
+            self.state_revision_key().into_bytes(),
+        ])?;
+        Self::parse_state_revision_response(value)
+    }
+
+    /// Read the revision response returned by either a standalone GET or a
+    /// pipelined WATCH+GET preflight. The batch path must preserve Redis error
+    /// replies so the caller can classify them as a connection/protocol error.
+    fn parse_state_revision_response(value: RespValue) -> Result<u64, RedisError> {
+        let value = value.into_bulk("GET")?;
         let Some(value) = value else {
             return Ok(0);
         };
@@ -392,11 +419,22 @@ impl RedisAdapter {
         );
         let mut watch = vec![b"WATCH".to_vec()];
         watch.extend(watch_keys);
-        let watched = self.command(watch)?;
+        let responses = self.commands(vec![
+            watch,
+            vec![b"GET".to_vec(), self.state_revision_key().into_bytes()],
+        ])?;
+        if responses.len() != 2 {
+            return Err(RedisError::Protocol(
+                "WATCH preflight returned an unexpected response count".to_owned(),
+            ));
+        }
+        let mut responses = responses.into_iter();
+        let watched = responses.next().expect("response count checked");
         if !matches!(watched, RespValue::Simple(value) if value == b"OK") {
             return Err(RedisError::Protocol("WATCH did not return OK".to_owned()));
         }
-        let actual = self.state_revision()?;
+        let actual =
+            Self::parse_state_revision_response(responses.next().expect("response count checked"))?;
         if actual != expected_revision {
             let _ = self.command(vec![b"UNWATCH".to_vec()]);
             return Err(RedisError::Conflict {
@@ -613,6 +651,262 @@ impl RedisAdapter {
             values.remove(0).into_success("idempotency marker SET")?;
         }
         for _ in projections {
+            values.remove(0).into_success("SET native manifest")?;
+        }
+        u64::try_from(revision)
+            .map_err(|_| RedisError::Protocol("state revision overflowed".to_owned()))
+    }
+
+    /// Atomically apply only changed native entities and deletions.
+    ///
+    /// The canonical SQLite snapshot is intentionally not touched here. It is
+    /// a repair/checkpoint transport for startup and migration, while normal
+    /// writes travel as addressable entity deltas. Revision, manifests,
+    /// operation ledgers, and duplicate markers remain in the same Redis
+    /// transaction as the point updates.
+    pub fn publish_native_deltas(
+        &self,
+        expected_revision: u64,
+        deltas: &[RedisNativeDelta],
+        operations: &[RedisOperation],
+    ) -> Result<u64, RedisError> {
+        let mut total_entities = 0usize;
+        let mut delta_bytes = 0usize;
+        let mut seen_workspaces = BTreeSet::new();
+        let mut projection_index_keys = Vec::with_capacity(deltas.len());
+        for delta in deltas {
+            if delta.workspace.trim().is_empty() {
+                return Err(RedisError::Invalid(
+                    "native delta workspace must not be empty".to_owned(),
+                ));
+            }
+            if !seen_workspaces.insert(delta.workspace.clone()) {
+                return Err(RedisError::Invalid(
+                    "native deltas must have unique workspaces".to_owned(),
+                ));
+            }
+            if delta.entity_count > MAX_NATIVE_ENTITIES {
+                return Err(RedisError::Invalid(
+                    "native delta entity count exceeds the configured limit".to_owned(),
+                ));
+            }
+            total_entities = total_entities.saturating_add(delta.entity_count);
+            if total_entities > MAX_NATIVE_ENTITIES {
+                return Err(RedisError::Invalid(
+                    "native delta entity count exceeds the configured limit".to_owned(),
+                ));
+            }
+            projection_index_keys.push(self.native_index_key(&delta.workspace));
+
+            let mut seen_entities = BTreeSet::new();
+            for entity in &delta.upserts {
+                validate_native_entity(entity)?;
+                if !seen_entities.insert((entity.kind.clone(), entity.id.clone())) {
+                    return Err(RedisError::Invalid(
+                        "native delta entity keys must be unique".to_owned(),
+                    ));
+                }
+                let encoded = serde_json::to_vec(entity)?;
+                if encoded.len() > MAX_NATIVE_ENTITY_BYTES {
+                    return Err(RedisError::Invalid(
+                        "native entity exceeds the configured size limit".to_owned(),
+                    ));
+                }
+                delta_bytes = delta_bytes.saturating_add(encoded.len());
+                if delta_bytes > MAX_NATIVE_PROJECTION_BYTES {
+                    return Err(RedisError::Invalid(
+                        "native delta exceeds the configured size limit".to_owned(),
+                    ));
+                }
+            }
+            for entity in &delta.deletes {
+                validate_native_entity_key(entity)?;
+                if !seen_entities.insert((entity.kind.clone(), entity.id.clone())) {
+                    return Err(RedisError::Invalid(
+                        "native delta entity keys must be unique".to_owned(),
+                    ));
+                }
+            }
+        }
+        for operation in operations {
+            validate_operation_key(&operation.idempotency_key)?;
+            validate_operation_name(&operation.name)?;
+        }
+        let mut seen_operations = BTreeSet::new();
+        for operation in operations {
+            if !seen_operations.insert(operation.idempotency_key.clone()) {
+                return Err(RedisError::Invalid(
+                    "native operation ledger keys must be unique".to_owned(),
+                ));
+            }
+        }
+
+        let mut watch = vec![
+            b"WATCH".to_vec(),
+            self.state_revision_key().into_bytes(),
+            self.native_schema_key().into_bytes(),
+        ];
+        watch.extend(
+            projection_index_keys
+                .iter()
+                .cloned()
+                .map(String::into_bytes),
+        );
+        let responses = self.commands(vec![
+            watch,
+            vec![b"GET".to_vec(), self.state_revision_key().into_bytes()],
+        ])?;
+        if responses.len() != 2 {
+            return Err(RedisError::Protocol(
+                "WATCH preflight returned an unexpected response count".to_owned(),
+            ));
+        }
+        let mut responses = responses.into_iter();
+        let watched = responses.next().expect("response count checked");
+        if !matches!(watched, RespValue::Simple(value) if value == b"OK") {
+            return Err(RedisError::Protocol("WATCH did not return OK".to_owned()));
+        }
+        let actual =
+            Self::parse_state_revision_response(responses.next().expect("response count checked"))?;
+        if actual != expected_revision {
+            let _ = self.command(vec![b"UNWATCH".to_vec()]);
+            return Err(RedisError::Conflict {
+                expected: expected_revision,
+                actual,
+            });
+        }
+
+        let next_revision = expected_revision.saturating_add(1);
+        let mut queued = Vec::new();
+        queued.push(vec![
+            b"SET".to_vec(),
+            self.native_schema_key().into_bytes(),
+            NATIVE_SCHEMA_VERSION.to_string().into_bytes(),
+        ]);
+        queued.push(vec![
+            b"INCR".to_vec(),
+            self.state_revision_key().into_bytes(),
+        ]);
+        for delta in deltas {
+            let index_key = self.native_index_key(&delta.workspace).into_bytes();
+            for entity in &delta.deletes {
+                let entity_key = self
+                    .native_entity_key_from_parts(&delta.workspace, &entity.kind, &entity.id)
+                    .into_bytes();
+                queued.push(vec![
+                    b"SREM".to_vec(),
+                    index_key.clone(),
+                    entity_key.clone(),
+                ]);
+                queued.push(vec![b"DEL".to_vec(), entity_key]);
+            }
+            for entity in &delta.upserts {
+                let entity_key = self
+                    .native_entity_key(&delta.workspace, entity)
+                    .into_bytes();
+                queued.push(vec![
+                    b"SET".to_vec(),
+                    entity_key.clone(),
+                    serde_json::to_vec(entity)?,
+                ]);
+                queued.push(vec![b"SADD".to_vec(), index_key.clone(), entity_key]);
+            }
+        }
+        for operation in operations {
+            let ledger = RedisOperationLedger {
+                operation_key: operation.idempotency_key.clone(),
+                operation_name: operation.name.clone(),
+                workspace_hash: digest(&operation.workspace),
+                status: "committed".to_owned(),
+                revision: next_revision,
+                entity_count: total_entities,
+                reason: None,
+            };
+            let encoded = serde_json::to_vec(&ledger)?;
+            if encoded.len() > MAX_LEDGER_RECORD_BYTES {
+                return Err(RedisError::Invalid(
+                    "operation ledger record exceeds the configured size limit".to_owned(),
+                ));
+            }
+            queued.push(vec![
+                b"SET".to_vec(),
+                self.operation_ledger_key(&operation.idempotency_key)
+                    .into_bytes(),
+                encoded,
+            ]);
+            queued.push(vec![
+                b"SET".to_vec(),
+                self.operation_marker_key(&operation.idempotency_key)
+                    .into_bytes(),
+                b"1".to_vec(),
+                b"EX".to_vec(),
+                IDEMPOTENCY_MARKER_TTL_SECONDS.to_string().into_bytes(),
+            ]);
+        }
+        for delta in deltas {
+            let manifest = RedisNativeManifest {
+                schema_version: NATIVE_SCHEMA_VERSION,
+                revision: next_revision,
+                entity_count: delta.entity_count,
+            };
+            queued.push(vec![
+                b"SET".to_vec(),
+                self.native_manifest_key(&delta.workspace).into_bytes(),
+                serde_json::to_vec(&manifest)?,
+            ]);
+        }
+
+        let result = self.execute_batched_transaction(queued)?;
+        let mut values = match result {
+            RespValue::Array(Some(values)) => values,
+            RespValue::Array(None) => {
+                let actual = self.state_revision().unwrap_or(expected_revision);
+                return Err(RedisError::Conflict {
+                    expected: expected_revision,
+                    actual,
+                });
+            }
+            _ => {
+                return Err(RedisError::Protocol(
+                    "EXEC returned a non-array response".to_owned(),
+                ))
+            }
+        };
+        let expected_results = 2
+            + deltas
+                .iter()
+                .map(|delta| delta.deletes.len() * 2 + delta.upserts.len() * 2)
+                .sum::<usize>()
+            + operations.len() * 2
+            + deltas.len();
+        if values.len() != expected_results {
+            return Err(RedisError::Protocol(
+                "EXEC returned an unexpected result count".to_owned(),
+            ));
+        }
+        values.remove(0).into_success("SET native schema")?;
+        let revision = values.remove(0).into_integer("INCR")?;
+        for delta in deltas {
+            for _ in &delta.deletes {
+                values
+                    .remove(0)
+                    .into_integer_or_success("SREM native index")?;
+                values
+                    .remove(0)
+                    .into_integer_or_success("DEL native entity")?;
+            }
+            for _ in &delta.upserts {
+                values.remove(0).into_success("SET native entity")?;
+                values
+                    .remove(0)
+                    .into_integer_or_success("SADD native index")?;
+            }
+        }
+        for _ in operations {
+            values.remove(0).into_success("SET operation ledger")?;
+            values.remove(0).into_success("idempotency marker SET")?;
+        }
+        for _ in deltas {
             values.remove(0).into_success("SET native manifest")?;
         }
         u64::try_from(revision)
@@ -858,6 +1152,39 @@ impl RedisAdapter {
         self.connection.borrow_mut().command(arguments)
     }
 
+    fn commands(&self, commands: Vec<Vec<Vec<u8>>>) -> Result<Vec<RespValue>, RedisError> {
+        self.connection.borrow_mut().commands(commands)
+    }
+
+    fn execute_batched_transaction(
+        &self,
+        queued_commands: Vec<Vec<Vec<u8>>>,
+    ) -> Result<RespValue, RedisError> {
+        let mut commands = Vec::with_capacity(queued_commands.len() + 2);
+        commands.push(vec![b"MULTI".to_vec()]);
+        commands.extend(queued_commands);
+        commands.push(vec![b"EXEC".to_vec()]);
+        let mut responses = self.commands(commands)?;
+        if responses.len() < 2 {
+            return Err(RedisError::Protocol(
+                "batched Redis transaction returned too few responses".to_owned(),
+            ));
+        }
+        responses.remove(0).into_success("MULTI")?;
+        let result = responses.pop().expect("transaction response count checked");
+        for response in responses {
+            if !matches!(response, RespValue::Simple(value) if value == b"QUEUED") {
+                return Err(RedisError::Protocol(
+                    "Redis transaction command was not queued".to_owned(),
+                ));
+            }
+        }
+        match result {
+            RespValue::Error(message) => Err(RedisError::Protocol(message)),
+            result => Ok(result),
+        }
+    }
+
     fn key(&self, suffix: &str) -> String {
         format!("{}:{suffix}", self.namespace)
     }
@@ -895,11 +1222,15 @@ impl RedisAdapter {
     }
 
     fn native_entity_key(&self, workspace: &str, entity: &RedisEntityRecord) -> String {
+        self.native_entity_key_from_parts(workspace, &entity.kind, &entity.id)
+    }
+
+    fn native_entity_key_from_parts(&self, workspace: &str, kind: &str, id: &str) -> String {
         self.key(&format!(
             "native:entity:{}:{}:{}",
             digest(workspace),
-            entity.kind,
-            digest(&entity.id)
+            kind,
+            digest(id)
         ))
     }
 
@@ -909,6 +1240,25 @@ impl RedisAdapter {
 }
 
 fn validate_native_entity(entity: &RedisEntityRecord) -> Result<(), RedisError> {
+    if entity.kind.trim().is_empty()
+        || !entity
+            .kind
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(RedisError::Invalid(
+            "native entity kind contains unsupported characters".to_owned(),
+        ));
+    }
+    if entity.id.trim().is_empty() || entity.id.len() > 256 {
+        return Err(RedisError::Invalid(
+            "native entity id must be non-empty and bounded".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_native_entity_key(entity: &RedisNativeEntityKey) -> Result<(), RedisError> {
     if entity.kind.trim().is_empty()
         || !entity
             .kind
@@ -1217,41 +1567,69 @@ impl RedisConnection {
     }
 
     fn command(&mut self, arguments: Vec<Vec<u8>>) -> Result<RespValue, RedisError> {
-        let mut request = format!("*{}\r\n", arguments.len()).into_bytes();
-        for argument in arguments {
-            request.extend_from_slice(b"$");
-            request.extend_from_slice(format!("{}\r\n", argument.len()).as_bytes());
-            request.extend_from_slice(&argument);
-            request.extend_from_slice(b"\r\n");
+        let mut responses = self.commands(vec![arguments])?;
+        let response = responses
+            .pop()
+            .ok_or_else(|| RedisError::Protocol("Redis returned no response".to_owned()))?;
+        match response {
+            RespValue::Error(message) => Err(RedisError::Protocol(message)),
+            response => Ok(response),
+        }
+    }
+
+    /// Send several RESP commands in one write/flush and read their replies
+    /// in order. Redis still processes the commands sequentially, but the
+    /// client avoids a network round trip for every queued transaction
+    /// command. Metrics count logical commands, not TCP writes.
+    fn commands(&mut self, commands: Vec<Vec<Vec<u8>>>) -> Result<Vec<RespValue>, RedisError> {
+        if commands.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut request = Vec::new();
+        for arguments in &commands {
+            encode_command(arguments, &mut request);
         }
         self.stream.write_all(&request)?;
         self.stream.flush()?;
-        self.metrics.commands = self.metrics.commands.saturating_add(1);
+        self.metrics.commands = self
+            .metrics
+            .commands
+            .saturating_add(u64::try_from(commands.len()).unwrap_or(u64::MAX));
         self.metrics.request_bytes = self
             .metrics
             .request_bytes
             .saturating_add(u64::try_from(request.len()).unwrap_or(u64::MAX));
-        let mut response_bytes = 0;
-        let response = {
-            let mut reader = CountingReader {
-                stream: &mut self.stream,
-                bytes: &mut response_bytes,
+        let mut responses = Vec::with_capacity(commands.len());
+        for _ in commands {
+            let mut response_bytes = 0;
+            let response = {
+                let mut reader = CountingReader {
+                    stream: &mut self.stream,
+                    bytes: &mut response_bytes,
+                };
+                read_resp(&mut reader, 0)
             };
-            read_resp(&mut reader, 0)
-        };
-        self.metrics.response_bytes = self
-            .metrics
-            .response_bytes
-            .saturating_add(u64::try_from(response_bytes).unwrap_or(u64::MAX));
-        let response = response?;
-        if let RespValue::Error(message) = response {
-            return Err(RedisError::Protocol(message));
+            self.metrics.response_bytes = self
+                .metrics
+                .response_bytes
+                .saturating_add(u64::try_from(response_bytes).unwrap_or(u64::MAX));
+            responses.push(response?);
         }
-        Ok(response)
+        Ok(responses)
     }
 
     fn metrics(&self) -> RedisMetrics {
         self.metrics
+    }
+}
+
+fn encode_command(arguments: &[Vec<u8>], request: &mut Vec<u8>) {
+    request.extend_from_slice(format!("*{}\r\n", arguments.len()).as_bytes());
+    for argument in arguments {
+        request.extend_from_slice(b"$");
+        request.extend_from_slice(format!("{}\r\n", argument.len()).as_bytes());
+        request.extend_from_slice(argument);
+        request.extend_from_slice(b"\r\n");
     }
 }
 
@@ -1819,6 +2197,46 @@ mod tests {
             })
         );
         assert!(adapter.operation_applied(&key).unwrap());
+        let delta_key = "d".repeat(64);
+        let delta_operation = RedisOperation {
+            idempotency_key: delta_key,
+            name: "remember_fact".to_owned(),
+            workspace: "workspace".to_owned(),
+        };
+        assert_eq!(
+            adapter
+                .publish_native_deltas(
+                    1,
+                    &[RedisNativeDelta {
+                        workspace: "workspace".to_owned(),
+                        upserts: vec![RedisEntityRecord {
+                            kind: "fact".to_owned(),
+                            id: "43".to_owned(),
+                            payload: serde_json::json!({"text": "point update"}),
+                        }],
+                        deletes: vec![RedisNativeEntityKey {
+                            kind: "fact".to_owned(),
+                            id: "42".to_owned(),
+                        }],
+                        entity_count: 1,
+                    }],
+                    std::slice::from_ref(&delta_operation),
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            adapter.state_snapshot().unwrap(),
+            Some(b"standby-image".to_vec())
+        );
+        assert_eq!(
+            adapter.native_entities("workspace").unwrap(),
+            vec![RedisEntityRecord {
+                kind: "fact".to_owned(),
+                id: "43".to_owned(),
+                payload: serde_json::json!({"text": "point update"}),
+            }]
+        );
         let replacement_key = "c".repeat(64);
         let replacement = RedisNativeProjection {
             workspace: "workspace".to_owned(),
@@ -1836,13 +2254,13 @@ mod tests {
         assert_eq!(
             adapter
                 .publish_state_with_projections(
-                    1,
+                    2,
                     b"standby-image-2",
                     std::slice::from_ref(&replacement),
                     std::slice::from_ref(&replacement_operation),
                 )
                 .unwrap(),
-            2
+            3
         );
         assert_eq!(
             adapter.native_entities("workspace").unwrap(),

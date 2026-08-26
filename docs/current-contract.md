@@ -151,6 +151,22 @@ relations during rebuilds, keep workspace-scoped deduplication, and rebuild
 FTS5 indexes when required. Migration tests must cover both a fresh store and
 the legacy fixtures used by the upstream suite.
 
+## Copy-first database migration
+
+The shipped `memory-mcp-rust` binary also provides a migration subcommand:
+
+```text
+memory-mcp-rust migrate --source LEGACY.db --target RUST.db
+```
+
+The source is opened read-only inside one consistent SQLite snapshot. The
+target must not exist. Rust schema migrations run on a private temporary copy,
+which is published without overwrite only after durable source-table row counts,
+per-row typed fingerprints, and target integrity checks pass. The command
+prints counts and fingerprints only; it does not print database paths or
+memory payloads. `scripts/memory-mcp-migrate.sh` is the environment-variable
+wrapper for the same operation.
+
 ## Compatibility test baseline
 
 The upstream CI runs Python 3.11 and both suites:
@@ -183,7 +199,8 @@ start as compatibility:
 This document completes the contract-capture stage only. The next implementation
 stage can be accepted when the Rust project has:
 
-1. a single executable entry point with the wire behavior above;
+1. a single executable entry point with the wire behavior above and the
+   copy-first migration subcommand;
 2. a schema/migration test fixture covering a fresh store and legacy stores;
 3. a machine-readable tool-schema parity check against the 80-name inventory;
 4. deterministic tests for the core fact/context round trips before optional
@@ -193,22 +210,40 @@ No performance claim is made by this baseline. Benchmarking starts after the
 SQLite parity slice is working, and Redis remains an optional measured adapter
 with deterministic SQLite fallback.
 
-## Rust parity slice status
+## Rust parity implementation status
 
-The first implementation slice now provides one stdio executable, bundled
-SQLite/FTS5 initialization, a fresh-store round trip, a legacy `facts`-table
-upgrade fixture, and an 80-name inventory gate. The generic entries returned by
-`tools/list` intentionally mark per-tool schema/handler parity as incremental;
-the pinned upstream descriptions and input schemas remain the acceptance source
-for the subsequent port stages.
+The current implementation provides one stdio executable, bundled SQLite/FTS5
+initialization, additive legacy-store upgrades, the pinned 80-tool descriptors,
+and concrete compatibility handlers for the full advertised contract. The
+provider/pipeline layer preserves the Python deployment's feature switches for
+extraction, embeddings, recall, verification, categorization, and LLM-backed
+operations; deterministic test providers are available for isolated checks.
+
+The deployment migration slice adds a copy-first SQLite migration command and
+two bounded launch checks. `scripts/memory-mcp-preflight.py` compares both
+servers' initialize identity, all 80 tool descriptors, launcher environment
+names, SQLite row counts, and disposable empty-argument routes. It treats
+missing required arguments as valid route evidence, but blocks unknown or
+unimplemented handlers. The actual legacy-Python-versus-Rust preflight remains
+a release gate: it must be run with the deployed Python command, its migrated
+database copy, and the complete set of environment names that affect provider
+and pipeline behavior. The Rust entry point accepts those names and routes the
+corresponding operations through the compatibility layer; removing them to make
+the comparison green would invalidate the parity check.
+
+The slice descriptions below record historical implementation milestones. The
+Redis-first coordinator and the completed provider/pipeline compatibility
+surface described later are the current behavior and supersede earlier
+"staged" or "out of scope" notes.
 
 The second implementation slice adds SQLite-backed fact lifecycle operations
 (`forget_fact`, `restore_fact`, and `list_forgotten`) plus workspace lifecycle
 operations (`create_workspace`, `list_workspaces`, `archive_workspace`, and
 `reset_workspace`). Forgotten facts are excluded from normal list/search results,
-and reset deletes only the selected workspace's facts and contexts. Redis remains
-out of scope until the SQLite behavior is measured and the parity surface is
-complete enough for a meaningful adapter comparison.
+and reset deletes only the selected workspace's facts and contexts. Those
+operations were initially implemented on SQLite; the current coordinator routes
+the complete surface through Redis when it is reachable and retains the SQLite
+implementation as the standby/fallback path.
 
 The third implementation slice adds the first context retrieval boundary:
 
@@ -419,10 +454,10 @@ optional Redis core-fact adapter:
   performance efficacy explicitly not claimed until a paired workload and
   environment review is available.
 
-This adapter is an experimental core-fact comparison surface, not a claim that
-Redis already replaces every SQLite-backed MCP table. The full MCP contract
-continues to use the SQLite store unless a later parity gate explicitly wires
-the Redis adapter into the server backend.
+This was the initial experimental core-fact comparison surface. The subsequent
+coordinator implementation below supersedes it: Redis now owns the canonical
+state for the full MCP contract when reachable, while SQLite remains the
+standby/fallback image.
 
 ## Current coordinator implementation
 
@@ -434,8 +469,8 @@ server through `BackendCoordinator`:
 - while Redis is healthy, the coordinator restores a private in-memory
   materialization from the Redis snapshot and executes all 80 advertised tools
   plus the `add_fact` compatibility alias against that Redis-owned state; the
-  file-backed SQLite store is updated only after the Redis revision commits and
-  is used as standby/fallback;
+  file-backed SQLite store is updated by a background pointwise replay after
+  the Redis revision commits and is used as standby/fallback;
 - the coordinator selects Redis when its probe succeeds, otherwise serves the
   complete SQLite implementation, records degraded writes in a durable,
   idempotent JSONL outbox, and reconciles back with Redis priority;
@@ -446,17 +481,21 @@ server through `BackendCoordinator`:
 - the watcher reads only the small revision key while the state is unchanged,
   fetches a snapshot only after a revision change, uses bounded backoff, and
   stops with the coordinator lifecycle;
+- the watcher makes a complete compatibility snapshot checkpoint only after
+  each bounded 256-revision interval, so restart recovery remains bounded
+  without copying the database on every write;
 - each state-changing operation also receives a system projection for database
   metadata, and each touched workspace receives a
   bounded native entity projection: hashed workspace/index keys point to
   individually addressable JSON records for facts, contexts, events,
   fact history, context lineage, handoffs, graph, decisions, evidence,
   categories, runs, measurements, feedback, and registered workspaces;
-- native projection replacement, the Redis-owned snapshot, the SQLite standby
-  image, the monotonic revision, and the durable operation ledger are committed in one
-  `WATCH`/`MULTI`/`EXEC` transaction; a per-workspace manifest records the
-  projection schema version, revision, and bounded entity count. A version-2
-  native schema marker makes older snapshot-only namespaces rebuild on attach;
+- normal native writes apply only changed entities and removed keys; the
+  pointwise projection, monotonic revision, schema marker, manifests, and
+  durable operation ledger are committed in one `WATCH`/`MULTI`/`EXEC`
+  transaction. A per-workspace manifest records the projection schema
+  version, revision, and bounded entity count. A version-2 native schema
+  marker makes older snapshot-only namespaces rebuild on attach;
 - the operation ledger is keyed by the SHA-256 operation idempotency key and
   has no TTL. It stores only operation name, workspace hash, status, revision,
   entity count, and a bounded conflict reason. The seven-day marker remains a
@@ -466,11 +505,12 @@ server through `BackendCoordinator`:
   counters; it never returns payloads or credentials.
 
 This remains a correctness-first implementation, not a performance claim. Redis
-is the sole durable primary when configured: its bounded snapshot and native
-entity/database projections are the source of the active revision. The
-in-memory `Store` is retained as a deterministic compatibility/query engine,
-not as a second durable primary; the file-backed SQLite image is written only
-after a Redis commit and is the fallback/standby image. The direct
+is the sole durable primary when configured: its native entity/database
+projections and revision are the source of the active write path; the complete
+snapshot remains the attach/rebuild/recovery transport. The in-memory `Store`
+is retained as a deterministic compatibility/query engine, not as a second
+durable primary; the file-backed SQLite image is mirrored pointwise in the
+background after a Redis commit and is the fallback/standby image. The direct
 `handle_line` API remains a SQLite fixture path, while the shipped stdio binary
 uses `handle_line_with_coordinator`.
 
@@ -490,11 +530,14 @@ policy above for the next implementation stages:
 - if the active Redis connection is lost, the coordinator serves the last
   confirmed SQLite revision and records every degraded-mode write in a durable,
   idempotent outbox;
-- after Redis recovers, the coordinator applies Redis revisions first, replays
-  non-conflicting outbox entries by idempotency key, gives Redis priority for
-  conflicts, refreshes the SQLite standby, and switches normal traffic back to
-  Redis only after the recovered state is durable;
-- the state publish and its operation marker(s) are one Redis transaction;
+- after Redis recovers, the coordinator uses the local SQLite fallback image to
+  publish queued point changes, gives the Redis revision priority for
+  conflicts, mirrors committed operations back into SQLite, and switches
+  normal traffic to Redis;
+- the pointwise state publish and its operation marker(s) are one Redis
+  transaction; a complete snapshot is reserved for attach, migration, recovery,
+  and the amortized 256-revision restart checkpoint; it is not part of each
+  write;
   recovery treats an existing marker as already committed and removes the
   corresponding outbox item without applying it a second time; markers expire
   after seven days, so duplicate-replay protection is intentionally bounded;
@@ -507,8 +550,9 @@ policy above for the next implementation stages:
   exposing payloads or credentials;
 - the background synchronizer must be event/revision driven and bounded: it
   polls a small health/revision key at a configurable interval, fetches the
-  state only when the revision changes, applies bounded batches, and backs off
-  on errors; it must not rescan the complete dataset on every tick;
+  state only when the revision changes, applies bounded batches, checkpoints
+  the compatibility snapshot only at the 256-revision boundary, and backs off
+  on errors; it must not rescan or rewrite the complete dataset on every tick;
 - the Redis watcher must share the coordinator's connection/lifecycle, avoid a
   busy loop, use bounded timeouts, and stop cleanly with the process;
 - the full 80-tool route is an acceptance gate: every advertised tool and the
@@ -521,8 +565,9 @@ policy above for the next implementation stages:
 
 Option A is now the selected implementation model: Redis owns the canonical
 revision and the complete operation state, while the compatibility engine is
-rebuilt from that state for each active process. The version-2 schema marker
-and atomic full projection publish migrate legacy snapshot-only namespaces;
+rebuilt from that state for each active process. Normal writes use atomic
+pointwise projection deltas; the version-2 schema marker and atomic full
+projection publish migrate legacy snapshot-only namespaces;
 the virtual database catalog is included in the Redis snapshot and database
 metadata is independently indexed under the reserved system scope. Remaining
 release acceptance is limited to real-service migration/isolation/conflict/
@@ -530,9 +575,11 @@ lag/backoff measurements, the formatter/test/lint/AppSec/artifact/QA/PM gates,
 and a separate performance decision. No speedup claim is made here.
 
 The architecture and recovery protocol are recorded in
-`docs/decisions/ADR-0001-redis-primary-with-sqlite-fallback.md`. The ADR is
+`docs/decisions/ADR-0001-redis-primary-with-sqlite-fallback.md`; the pointwise
+write refinement is recorded in
+`docs/decisions/ADR-0002-pointwise-redis-replication.md`. ADR-0001 remains
 accepted for this implementation slice after the PM, QA, AppSec, artifact, and
 release readbacks. A reachable Redis endpoint now selects the coordinator's
-Redis-primary snapshot mode, and an unavailable endpoint falls back to SQLite
+Redis-primary pointwise mode, and an unavailable endpoint falls back to SQLite
 without enabling a partial fact-only route; the recorded benchmark makes no
-speedup claim for this snapshot workload.
+speedup claim.

@@ -46,13 +46,16 @@ reconciliation duration, and recovery success are separate reliability
 measurements; they must not be folded into a Redis speedup percentage.
 
 The current coordinator implements the selected Redis-primary model. A
-stateful operation restores the complete bounded Redis image into a private
-in-memory compatibility engine, then atomically publishes the next Redis
-revision, native per-entity projection, system/database projection, durable
-operation ledger, and SQLite standby image. The file-backed SQLite store is
-not written before the Redis commit and is used only for fallback/standby.
-The projection is capped at 4096 entities and 8 MiB per publish; each record is
-individually addressable through a hashed key and a workspace index. A version-2
+stateful operation runs against the private in-memory compatibility engine,
+then atomically publishes only changed native records and removed keys together
+with the next Redis revision, manifests, durable operation ledger, and
+idempotency marker. The SQLite standby is updated by a background, pointwise
+outbox replay after the Redis commit; it is not written before Redis accepts the
+operation and remains the fallback image. A complete bounded snapshot is
+reserved for attach, schema rebuild, recovery, and an amortized checkpoint
+every 256 committed revisions. The projection is capped at 4096 entities and
+8 MiB per delta batch; each record is individually addressable through a hashed
+key and a workspace index. A version-2
 schema marker triggers a bounded full rebuild for legacy snapshot-only
 namespaces. No native Redis performance win is claimed.
 
@@ -65,11 +68,14 @@ Measurements must separate projection cost from snapshot backup cost and report
 rejection/fallback behavior when either bound is reached.
 
 The replication budget is part of the acceptance contract. The watcher uses a
-small revision/health read, fetches a state batch only after a revision change,
-and applies bounded batches with exponential backoff on errors. Resource
-measurements must report watcher CPU time, Redis commands/bytes, SQLite write
-bytes, standby lag, and reconciliation duration under idle, steady-write, and
-recovery workloads. A full-dataset scan on every health tick fails this gate.
+small revision/health read, mirrors only durable outbox operations in bounded
+batches, fetches a full state image only after a revision change or recovery,
+and makes a compatibility checkpoint only at the 256-revision boundary. It
+applies exponential backoff on errors. The RESP client batches the Redis
+transaction commands into one network write/flush. Resource measurements must
+report watcher CPU time, Redis commands/bytes, SQLite write bytes, standby lag,
+and reconciliation duration under idle, steady-write, and recovery workloads.
+A full-dataset scan on every health tick fails this gate.
 The coordinator status counters cover Redis commands/bytes and watcher
 ticks/errors/last duration; CPU time and SQLite write-byte accounting still
 require the real-service measurement harness.

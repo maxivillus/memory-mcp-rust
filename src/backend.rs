@@ -1,7 +1,7 @@
 use crate::protocol::replay_tool;
 use crate::redis::{
-    RedisAdapter, RedisEntityRecord, RedisError, RedisMetrics, RedisNativeProjection,
-    RedisOperation, NATIVE_SYSTEM_SCOPE,
+    RedisAdapter, RedisEntityRecord, RedisError, RedisMetrics, RedisNativeDelta,
+    RedisNativeEntityKey, RedisNativeProjection, RedisOperation, NATIVE_SYSTEM_SCOPE,
 };
 use crate::store::{Store, StoreError};
 use crate::tools;
@@ -9,7 +9,7 @@ use hex::encode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -25,6 +25,10 @@ const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const MAX_OUTBOX_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_RECONCILIATION_AUDIT_BYTES: u64 = 1024 * 1024;
 const MAX_REPLAY_BATCH: usize = 64;
+/// Keep the complete compatibility image restart-safe without putting it on
+/// the wire for every ordinary point update. This is an amortized control-
+/// plane checkpoint, not part of the per-operation Redis write transaction.
+const SNAPSHOT_CHECKPOINT_OPERATIONS: u64 = 256;
 static OUTBOX_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -65,6 +69,10 @@ struct OutboxEntry {
     idempotency_key: String,
     name: String,
     arguments: Value,
+    /// True once Redis has committed the operation. The entry remains until
+    /// the background watcher applies the same operation to standby SQLite.
+    #[serde(default)]
+    redis_committed: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -156,6 +164,25 @@ impl Outbox {
         self.append(&OutboxEvent::Pending(entry))
     }
 
+    fn mark_redis_committed(&self, idempotency_key: &str) -> Result<(), StoreError> {
+        let mut found = false;
+        for mut entry in self.pending()? {
+            if entry.idempotency_key == idempotency_key {
+                entry.redis_committed = true;
+                found = true;
+                self.append(&OutboxEvent::Pending(entry))?;
+                break;
+            }
+        }
+        if found {
+            Ok(())
+        } else {
+            Err(StoreError::Invalid(
+                "Redis-committed outbox entry is missing".to_owned(),
+            ))
+        }
+    }
+
     fn complete(&self, idempotency_key: &str) -> Result<(), StoreError> {
         self.append(&OutboxEvent::Completed {
             idempotency_key: idempotency_key.to_owned(),
@@ -163,6 +190,11 @@ impl Outbox {
     }
 
     fn reject(&self, idempotency_key: &str, reason: &str) -> Result<(), StoreError> {
+        self.audit(idempotency_key, reason)?;
+        self.complete(idempotency_key)
+    }
+
+    fn audit(&self, idempotency_key: &str, reason: &str) -> Result<(), StoreError> {
         let event = json!({
             "idempotency_key": idempotency_key,
             "reason": reason,
@@ -172,8 +204,7 @@ impl Outbox {
             &event,
             MAX_RECONCILIATION_AUDIT_BYTES,
             "reconciliation audit",
-        )?;
-        self.complete(idempotency_key)
+        )
     }
 
     fn compact(&self, entries: &[OutboxEntry]) -> Result<(), StoreError> {
@@ -213,6 +244,7 @@ struct CoordinatorInner {
     redis: Option<RedisAdapter>,
     mode: BackendKind,
     revision: u64,
+    last_snapshot_revision: u64,
     last_remote_revision: Option<u64>,
     outbox: Outbox,
     redis_configured: bool,
@@ -220,6 +252,21 @@ struct CoordinatorInner {
     sync_ticks: u64,
     sync_errors: u64,
     last_sync_micros: u64,
+    /// Native records last known to be present in Redis. The cache is used to
+    /// turn the affected scope into a pointwise delta without sending the
+    /// whole workspace projection on every write.
+    native_cache: Vec<RedisNativeProjection>,
+    /// Production coordinators let the watcher mirror Redis commits. Unit
+    /// coordinators without a watcher retain the old immediate local mirror.
+    background_standby_sync: bool,
+    /// During reconnect, the fallback SQLite image already contains the
+    /// offline operations. Publish their deltas directly instead of replaying
+    /// non-idempotent tool handlers against the same local image.
+    recovery_uses_local_state: bool,
+    /// A committed Redis operation can still be in the outbox after a process
+    /// restart because its SQLite mirror was not completed. Reapply it to the
+    /// freshly restored active store before removing that durable entry.
+    recovery_replay_committed: bool,
 }
 
 impl CoordinatorInner {
@@ -230,6 +277,7 @@ impl CoordinatorInner {
             redis: None,
             mode: BackendKind::Sqlite,
             revision: 0,
+            last_snapshot_revision: 0,
             last_remote_revision: None,
             outbox: Outbox::new(path),
             redis_configured,
@@ -237,72 +285,91 @@ impl CoordinatorInner {
             sync_ticks: 0,
             sync_errors: 0,
             last_sync_micros: 0,
+            native_cache: Vec::new(),
+            background_standby_sync: false,
+            recovery_uses_local_state: false,
+            recovery_replay_committed: false,
         })
     }
 
     fn attach_redis(&mut self, adapter: RedisAdapter) -> Result<(), StoreError> {
         let active_store = Store::in_memory()?;
+        let pending_before_attach = self.outbox.pending()?;
+        let recovering_sqlite = self.mode == BackendKind::Sqlite
+            && pending_before_attach
+                .iter()
+                .any(|entry| !entry.redis_committed);
+        let replay_committed = !recovering_sqlite
+            && pending_before_attach
+                .iter()
+                .any(|entry| entry.redis_committed);
+        let local_snapshot = recovering_sqlite
+            .then(|| self.store.snapshot_bytes())
+            .transpose()?;
         let remote = read_consistent_state(&adapter)?;
+        let native_cache;
         match remote {
             Some((revision, snapshot)) => {
-                self.store.restore_snapshot_bytes(&snapshot)?;
-                active_store.restore_snapshot_bytes(&snapshot)?;
-                self.revision = if adapter
+                if !recovering_sqlite {
+                    self.store.restore_snapshot_bytes(&snapshot)?;
+                }
+                let active_snapshot = local_snapshot.as_deref().unwrap_or(&snapshot);
+                active_store.restore_snapshot_bytes(active_snapshot)?;
+                let projections = native_projections_for_all_workspaces(&active_store)?;
+                let schema_rebuild = adapter
                     .native_schema_needs_rebuild()
-                    .map_err(redis_store_error)?
-                {
+                    .map_err(redis_store_error)?;
+                self.revision = if schema_rebuild {
                     adapter
                         .publish_state_with_projections(
                             revision,
-                            &snapshot,
-                            &native_projections_for_all_workspaces(&active_store)?,
+                            active_snapshot,
+                            &projections,
                             &[],
                         )
                         .map_err(redis_store_error)?
                 } else {
                     revision
                 };
+                native_cache = if recovering_sqlite && !schema_rebuild {
+                    native_projections_from_redis(&adapter, &active_store)?
+                } else {
+                    projections
+                };
                 self.last_remote_revision = Some(self.revision);
             }
             None => {
                 let snapshot = self.store.snapshot_bytes()?;
+                let projections = native_projections_for_all_workspaces(&self.store)?;
                 self.revision = adapter
-                    .publish_state_with_projections(
-                        0,
-                        &snapshot,
-                        &native_projections_for_all_workspaces(&self.store)?,
-                        &[],
-                    )
+                    .publish_state_with_projections(0, &snapshot, &projections, &[])
                     .map_err(redis_store_error)?;
                 self.last_remote_revision = Some(self.revision);
                 active_store.restore_snapshot_bytes(&snapshot)?;
+                native_cache = projections;
             }
         }
+        // Keep the durable standby in the same memory-database mode as the
+        // execution store. This full copy is limited to attach/recovery; all
+        // ordinary operation mirroring below is still pointwise replay.
+        let standby_snapshot = active_store.snapshot_bytes()?;
+        self.store.restore_snapshot_bytes(&standby_snapshot)?;
         self.active_store = Some(active_store);
         self.redis = Some(adapter);
         self.mode = BackendKind::Redis;
+        self.last_snapshot_revision = self.revision;
+        self.native_cache = native_cache;
+        self.recovery_uses_local_state = recovering_sqlite;
+        self.recovery_replay_committed = replay_committed;
         self.reconcile_outbox()
     }
 
     fn prepare_for_operation(&mut self) {
-        if self.mode != BackendKind::Redis {
-            return;
-        }
-        let result = (|| {
-            let adapter = self.redis.as_ref().ok_or_else(|| {
-                StoreError::Invalid("Redis connection is not available".to_owned())
-            })?;
-            let remote_revision = adapter.state_revision().map_err(redis_store_error)?;
-            self.last_remote_revision = Some(remote_revision);
-            if remote_revision != self.revision {
-                self.sync_from_redis_current()?;
-            }
-            if !self.outbox.pending()?.is_empty() {
-                self.reconcile_outbox()?;
-            }
-            Ok::<(), StoreError>(())
-        })();
-        if result.is_err() {
+        // The watcher owns liveness and external-revision observation. A
+        // write transaction performs its own WATCH/CAS check, so doing a
+        // blocking revision GET before every tool call would add an avoidable
+        // network wait to both reads and writes.
+        if self.mode == BackendKind::Redis && self.redis.is_none() {
             self.enter_sqlite_fallback();
         }
     }
@@ -321,8 +388,51 @@ impl CoordinatorInner {
             .as_ref()
             .expect("active store initialized")
             .restore_snapshot_bytes(&snapshot)?;
+        let standby_snapshot = self
+            .active_store
+            .as_ref()
+            .expect("active store initialized")
+            .snapshot_bytes()?;
+        self.store.restore_snapshot_bytes(&standby_snapshot)?;
+        self.native_cache = native_projections_for_all_workspaces(
+            self.active_store
+                .as_ref()
+                .expect("active store initialized"),
+        )?;
         self.revision = revision;
+        self.last_snapshot_revision = revision;
         self.last_remote_revision = Some(revision);
+        Ok(())
+    }
+
+    fn checkpoint_snapshot_if_due(&mut self) -> Result<(), StoreError> {
+        if self.mode != BackendKind::Redis
+            || self.revision.saturating_sub(self.last_snapshot_revision)
+                < SNAPSHOT_CHECKPOINT_OPERATIONS
+        {
+            return Ok(());
+        }
+        self.checkpoint_snapshot()
+    }
+
+    /// Persist the complete compatibility image at a recovery boundary. The
+    /// fallback entries have already been sent as native deltas; this second,
+    /// infrequent checkpoint keeps a process restart from having to infer
+    /// virtual-database/index details from the native projection alone.
+    fn checkpoint_snapshot(&mut self) -> Result<(), StoreError> {
+        let active_store = self.active_store();
+        let snapshot = active_store.snapshot_bytes()?;
+        let projections = native_projections_for_all_workspaces(active_store)?;
+        let revision = self
+            .redis
+            .as_ref()
+            .ok_or_else(|| StoreError::Invalid("Redis connection is not available".to_owned()))?
+            .publish_state_with_projections(self.revision, &snapshot, &projections, &[])
+            .map_err(redis_store_error)?;
+        self.revision = revision;
+        self.last_snapshot_revision = revision;
+        self.last_remote_revision = Some(revision);
+        self.native_cache = projections;
         Ok(())
     }
 
@@ -336,31 +446,18 @@ impl CoordinatorInner {
         result
     }
 
-    fn publish_local_state(
+    fn publish_local_deltas(
         &mut self,
         operations: &[RedisOperation],
         projections: &[RedisNativeProjection],
     ) -> Result<(), RedisError> {
-        let snapshot = self
-            .active_store()
-            .snapshot_bytes()
-            .map_err(store_redis_error)?;
+        let deltas = native_deltas(&self.native_cache, projections).map_err(store_redis_error)?;
         let adapter = self
             .redis
             .as_ref()
             .ok_or_else(|| RedisError::Protocol("Redis connection is not available".to_owned()))?;
-        self.revision = adapter.publish_state_with_projections(
-            self.revision,
-            &snapshot,
-            projections,
-            operations,
-        )?;
-        // The file-backed image is updated only after Redis accepts the
-        // revision. This makes it a standby/fallback copy rather than the
-        // primary write path.
-        self.store
-            .restore_snapshot_bytes(&snapshot)
-            .map_err(store_redis_error)?;
+        self.revision = adapter.publish_native_deltas(self.revision, &deltas, operations)?;
+        apply_native_cache(&mut self.native_cache, projections);
         self.last_remote_revision = Some(self.revision);
         Ok(())
     }
@@ -369,14 +466,84 @@ impl CoordinatorInner {
         self.active_store.as_ref().unwrap_or(&self.store)
     }
 
+    fn mirror_committed_outbox(&mut self) -> Result<(), StoreError> {
+        let pending = self.outbox.pending()?;
+        let mut mirrored = Vec::new();
+        for entry in pending
+            .iter()
+            .filter(|entry| entry.redis_committed)
+            .take(MAX_REPLAY_BATCH)
+        {
+            let Some(arguments) = entry.arguments.as_object() else {
+                return Err(StoreError::Invalid(
+                    "committed outbox entry has invalid arguments".to_owned(),
+                ));
+            };
+            match replay_tool(&entry.name, arguments, &self.store) {
+                Ok(_) => {}
+                Err(_error) if standby_already_contains(&self.store, &entry.name, arguments)? => {}
+                Err(error) => {
+                    return Err(StoreError::Invalid(format!(
+                        "standby SQLite mirror for {} failed: {error}",
+                        entry.name
+                    )))
+                }
+            }
+            mirrored.push(entry.idempotency_key.clone());
+        }
+        for idempotency_key in mirrored {
+            self.outbox.complete(&idempotency_key)?;
+        }
+        let remaining = self.outbox.pending()?;
+        self.outbox.compact(&remaining)
+    }
+
+    fn replay_committed_into_active(&mut self) -> Result<(), StoreError> {
+        if !self.recovery_replay_committed {
+            return Ok(());
+        }
+        for entry in self
+            .outbox
+            .pending()?
+            .into_iter()
+            .filter(|entry| entry.redis_committed)
+            .take(MAX_REPLAY_BATCH)
+        {
+            let Some(arguments) = entry.arguments.as_object() else {
+                return Err(StoreError::Invalid(
+                    "committed outbox entry has invalid arguments".to_owned(),
+                ));
+            };
+            replay_tool(&entry.name, arguments, self.active_store()).map_err(|error| {
+                StoreError::Invalid(format!(
+                    "active Redis recovery replay for {} failed: {error}",
+                    entry.name
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
     fn reconcile_outbox(&mut self) -> Result<(), StoreError> {
+        // Redis commits are acknowledged before this local pointwise mirror;
+        // the watcher calls this method in the background. Keeping the entry
+        // durable until replay succeeds makes a process restart recoverable.
+        self.replay_committed_into_active()?;
+        self.mirror_committed_outbox()?;
         let pending = self.outbox.pending()?;
         if pending.is_empty() {
+            self.recovery_replay_committed = false;
+            self.recovery_uses_local_state = false;
             return Ok(());
         }
         let mut applied = Vec::new();
+        let mut locally_present = BTreeSet::new();
         let mut rejected: Vec<(OutboxEntry, &'static str)> = Vec::new();
-        for entry in pending.iter().take(MAX_REPLAY_BATCH) {
+        for entry in pending
+            .iter()
+            .filter(|entry| !entry.redis_committed)
+            .take(MAX_REPLAY_BATCH)
+        {
             let adapter = self.redis.as_ref().ok_or_else(|| {
                 StoreError::Invalid("Redis connection is not available".to_owned())
             })?;
@@ -387,7 +554,9 @@ impl CoordinatorInner {
                 .as_ref()
                 .is_some_and(|record| record.status == "committed")
             {
-                rejected.push((entry.clone(), "already_committed_in_redis_ledger"));
+                self.outbox
+                    .audit(&entry.idempotency_key, "already_committed_in_redis_ledger")?;
+                self.outbox.mark_redis_committed(&entry.idempotency_key)?;
                 continue;
             }
             if ledger
@@ -404,7 +573,14 @@ impl CoordinatorInner {
                 .operation_applied(&entry.idempotency_key)
                 .map_err(redis_store_error)?;
             if already_applied {
-                rejected.push((entry.clone(), "already_committed_in_redis"));
+                self.outbox
+                    .audit(&entry.idempotency_key, "already_committed_in_redis")?;
+                self.outbox.mark_redis_committed(&entry.idempotency_key)?;
+                continue;
+            }
+            if self.recovery_uses_local_state {
+                locally_present.insert(entry.idempotency_key.clone());
+                applied.push(entry.clone());
                 continue;
             }
             let Some(arguments) = entry.arguments.as_object() else {
@@ -435,7 +611,7 @@ impl CoordinatorInner {
                 .map(redis_operation_for_entry)
                 .collect::<Vec<_>>();
             let projections = native_projections_for_entries(self.active_store(), &applied)?;
-            match self.publish_local_state(&operations, &projections) {
+            match self.publish_local_deltas(&operations, &projections) {
                 Ok(()) => {}
                 Err(RedisError::Conflict {
                     expected: _expected,
@@ -463,14 +639,31 @@ impl CoordinatorInner {
             }
         }
 
+        if !locally_present.is_empty() {
+            self.checkpoint_snapshot()?;
+        }
+
         for entry in &applied {
-            self.outbox.complete(&entry.idempotency_key)?;
+            if locally_present.contains(&entry.idempotency_key) {
+                // The fallback operation was already committed to the SQLite
+                // image. Reconciliation only publishes its point delta to
+                // Redis; replaying the tool here could duplicate a non-
+                // idempotent operation such as an append or counter update.
+                self.outbox.complete(&entry.idempotency_key)?;
+            } else {
+                self.outbox.mark_redis_committed(&entry.idempotency_key)?;
+            }
         }
         for (entry, reason) in rejected {
             self.outbox.reject(&entry.idempotency_key, reason)?;
         }
         let remaining = self.outbox.pending()?;
         self.outbox.compact(&remaining)?;
+        self.mirror_committed_outbox()?;
+        let remaining = self.outbox.pending()?;
+        self.recovery_uses_local_state = remaining.iter().any(|entry| !entry.redis_committed);
+        self.recovery_replay_committed =
+            !self.recovery_uses_local_state && remaining.iter().any(|entry| entry.redis_committed);
         Ok(())
     }
 
@@ -521,7 +714,8 @@ impl CoordinatorInner {
             if remote_revision != self.revision {
                 self.sync_from_redis_current()?;
             }
-            self.reconcile_outbox()
+            self.reconcile_outbox()?;
+            self.checkpoint_snapshot_if_due()
         } else {
             self.try_reconnect()
         }
@@ -548,6 +742,7 @@ impl BackendCoordinator {
 
     fn open_with_configuration(path: &Path, redis_configured: bool) -> Result<Self, StoreError> {
         let mut inner = CoordinatorInner::new(path, redis_configured)?;
+        inner.background_standby_sync = redis_configured;
         if redis_configured {
             if let Ok(Some(adapter)) = RedisAdapter::from_env() {
                 if inner.attach_redis(adapter).is_err() {
@@ -658,6 +853,7 @@ impl BackendCoordinator {
                     idempotency_key: key.clone(),
                     name: name.to_owned(),
                     arguments: Value::Object(arguments.clone()),
+                    redis_committed: false,
                 })
                 .map_err(BackendToolError::Execution)?;
             outbox_key = Some(key);
@@ -686,20 +882,17 @@ impl BackendCoordinator {
                         name: name.to_owned(),
                         workspace: operation_workspace(name, arguments).unwrap_or_default(),
                     };
-                    match inner.publish_local_state(&[operation], &projections) {
+                    match inner.publish_local_deltas(&[operation], &projections) {
                         Ok(()) => {
                             inner
                                 .outbox
-                                .complete(key)
+                                .mark_redis_committed(key)
                                 .map_err(BackendToolError::Execution)?;
-                            let remaining = inner
-                                .outbox
-                                .pending()
-                                .map_err(BackendToolError::Execution)?;
-                            inner
-                                .outbox
-                                .compact(&remaining)
-                                .map_err(BackendToolError::Execution)?;
+                            if !inner.background_standby_sync {
+                                inner
+                                    .mirror_committed_outbox()
+                                    .map_err(BackendToolError::Execution)?;
+                            }
                         }
                         Err(RedisError::Conflict { .. }) => {
                             inner.enter_sqlite_fallback();
@@ -815,6 +1008,38 @@ fn redis_operation_for_entry(entry: &OutboxEntry) -> RedisOperation {
     }
 }
 
+fn standby_already_contains(
+    store: &Store,
+    name: &str,
+    arguments: &Map<String, Value>,
+) -> Result<bool, StoreError> {
+    match name {
+        "create_database" => {
+            let Some(database) = arguments.get("name").and_then(Value::as_str) else {
+                return Ok(false);
+            };
+            Ok(store
+                .list_databases()?
+                .into_iter()
+                .any(|candidate| candidate.name == database))
+        }
+        "create_workspace" => {
+            let Some(workspace) = arguments
+                .get("id")
+                .or_else(|| arguments.get("workspace"))
+                .and_then(Value::as_str)
+            else {
+                return Ok(false);
+            };
+            Ok(store
+                .list_workspaces()?
+                .into_iter()
+                .any(|candidate| candidate.id == workspace))
+        }
+        _ => Ok(false),
+    }
+}
+
 fn operation_workspace(name: &str, arguments: &Map<String, Value>) -> Option<String> {
     let workspace = arguments
         .get("workspace")
@@ -850,6 +1075,66 @@ fn native_projections_for_operation(
     Ok(projections)
 }
 
+fn native_deltas(
+    previous: &[RedisNativeProjection],
+    current: &[RedisNativeProjection],
+) -> Result<Vec<RedisNativeDelta>, StoreError> {
+    current
+        .iter()
+        .map(|projection| {
+            let previous_entities = previous
+                .iter()
+                .find(|candidate| candidate.workspace == projection.workspace)
+                .map(|candidate| {
+                    candidate
+                        .entities
+                        .iter()
+                        .map(|entity| ((entity.kind.clone(), entity.id.clone()), entity.clone()))
+                        .collect::<BTreeMap<_, _>>()
+                })
+                .unwrap_or_default();
+            let current_entities = projection
+                .entities
+                .iter()
+                .map(|entity| ((entity.kind.clone(), entity.id.clone()), entity.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let upserts = current_entities
+                .iter()
+                .filter_map(|(key, entity)| {
+                    (previous_entities.get(key) != Some(entity)).then_some(entity.clone())
+                })
+                .collect::<Vec<_>>();
+            let deletes = previous_entities
+                .keys()
+                .filter(|key| !current_entities.contains_key(*key))
+                .map(|(kind, id)| RedisNativeEntityKey {
+                    kind: kind.clone(),
+                    id: id.clone(),
+                })
+                .collect::<Vec<_>>();
+            Ok(RedisNativeDelta {
+                workspace: projection.workspace.clone(),
+                upserts,
+                deletes,
+                entity_count: projection.entities.len(),
+            })
+        })
+        .collect()
+}
+
+fn apply_native_cache(cache: &mut Vec<RedisNativeProjection>, current: &[RedisNativeProjection]) {
+    for projection in current {
+        if let Some(existing) = cache
+            .iter_mut()
+            .find(|candidate| candidate.workspace == projection.workspace)
+        {
+            *existing = projection.clone();
+        } else {
+            cache.push(projection.clone());
+        }
+    }
+}
+
 fn native_projections_for_entries(
     store: &Store,
     entries: &[OutboxEntry],
@@ -878,11 +1163,32 @@ fn native_projections_for_all_workspaces(
     let mut projections = vec![native_projection_for_databases(store)?];
     projections.extend(
         store
-            .list_workspaces()?
+            .list_workspace_ids()?
             .into_iter()
-            .map(|workspace| native_projection_for_workspace(store, &workspace.id))
+            .map(|workspace| native_projection_for_workspace(store, &workspace))
             .collect::<Result<Vec<_>, _>>()?,
     );
+    Ok(projections)
+}
+
+fn native_projections_from_redis(
+    adapter: &RedisAdapter,
+    store: &Store,
+) -> Result<Vec<RedisNativeProjection>, StoreError> {
+    let mut projections = vec![RedisNativeProjection {
+        workspace: NATIVE_SYSTEM_SCOPE.to_owned(),
+        entities: adapter
+            .native_entities(NATIVE_SYSTEM_SCOPE)
+            .map_err(redis_store_error)?,
+    }];
+    for workspace in store.list_workspace_ids()? {
+        projections.push(RedisNativeProjection {
+            workspace: workspace.clone(),
+            entities: adapter
+                .native_entities(&workspace)
+                .map_err(redis_store_error)?,
+        });
+    }
     Ok(projections)
 }
 
@@ -1149,6 +1455,7 @@ mod tests {
             idempotency_key: "op-1".to_owned(),
             name: "remember_fact".to_owned(),
             arguments: json!({"text": "queued", "workspace": "w"}),
+            redis_committed: false,
         };
         outbox.append_pending(entry.clone()).expect("append");
         assert_eq!(outbox.pending().unwrap(), vec![entry.clone()]);
@@ -1168,6 +1475,7 @@ mod tests {
             idempotency_key: "op-rejected".to_owned(),
             name: "remember_fact".to_owned(),
             arguments: json!({"text": "sensitive memory", "workspace": "w"}),
+            redis_committed: false,
         };
         outbox.append_pending(entry).expect("append");
         outbox
@@ -1221,6 +1529,7 @@ mod tests {
                 idempotency_key,
                 name: "remember_fact".to_owned(),
                 arguments,
+                redis_committed: false,
             })
             .expect("pending outbox entry");
 
@@ -1370,6 +1679,52 @@ mod tests {
         assert!(state.active_store.is_some());
         assert_eq!(state.store.list_facts("w").expect("standby facts").len(), 1);
         assert_eq!(state.revision, 2);
+        drop(state);
+        drop(coordinator);
+        server.join().expect("Redis fixture");
+        let _ = fs::remove_file(database.with_extension("outbox.jsonl"));
+        let _ = fs::remove_file(database.with_extension("reconciliation.jsonl"));
+        let _ = fs::remove_file(database.with_extension("db-wal"));
+        let _ = fs::remove_file(database.with_extension("db-shm"));
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
+    fn background_mirror_keeps_redis_commit_and_sqlite_replay_separate() {
+        let values = Arc::new(Mutex::new(HashMap::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server_values = Arc::clone(&values);
+        let server = thread::spawn(move || run_snapshot_redis(listener, server_values, None));
+        let adapter =
+            RedisAdapter::connect(&format!("redis://{address}"), "background-mirror-test")
+                .expect("Redis adapter");
+        let database = test_database_path();
+        let mut inner = CoordinatorInner::new(&database, true).expect("coordinator state");
+        inner.attach_redis(adapter).expect("initial Redis state");
+        inner.background_standby_sync = true;
+        let coordinator = BackendCoordinator {
+            shared: Arc::new(Mutex::new(inner)),
+            stop: None,
+            watcher: None,
+        };
+
+        let arguments = json!({"text": "deferred mirror", "workspace": "w"});
+        coordinator
+            .execute_tool("remember_fact", arguments.as_object().unwrap(), |store| {
+                store
+                    .remember_fact("deferred mirror", "w")
+                    .map(|fact| serde_json::to_value(fact).expect("fact"))
+                    .map_err(BackendToolError::Execution)
+            })
+            .expect("Redis operation");
+
+        let mut state = coordinator.shared.lock().expect("coordinator lock");
+        assert_eq!(state.outbox.pending().unwrap().len(), 1);
+        assert!(state.store.list_facts("w").unwrap().is_empty());
+        state.reconcile_outbox().expect("background mirror");
+        assert!(state.outbox.pending().unwrap().is_empty());
+        assert_eq!(state.store.list_facts("w").unwrap().len(), 1);
         drop(state);
         drop(coordinator);
         server.join().expect("Redis fixture");
@@ -1663,7 +2018,7 @@ mod tests {
             // The first native projection publish must commit before the
             // fixture drops the connection; the next operation then exercises
             // the real client-side loss path.
-            run_snapshot_redis(first_listener, first_values, Some(39));
+            run_snapshot_redis(first_listener, first_values, Some(38));
         });
         let adapter = RedisAdapter::connect(
             &format!("redis://{first_address}"),
@@ -1854,6 +2209,11 @@ mod tests {
                                     .or_default()
                                     .insert(command[2].clone());
                             }
+                            b"SREM" => {
+                                if let Some(members) = sets.get_mut(&command[1]) {
+                                    members.remove(&command[2]);
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -1904,6 +2264,12 @@ mod tests {
                         .or_default()
                         .insert(arguments[2].clone());
                     write_integer(&mut stream, i64::from(inserted));
+                }
+                b"SREM" => {
+                    let removed = sets
+                        .get_mut(&arguments[1])
+                        .is_some_and(|members| members.remove(&arguments[2]));
+                    write_integer(&mut stream, i64::from(removed));
                 }
                 b"DEL" => {
                     let mut deleted = shared_values
