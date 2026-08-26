@@ -1,12 +1,15 @@
 use hex::encode;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, DatabaseName, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::{RefCell, UnsafeCell};
 use std::fmt::{Display, Formatter};
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -525,6 +528,8 @@ pub struct Workspace {
 const MAX_EVENT_PAYLOAD_BYTES: usize = 16 * 1024;
 const MAX_RUN_FILES_BYTES: usize = 64 * 1024;
 const MAX_RUN_DIFF_BYTES: usize = 128 * 1024;
+const MAX_DATABASE_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
+static SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct ConnectionSlot {
     connection: UnsafeCell<Connection>,
@@ -542,6 +547,23 @@ impl ConnectionSlot {
         // the single-threaded stdio dispatcher. No public operation can hold a
         // reference into the slot across a database selection.
         unsafe { std::mem::replace(&mut *self.connection.get(), connection) }
+    }
+
+    fn backup<P: AsRef<Path>>(&self, destination: P) -> rusqlite::Result<()> {
+        self.deref().backup(DatabaseName::Main, destination, None)
+    }
+
+    fn restore<P: AsRef<Path>>(&self, source: P) -> rusqlite::Result<()> {
+        // SAFETY: Store serializes every operation through its dispatcher (and
+        // the coordinator's mutex when the background watcher is enabled), so
+        // no statement can be using the connection while it is restored.
+        unsafe {
+            (&mut *self.connection.get()).restore(
+                DatabaseName::Main,
+                source,
+                None::<fn(rusqlite::backup::Progress)>,
+            )
+        }
     }
 
     fn into_inner(self) -> Connection {
@@ -579,6 +601,50 @@ impl Store {
 
     pub fn in_memory() -> Result<Self, StoreError> {
         Self::from_connection(Connection::open_in_memory()?, None)
+    }
+
+    /// Export the complete SQLite database as a bounded binary snapshot.
+    ///
+    /// The snapshot includes the schema, indexes, FTS tables, and all
+    /// workspaces, unlike the user-facing workspace JSON export. It is used by
+    /// the Redis coordinator as the standby replication payload.
+    pub fn snapshot_bytes(&self) -> Result<Vec<u8>, StoreError> {
+        let path = temporary_snapshot_path("export");
+        create_private_file(&path, &[])?;
+        let result = self
+            .connection
+            .backup(&path)
+            .map_err(StoreError::from)
+            .and_then(|_| {
+                let bytes = fs::read(&path)?;
+                if bytes.len() > MAX_DATABASE_SNAPSHOT_BYTES {
+                    return Err(StoreError::Invalid(
+                        "database snapshot exceeds the configured size limit".to_owned(),
+                    ));
+                }
+                Ok(bytes)
+            });
+        let _ = fs::remove_file(&path);
+        result
+    }
+
+    /// Restore a complete SQLite database snapshot into this store.
+    pub fn restore_snapshot_bytes(&self, bytes: &[u8]) -> Result<(), StoreError> {
+        if bytes.is_empty() {
+            return Err(StoreError::Invalid(
+                "database snapshot must not be empty".to_owned(),
+            ));
+        }
+        if bytes.len() > MAX_DATABASE_SNAPSHOT_BYTES {
+            return Err(StoreError::Invalid(
+                "database snapshot exceeds the configured size limit".to_owned(),
+            ));
+        }
+        let path = temporary_snapshot_path("restore");
+        let result = create_private_file(&path, bytes)
+            .and_then(|_| self.connection.restore(&path).map_err(StoreError::from));
+        let _ = fs::remove_file(&path);
+        result
     }
 
     fn from_connection(
@@ -4099,6 +4165,25 @@ pub fn default_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("data/facts.db"))
 }
 
+fn temporary_snapshot_path(kind: &str) -> PathBuf {
+    let sequence = SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "memory-mcp-rust-{kind}-{}-{sequence}.db",
+        std::process::id()
+    ))
+}
+
+fn create_private_file(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
 fn database_root_for_path(path: &Path) -> PathBuf {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -4759,6 +4844,48 @@ mod tests {
                 facts: 1,
                 contexts: 1
             }
+        );
+    }
+
+    #[test]
+    fn database_snapshot_round_trips_schema_fts_and_state() {
+        let source = Store::in_memory().expect("source store");
+        source
+            .remember_fact("snapshot fact", "workspace-a")
+            .expect("fact");
+        source
+            .put_context("snapshot-context", "Snapshot", "state", "workspace-a")
+            .expect("context");
+        source.create_workspace("workspace-a").expect("workspace");
+
+        let snapshot = source.snapshot_bytes().expect("snapshot bytes");
+        assert!(!snapshot.is_empty());
+
+        let restored = Store::in_memory().expect("restored store");
+        restored
+            .restore_snapshot_bytes(&snapshot)
+            .expect("restore bytes");
+        assert_eq!(
+            restored
+                .search_facts("snapshot", "workspace-a")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            restored
+                .context("snapshot-context", "workspace-a")
+                .unwrap()
+                .expect("restored context")
+                .content,
+            "state"
+        );
+        assert_eq!(
+            restored.list_workspaces().unwrap(),
+            vec![Workspace {
+                id: "workspace-a".to_owned(),
+                status: "active".to_owned()
+            }]
         );
     }
 

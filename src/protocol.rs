@@ -1,3 +1,4 @@
+use crate::backend::{BackendCoordinator, BackendToolError};
 use crate::store::{
     ContextMetadata, DecisionSpec, EntitySpec, EventSpec, EvidenceSpec, FactFilters, FactMetadata,
     FeedbackSpec, HandoffSpec, MeasurementSpec, RelationSpec, RunSpec, Store, StoreError,
@@ -16,7 +17,33 @@ pub fn handle_line(line: &str, store: &Store) -> Option<Value> {
     }
 }
 
+pub fn handle_line_with_coordinator(line: &str, coordinator: &BackendCoordinator) -> Option<Value> {
+    match serde_json::from_str::<Value>(line) {
+        Ok(request) => handle_request_with_coordinator(request, coordinator),
+        Err(_) => Some(error_response(Value::Null, -32700, "Parse error")),
+    }
+}
+
+/// SQLite fixture/compatibility entrypoint. The shipped stdio server uses
+/// `handle_request_with_coordinator` so backend selection and failover are not
+/// bypassed.
 pub fn handle_request(request: Value, store: &Store) -> Option<Value> {
+    handle_request_with(request, |params| call_tool(params, store))
+}
+
+pub fn handle_request_with_coordinator(
+    request: Value,
+    coordinator: &BackendCoordinator,
+) -> Option<Value> {
+    handle_request_with(request, |params| {
+        call_tool_with_coordinator(params, coordinator)
+    })
+}
+
+fn handle_request_with<F>(request: Value, mut call_tool: F) -> Option<Value>
+where
+    F: FnMut(Option<&Value>) -> Result<Value, CallError>,
+{
     let object = match request.as_object() {
         Some(object) => object,
         None => return Some(error_response(Value::Null, -32600, "Invalid Request")),
@@ -61,7 +88,7 @@ pub fn handle_request(request: Value, store: &Store) -> Option<Value> {
             id.clone().unwrap_or(Value::Null),
             json!({"tools": tools::advertised_tools()}),
         ),
-        "tools/call" => match call_tool(object.get("params"), store) {
+        "tools/call" => match call_tool(object.get("params")) {
             Ok(result) => result_response(id.clone().unwrap_or(Value::Null), result),
             Err(CallError::InvalidParams(message)) => {
                 error_response(id.clone().unwrap_or(Value::Null), -32602, &message)
@@ -1047,6 +1074,66 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
     }))
 }
 
+fn call_tool_with_coordinator(
+    params: Option<&Value>,
+    coordinator: &BackendCoordinator,
+) -> Result<Value, CallError> {
+    let params_object = params.and_then(Value::as_object).ok_or_else(|| {
+        CallError::InvalidParams("tools/call params must be an object".to_owned())
+    })?;
+    let name = params_object
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CallError::InvalidParams("tools/call name must be a string".to_owned()))?;
+    let arguments = params_object
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    if !arguments.is_object() {
+        return Err(CallError::InvalidParams(
+            "tools/call arguments must be an object".to_owned(),
+        ));
+    }
+    let request = json!({"name": name, "arguments": arguments});
+    coordinator
+        .execute_tool(
+            name,
+            request["arguments"].as_object().expect("object checked"),
+            |store| call_tool(Some(&request), store).map_err(call_error_to_backend_error),
+        )
+        .map_err(backend_error_to_call_error)
+}
+
+pub(crate) fn replay_tool(
+    name: &str,
+    arguments: &Map<String, Value>,
+    store: &Store,
+) -> Result<Value, StoreError> {
+    let request = json!({"name": name, "arguments": arguments});
+    call_tool(Some(&request), store).map_err(call_error_to_store_error)
+}
+
+fn call_error_to_store_error(error: CallError) -> StoreError {
+    match error {
+        CallError::InvalidParams(message) => StoreError::Invalid(message),
+        CallError::Execution(error) => error,
+    }
+}
+
+fn call_error_to_backend_error(error: CallError) -> BackendToolError {
+    match error {
+        CallError::InvalidParams(message) => BackendToolError::InvalidParams(message),
+        CallError::Execution(error) => BackendToolError::Execution(error),
+    }
+}
+
+fn backend_error_to_call_error(error: BackendToolError) -> CallError {
+    match error {
+        BackendToolError::InvalidParams(message) => CallError::InvalidParams(message),
+        BackendToolError::Execution(error) => CallError::Execution(error),
+    }
+}
+
 fn required_string<'a>(arguments: &'a Map<String, Value>, key: &str) -> Result<&'a str, CallError> {
     arguments
         .get(key)
@@ -1284,7 +1371,9 @@ fn error_response(id: Value, code: i64, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::BackendCoordinator;
     use crate::store::Store;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn initialize_and_tools_list_match_contract_baseline() {
@@ -1305,6 +1394,39 @@ mod tests {
             .unwrap()
             .iter()
             .any(|tool| tool["name"] == "decay_sweep"));
+    }
+
+    #[test]
+    fn every_advertised_tool_crosses_the_coordinator_route() {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let database = std::env::temp_dir().join(format!(
+            "memory-mcp-rust-coverage-{}-{timestamp}.db",
+            std::process::id()
+        ));
+        let coordinator = BackendCoordinator::sqlite_only(&database).expect("coordinator");
+
+        for name in tools::TOOL_NAMES {
+            let params = json!({"name": name, "arguments": {}});
+            let result = call_tool_with_coordinator(Some(&params), &coordinator);
+            if let Err(error) = result {
+                match error {
+                    CallError::InvalidParams(_) => {}
+                    CallError::Execution(StoreError::Invalid(message)) => {
+                        assert!(
+                            !message.contains("tool not implemented in parity slice"),
+                            "{name} fell through the coordinator route: {message}"
+                        );
+                    }
+                    CallError::Execution(_) => {}
+                }
+            }
+        }
+
+        let _ = std::fs::remove_file(&database);
+        let _ = std::fs::remove_file(database.with_extension("outbox.jsonl"));
     }
 
     #[test]

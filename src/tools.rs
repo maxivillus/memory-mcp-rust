@@ -1022,6 +1022,52 @@ pub fn is_advertised(name: &str) -> bool {
     TOOL_NAMES.contains(&name)
 }
 
+/// Return whether a tool changes durable memory state.
+///
+/// The coordinator uses this small explicit table to avoid exporting a full
+/// SQLite image for read-only calls. Tools that only write an external backup
+/// file are intentionally excluded: the database state itself is unchanged.
+pub fn is_state_mutating(name: &str) -> bool {
+    matches!(
+        name,
+        "remember_fact"
+            | "add_fact"
+            | "absorb"
+            | "ingest_turn"
+            | "confirm_fact"
+            | "sweep_freshness"
+            | "decay_sweep"
+            | "embed_backfill"
+            | "run_begin"
+            | "run_end"
+            | "link_run"
+            | "record_measurement"
+            | "record_feedback"
+            | "categorize_pending"
+            | "forget_fact"
+            | "restore_fact"
+            | "put_context"
+            | "ingest_document"
+            | "reduce_context"
+            | "capture_event"
+            | "handoff_begin"
+            | "handoff_accept"
+            | "handoff_cancel"
+            | "remember_entity"
+            | "remember_relation"
+            | "record_decision"
+            | "attach_evidence"
+            | "create_database"
+            | "archive_database"
+            | "delete_database"
+            | "select_database"
+            | "reset_database"
+            | "create_workspace"
+            | "archive_workspace"
+            | "reset_workspace"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1056,5 +1102,14 @@ mod tests {
             recall["inputSchema"]["required"],
             json!(["query", "workspace"])
         );
+    }
+
+    #[test]
+    fn state_mutation_table_has_explicit_read_only_boundary() {
+        assert!(is_state_mutating("remember_fact"));
+        assert!(is_state_mutating("add_fact"));
+        assert!(is_state_mutating("reset_workspace"));
+        assert!(!is_state_mutating("search_facts"));
+        assert!(!is_state_mutating("backup_workspace"));
     }
 }

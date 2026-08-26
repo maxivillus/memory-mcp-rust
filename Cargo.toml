@@ -7,8 +7,7 @@ description = "A compatibility-first Rust implementation of the memory-mcp stdio
 
 [dependencies]
 hex = "0.4"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["backup", "bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-

@@ -424,6 +424,31 @@ Redis already replaces every SQLite-backed MCP table. The full MCP contract
 continues to use the SQLite store unless a later parity gate explicitly wires
 the Redis adapter into the server backend.
 
+## Current coordinator implementation
+
+The first Redis-primary implementation slice is now wired into the stdio
+server through `BackendCoordinator`:
+
+- Redis stores a bounded, namespaced SQLite state snapshot and a monotonic
+  revision; `WATCH`/`MULTI`/`EXEC` protects the revision-checked publish;
+- the complete local `Store` remains the materialized execution engine, so all
+  80 advertised tools and the `add_fact` compatibility alias cross the same
+  coordinator route;
+- the coordinator selects Redis when its probe succeeds, otherwise serves the
+  complete SQLite implementation, records degraded writes in a durable,
+  idempotent JSONL outbox, and reconciles back with Redis priority;
+- the watcher reads only the small revision key while the state is unchanged,
+  fetches a snapshot only after a revision change, uses bounded backoff, and
+  stops with the coordinator lifecycle;
+- `BackendCoordinator::status()` exposes only backend, connection, revision,
+  lag, and outbox counters.
+
+This is a correctness-first snapshot coordinator, not yet a claim of a native
+per-entity Redis schema or a performance win. The compatibility `Store` is
+deliberately retained as the materialized state needed for the full route;
+the direct `handle_line` API remains a SQLite fixture path, while the shipped
+stdio binary uses `handle_line_with_coordinator`.
+
 ## Redis-first backend contract
 
 The original backend requirement is restored and supersedes the optional-adapter
@@ -463,30 +488,20 @@ policy above for the next implementation stages:
 - credentials remain environment-only and are never emitted in logs, reports,
   test fixtures, or protocol responses.
 
-The current code does not yet satisfy this contract. `RedisAdapter` remains a
-four-operation benchmark adapter, while the stdio server is SQLite-backed.
-The implementation plan is therefore a gated migration rather than a claim
-that the existing adapter is already a full backend:
+The remaining production-acceptance work is a gated migration rather than a
+claim that the snapshot coordinator is already a native Redis backend:
 
-1. define one backend interface matching the complete Store/protocol surface
-   and make the dispatcher depend only on that interface;
-2. define a workspace/database-isolated Redis schema with atomic idempotency,
-   lifecycle, indexing, export, and backup semantics for every Store entity;
-3. implement the Redis backend operation group by operation group, with a
-   coverage test that maps all 80 advertised tools plus the `add_fact` alias;
-4. add the resource-bounded replication cursor, SQLite outbox, controlled
-   failover, recovery reconciliation, Redis-priority conflict handling, and
-   bounded health/lag state;
-5. route all 80 advertised tools plus `add_fact` through the coordinator and
-   add a machine-readable coverage check;
-6. add reachable-Redis, unavailable-Redis, forced-connection-loss, offline
-   write, replay, conflict, migration, isolation, lag, backoff, and clean-stop
-   tests;
-7. update runtime selection, documentation, benchmark interpretation, and
-   delivery gates only after the complete route and recovery protocol are
-   covered.
+1. replace the bounded snapshot transport with a workspace/database-isolated
+   per-entity Redis schema while preserving the complete Store semantics;
+2. make Redis-side idempotency markers and conflict records durable across
+   reconnects, including the remaining operation groups and backup semantics;
+3. add migration, isolation, conflict, lag, backoff, clean-stop, and resource
+   measurements against a real Redis service, not only the bounded RESP fixture;
+4. complete the formatter, test, lint, AppSec, artifact, QA, and PM gates and
+   only then make a production performance claim.
 
 The proposed architecture and recovery protocol are recorded in
-`docs/decisions/ADR-0001-redis-primary-with-sqlite-fallback.md`. Until the
-full route and its gates pass, the server intentionally remains on SQLite so
-that a reachable Redis endpoint cannot produce a misleading partial mode.
+`docs/decisions/ADR-0001-redis-primary-with-sqlite-fallback.md`; its status
+remains Proposed until PM/TechLead acceptance. A reachable Redis endpoint now
+selects the coordinator's Redis-primary snapshot mode, and an unavailable
+endpoint falls back to SQLite without enabling a partial fact-only route.

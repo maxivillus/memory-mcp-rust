@@ -56,6 +56,24 @@ has a clean stop path and exposes only safe counters/lag state. The 80-tool
 coverage check is a hard gate: all advertised tools and the `add_fact` alias
 must use the same coordinator path.
 
+## Implementation checkpoint
+
+The first implementation slice wires `BackendCoordinator` into the shipped
+stdio server and routes the complete 80-tool inventory plus `add_fact` through
+it. Redis currently holds a bounded namespaced SQLite snapshot and revision;
+the local `Store` is the materialized execution engine and SQLite hot standby.
+Stateful calls append to a durable JSONL outbox before execution, publish a
+revision-checked snapshot with `WATCH`/`MULTI`/`EXEC` while Redis is primary,
+and replay bounded offline writes with Redis priority after recovery. The
+watcher reads the revision key only while state is unchanged and uses bounded
+backoff.
+
+This checkpoint is intentionally correctness-first. It proves the route,
+snapshot durability, fallback, recovery, and bounded watcher behavior, but it
+does not claim a native per-entity Redis schema, complete Redis-side
+idempotency records, or production performance. Those remain acceptance work;
+the ADR status stays Proposed until PM/TechLead review.
+
 The implementation is staged behind a coverage gate:
 
 1. define and test one backend interface and coordinator state machine;

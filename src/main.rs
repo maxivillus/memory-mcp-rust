@@ -1,12 +1,13 @@
-use memory_mcp_rust::protocol::handle_line;
-use memory_mcp_rust::store::{default_path, Store};
+use memory_mcp_rust::backend::BackendCoordinator;
+use memory_mcp_rust::protocol::handle_line_with_coordinator;
+use memory_mcp_rust::store::default_path;
 use std::io::{self, BufRead, Write};
 
 fn main() {
-    let store = match Store::open(default_path()) {
-        Ok(store) => store,
+    let coordinator = match BackendCoordinator::open(default_path()) {
+        Ok(coordinator) => coordinator,
         Err(error) => {
-            eprintln!("failed to open memory store: {error}");
+            eprintln!("failed to open memory backend: {error}");
             std::process::exit(1);
         }
     };
@@ -20,7 +21,7 @@ fn main() {
                 break;
             }
         };
-        if let Some(response) = handle_line(&line, &store) {
+        if let Some(response) = handle_line_with_coordinator(&line, &coordinator) {
             let encoded = match serde_json::to_vec(&response) {
                 Ok(encoded) => encoded,
                 Err(error) => {

@@ -12,6 +12,7 @@ const REDIS_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_RESP_LINE_BYTES: usize = 64 * 1024;
 const MAX_RESP_BULK_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RESP_DEPTH: usize = 16;
+const MAX_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum RedisError {
@@ -19,6 +20,7 @@ pub enum RedisError {
     Io(std::io::Error),
     Protocol(String),
     Json(serde_json::Error),
+    Conflict { expected: u64, actual: u64 },
 }
 
 impl Display for RedisError {
@@ -28,6 +30,12 @@ impl Display for RedisError {
             Self::Io(error) => write!(f, "Redis I/O error: {error}"),
             Self::Protocol(message) => write!(f, "Redis protocol error: {message}"),
             Self::Json(error) => write!(f, "Redis fact encoding error: {error}"),
+            Self::Conflict { expected, actual } => {
+                write!(
+                    f,
+                    "Redis state revision changed (expected {expected}, actual {actual})"
+                )
+            }
         }
     }
 }
@@ -52,6 +60,11 @@ pub struct RedisAdapter {
 }
 
 impl RedisAdapter {
+    pub fn configured() -> bool {
+        std::env::var_os("MEMORY_MCP_REDIS_URL").is_some()
+            || std::env::var_os("REDIS_URL").is_some()
+    }
+
     pub fn from_env() -> Result<Option<Self>, RedisError> {
         Self::from_env_with_namespace_suffix("")
     }
@@ -91,6 +104,139 @@ impl RedisAdapter {
 
     pub fn namespace(&self) -> &str {
         &self.namespace
+    }
+
+    /// Check the existing connection without fetching the replicated state.
+    pub fn ping(&self) -> Result<(), RedisError> {
+        let pong = self.command(vec![b"PING".to_vec()])?;
+        if matches!(pong, RespValue::Simple(value) if value == b"PONG") {
+            Ok(())
+        } else {
+            Err(RedisError::Protocol("PING did not return PONG".to_owned()))
+        }
+    }
+
+    /// Read the small state revision key used by the bounded watcher.
+    pub fn state_revision(&self) -> Result<u64, RedisError> {
+        let value = self
+            .command(vec![
+                b"GET".to_vec(),
+                self.state_revision_key().into_bytes(),
+            ])?
+            .into_bulk("GET")?;
+        let Some(value) = value else {
+            return Ok(0);
+        };
+        let value = std::str::from_utf8(&value)
+            .map_err(|_| RedisError::Protocol("state revision is not UTF-8".to_owned()))?;
+        value
+            .parse::<u64>()
+            .map_err(|_| RedisError::Protocol("state revision is not an integer".to_owned()))
+    }
+
+    /// Read the complete replicated SQLite image only when the caller needs it.
+    pub fn state_snapshot(&self) -> Result<Option<Vec<u8>>, RedisError> {
+        let value = self
+            .command(vec![
+                b"GET".to_vec(),
+                self.state_snapshot_key().into_bytes(),
+            ])?
+            .into_bulk("GET")?;
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        if value.len() > MAX_SNAPSHOT_BYTES {
+            return Err(RedisError::Protocol(
+                "state snapshot exceeds the configured size limit".to_owned(),
+            ));
+        }
+        Ok(Some(value))
+    }
+
+    /// Publish one complete state image after checking the last observed
+    /// revision. Redis WATCH/MULTI/EXEC makes the check and write atomic with
+    /// respect to other coordinators.
+    pub fn publish_state(
+        &self,
+        expected_revision: u64,
+        snapshot: &[u8],
+    ) -> Result<u64, RedisError> {
+        if snapshot.is_empty() {
+            return Err(RedisError::Invalid(
+                "state snapshot must not be empty".to_owned(),
+            ));
+        }
+        if snapshot.len() > MAX_SNAPSHOT_BYTES {
+            return Err(RedisError::Invalid(
+                "state snapshot exceeds the configured size limit".to_owned(),
+            ));
+        }
+        let watched = self.command(vec![
+            b"WATCH".to_vec(),
+            self.state_snapshot_key().into_bytes(),
+            self.state_revision_key().into_bytes(),
+        ])?;
+        if !matches!(watched, RespValue::Simple(value) if value == b"OK") {
+            return Err(RedisError::Protocol("WATCH did not return OK".to_owned()));
+        }
+        let actual = self.state_revision()?;
+        if actual != expected_revision {
+            let _ = self.command(vec![b"UNWATCH".to_vec()]);
+            return Err(RedisError::Conflict {
+                expected: expected_revision,
+                actual,
+            });
+        }
+        let multi = self.command(vec![b"MULTI".to_vec()])?;
+        if !matches!(multi, RespValue::Simple(value) if value == b"OK") {
+            return Err(RedisError::Protocol("MULTI did not return OK".to_owned()));
+        }
+        for (command, arguments) in [
+            (
+                "SET",
+                vec![
+                    b"SET".to_vec(),
+                    self.state_snapshot_key().into_bytes(),
+                    snapshot.to_vec(),
+                ],
+            ),
+            (
+                "INCR",
+                vec![b"INCR".to_vec(), self.state_revision_key().into_bytes()],
+            ),
+        ] {
+            let queued = self.command(arguments)?;
+            if !matches!(queued, RespValue::Simple(value) if value == b"QUEUED") {
+                return Err(RedisError::Protocol(format!(
+                    "{command} was not queued in the Redis transaction"
+                )));
+            }
+        }
+        let result = self.command(vec![b"EXEC".to_vec()])?;
+        let mut values = match result {
+            RespValue::Array(Some(values)) => values,
+            RespValue::Array(None) => {
+                let actual = self.state_revision().unwrap_or(expected_revision);
+                return Err(RedisError::Conflict {
+                    expected: expected_revision,
+                    actual,
+                });
+            }
+            _ => {
+                return Err(RedisError::Protocol(
+                    "EXEC returned a non-array response".to_owned(),
+                ))
+            }
+        };
+        if values.len() != 2 {
+            return Err(RedisError::Protocol(
+                "EXEC returned an unexpected result count".to_owned(),
+            ));
+        }
+        let _stored = values.remove(0).into_simple("SET")?;
+        let revision = values.remove(0).into_integer("INCR")?;
+        u64::try_from(revision)
+            .map_err(|_| RedisError::Protocol("state revision overflowed".to_owned()))
     }
 
     pub fn remember_fact(&self, text: &str, workspace: &str) -> Result<Fact, RedisError> {
@@ -220,6 +366,14 @@ impl RedisAdapter {
 
     fn workspace_key(&self, workspace: &str) -> String {
         self.key(&format!("workspace:{}", digest(workspace)))
+    }
+
+    fn state_snapshot_key(&self) -> String {
+        self.key("state:snapshot")
+    }
+
+    fn state_revision_key(&self) -> String {
+        self.key("state:revision")
     }
 
     fn fact_key(&self, text: &str, workspace: &str) -> String {
@@ -433,6 +587,15 @@ enum RespValue {
 }
 
 impl RespValue {
+    fn into_simple(self, command: &str) -> Result<Vec<u8>, RedisError> {
+        match self {
+            Self::Simple(value) => Ok(value),
+            _ => Err(RedisError::Protocol(format!(
+                "{command} returned a non-simple response"
+            ))),
+        }
+    }
+
     fn into_integer(self, command: &str) -> Result<i64, RedisError> {
         match self {
             Self::Integer(value) => Ok(value),
@@ -610,22 +773,67 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut values = HashMap::<Vec<u8>, Vec<u8>>::new();
             let mut sets = HashMap::<Vec<u8>, BTreeSet<Vec<u8>>>::new();
-            let mut next_id = 0;
+            let mut transaction: Option<Vec<Vec<Vec<u8>>>> = None;
             while let Ok(RespValue::Array(Some(arguments))) = read_resp(&mut stream, 0) {
                 let arguments = arguments
                     .into_iter()
                     .map(|argument| argument.into_bulk("test").unwrap().unwrap())
                     .collect::<Vec<_>>();
                 let command = String::from_utf8_lossy(&arguments[0]).to_string();
+                if let Some(queue) = transaction.as_mut() {
+                    if command != "EXEC" {
+                        queue.push(arguments);
+                        write_simple(&mut stream, b"QUEUED");
+                        continue;
+                    }
+                }
                 match command.as_str() {
                     "PING" => write_simple(&mut stream, b"PONG"),
+                    "WATCH" | "UNWATCH" => write_simple(&mut stream, b"OK"),
+                    "MULTI" => {
+                        transaction = Some(Vec::new());
+                        write_simple(&mut stream, b"OK");
+                    }
+                    "EXEC" => {
+                        let queued = transaction.take().unwrap_or_default();
+                        let mut revision = None;
+                        for arguments in queued {
+                            match arguments[0].as_slice() {
+                                b"SET" => {
+                                    values.insert(arguments[1].clone(), arguments[2].clone());
+                                }
+                                b"INCR" => {
+                                    let current = values
+                                        .get(&arguments[1])
+                                        .map(|value| {
+                                            String::from_utf8_lossy(value).parse::<i64>().unwrap()
+                                        })
+                                        .unwrap_or(0)
+                                        + 1;
+                                    values.insert(
+                                        arguments[1].clone(),
+                                        current.to_string().into_bytes(),
+                                    );
+                                    revision = Some(current);
+                                }
+                                _ => {}
+                            }
+                        }
+                        write_exec_results(&mut stream, revision.unwrap_or(0));
+                    }
                     "GET" => write_bulk(&mut stream, values.get(&arguments[1])),
                     "INCR" => {
-                        next_id += 1;
-                        write_integer(&mut stream, next_id);
+                        let current = values
+                            .get(&arguments[1])
+                            .map(|value| String::from_utf8_lossy(value).parse::<i64>().unwrap())
+                            .unwrap_or(0)
+                            + 1;
+                        values.insert(arguments[1].clone(), current.to_string().into_bytes());
+                        write_integer(&mut stream, current);
                     }
                     "SET" => {
-                        if values.contains_key(&arguments[1]) {
+                        let nx = arguments.iter().any(|argument| argument == b"NX");
+                        if nx && values.contains_key(&arguments[1]) {
                             write_bulk(&mut stream, None);
                         } else {
                             values.insert(arguments[1].clone(), arguments[2].clone());
@@ -676,6 +884,20 @@ mod tests {
         );
         assert_eq!(adapter.reset_workspace("workspace").unwrap(), 1);
         assert!(adapter.list_facts("workspace").unwrap().is_empty());
+        assert_eq!(adapter.state_revision().unwrap(), 0);
+        assert_eq!(adapter.publish_state(0, b"sqlite-image").unwrap(), 1);
+        assert_eq!(adapter.state_revision().unwrap(), 1);
+        assert_eq!(
+            adapter.state_snapshot().unwrap(),
+            Some(b"sqlite-image".to_vec())
+        );
+        assert!(matches!(
+            adapter.publish_state(0, b"new-image"),
+            Err(RedisError::Conflict {
+                expected: 0,
+                actual: 1
+            })
+        ));
         drop(adapter);
         server.join().unwrap();
     }
@@ -718,5 +940,12 @@ mod tests {
         for value in values {
             write_bulk(stream, Some(value));
         }
+    }
+
+    fn write_exec_results(stream: &mut TcpStream, revision: i64) {
+        stream.write_all(b"*2\r\n+OK\r\n").unwrap();
+        stream
+            .write_all(format!(":{revision}\r\n").as_bytes())
+            .unwrap();
     }
 }
