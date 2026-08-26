@@ -278,3 +278,18 @@ storage:
 The remaining provenance/evidence attachment, export, database management,
 measurement, feedback, and advanced retrieval tools remain staged. No Redis
 or embedding implementation is claimed.
+
+The seventh implementation slice adds evidence and deterministic export:
+
+- attach_evidence stores a workspace-scoped fact anchor with source/checksum,
+  repository path and symbol, line/column ranges, selected-text SHA-256, and
+  resolution status; duplicate anchors replay safely and conflicting anchors
+  are rejected;
+- get_provenance reads the fact's evidence anchors without exposing stored
+  selected text;
+- export returns a JSON-serializable workspace snapshot across facts,
+  contexts, events, handoffs, graph, decisions, and evidence;
+- export_rdf emits stable relation triples ordered by relation id.
+
+Database selection/backup, aggregate measurement, feedback, and advanced
+retrieval remain staged. No Redis or embedding implementation is claimed.

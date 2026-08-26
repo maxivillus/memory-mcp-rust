@@ -174,6 +174,58 @@ pub struct DecisionConflict {
     pub outcomes: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceSpec {
+    pub fact_id: i64,
+    pub source_ref: String,
+    pub source: String,
+    pub checksum: String,
+    pub fetched_at: Option<String>,
+    pub repository_ref: String,
+    pub path: String,
+    pub symbol: String,
+    pub line_start: Option<i64>,
+    pub line_end: Option<i64>,
+    pub column_start: Option<i64>,
+    pub column_end: Option<i64>,
+    pub selected_text: String,
+    pub resolution_status: String,
+    pub workspace: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Evidence {
+    pub id: i64,
+    pub fact_id: i64,
+    pub source_ref: String,
+    pub source: String,
+    pub checksum: String,
+    pub fetched_at: Option<String>,
+    pub repository_ref: String,
+    pub path: String,
+    pub symbol: String,
+    pub line_start: Option<i64>,
+    pub line_end: Option<i64>,
+    pub column_start: Option<i64>,
+    pub column_end: Option<i64>,
+    pub selected_text_sha256: String,
+    pub resolution_status: String,
+    pub workspace: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct MemoryExport {
+    pub facts: Vec<Fact>,
+    pub contexts: Vec<Context>,
+    pub events: Vec<LifecycleEvent>,
+    pub handoffs: Vec<Handoff>,
+    pub entities: Vec<Entity>,
+    pub relations: Vec<Relation>,
+    pub decisions: Vec<Decision>,
+    pub evidence: Vec<Evidence>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Context {
     pub reference: String,
@@ -461,11 +513,33 @@ impl Store {
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (parent_id) REFERENCES decisions(id) ON DELETE SET NULL
             );
+            CREATE TABLE IF NOT EXISTS evidence (
+                id INTEGER PRIMARY KEY,
+                fact_id INTEGER NOT NULL,
+                source_ref TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT '',
+                checksum TEXT NOT NULL DEFAULT '',
+                fetched_at TEXT,
+                repository_ref TEXT NOT NULL DEFAULT '',
+                path TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                line_start INTEGER,
+                line_end INTEGER,
+                column_start INTEGER,
+                column_end INTEGER,
+                selected_text_sha256 TEXT NOT NULL DEFAULT '',
+                resolution_status TEXT NOT NULL DEFAULT 'unresolved',
+                workspace_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (workspace_id, fact_id, source_ref),
+                FOREIGN KEY (fact_id) REFERENCES facts(id) ON DELETE CASCADE
+            );
             ",
         )?;
         self.ensure_entity_columns()?;
         self.ensure_relation_columns()?;
         self.ensure_decision_columns()?;
+        self.ensure_evidence_columns()?;
         self.connection.execute_batch(
             "CREATE INDEX IF NOT EXISTS entities_canonical_idx
                 ON entities (workspace_id, canonical_name);
@@ -474,7 +548,9 @@ impl Store {
              CREATE INDEX IF NOT EXISTS relations_object_idx
                 ON relations (workspace_id, object_id);
              CREATE INDEX IF NOT EXISTS decisions_subject_idx
-                ON decisions (workspace_id, subject);",
+                ON decisions (workspace_id, subject);
+             CREATE INDEX IF NOT EXISTS evidence_fact_idx
+                ON evidence (workspace_id, fact_id);",
         )?;
         self.connection.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS decisions_fts
@@ -714,6 +790,40 @@ impl Store {
             if !columns.iter().any(|column| column == name) {
                 self.connection.execute(
                     &format!("ALTER TABLE decisions ADD COLUMN {name} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_evidence_columns(&self) -> Result<(), StoreError> {
+        let mut statement = self.connection.prepare("PRAGMA table_info(evidence)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let additions = [
+            ("fact_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("source_ref", "TEXT NOT NULL DEFAULT ''"),
+            ("source", "TEXT NOT NULL DEFAULT ''"),
+            ("checksum", "TEXT NOT NULL DEFAULT ''"),
+            ("fetched_at", "TEXT"),
+            ("repository_ref", "TEXT NOT NULL DEFAULT ''"),
+            ("path", "TEXT NOT NULL DEFAULT ''"),
+            ("symbol", "TEXT NOT NULL DEFAULT ''"),
+            ("line_start", "INTEGER"),
+            ("line_end", "INTEGER"),
+            ("column_start", "INTEGER"),
+            ("column_end", "INTEGER"),
+            ("selected_text_sha256", "TEXT NOT NULL DEFAULT ''"),
+            ("resolution_status", "TEXT NOT NULL DEFAULT 'unresolved'"),
+            ("workspace_id", "TEXT NOT NULL DEFAULT ''"),
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+        ];
+        for (name, definition) in additions {
+            if !columns.iter().any(|column| column == name) {
+                self.connection.execute(
+                    &format!("ALTER TABLE evidence ADD COLUMN {name} {definition}"),
                     [],
                 )?;
             }
@@ -1676,6 +1786,201 @@ impl Store {
             .collect())
     }
 
+    pub fn list_entities(&self, workspace: &str) -> Result<Vec<Entity>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, name, canonical_name, entity_type, aliases, workspace_id
+             FROM entities
+             WHERE workspace_id = ?1
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![workspace], map_entity)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)?;
+        Ok(rows)
+    }
+
+    pub fn list_relations(&self, workspace: &str) -> Result<Vec<Relation>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, subject_id, predicate, object_id, source_fact_id, workspace_id
+             FROM relations
+             WHERE workspace_id = ?1
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![workspace], map_relation)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)?;
+        Ok(rows)
+    }
+
+    pub fn list_decisions(&self, workspace: &str) -> Result<Vec<Decision>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, category, subject, scenario, reasoning,
+                    outcome, confidence, decision_maker, issue_ref,
+                    path, symbol, parent_id, workspace_id
+             FROM decisions
+             WHERE workspace_id = ?1
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![workspace], map_decision)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)?;
+        Ok(rows)
+    }
+
+    pub fn attach_evidence(&self, spec: &EvidenceSpec) -> Result<Evidence, StoreError> {
+        validate_evidence_spec(spec)?;
+        if self.fact_by_id(spec.fact_id, &spec.workspace)?.is_none() {
+            return Err(StoreError::Invalid(format!(
+                "fact not found: {}",
+                spec.fact_id
+            )));
+        }
+        if let Some(fetched_at) = spec.fetched_at.as_deref() {
+            self.validate_timestamp(fetched_at, "evidence fetched_at")?;
+        }
+        let selected_text_sha256 = sha256(&spec.selected_text);
+        if let Some(existing) =
+            self.evidence_by_key(spec.fact_id, &spec.source_ref, &spec.workspace)?
+        {
+            if existing.source != spec.source
+                || existing.checksum != spec.checksum
+                || existing.fetched_at != spec.fetched_at
+                || existing.repository_ref != spec.repository_ref
+                || existing.path != spec.path
+                || existing.symbol != spec.symbol
+                || existing.line_start != spec.line_start
+                || existing.line_end != spec.line_end
+                || existing.column_start != spec.column_start
+                || existing.column_end != spec.column_end
+                || existing.selected_text_sha256 != selected_text_sha256
+                || existing.resolution_status != spec.resolution_status
+            {
+                return Err(StoreError::Invalid(
+                    "evidence source ref conflicts with an existing record".to_owned(),
+                ));
+            }
+            return Ok(existing);
+        }
+        self.connection.execute(
+            "INSERT INTO evidence
+                (fact_id, source_ref, source, checksum, fetched_at, repository_ref,
+                 path, symbol, line_start, line_end, column_start, column_end,
+                 selected_text_sha256, resolution_status, workspace_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                spec.fact_id,
+                spec.source_ref,
+                spec.source,
+                spec.checksum,
+                spec.fetched_at,
+                spec.repository_ref,
+                spec.path,
+                spec.symbol,
+                spec.line_start,
+                spec.line_end,
+                spec.column_start,
+                spec.column_end,
+                selected_text_sha256,
+                spec.resolution_status,
+                spec.workspace
+            ],
+        )?;
+        self.evidence_by_key(spec.fact_id, &spec.source_ref, &spec.workspace)?
+            .ok_or_else(|| {
+                StoreError::Invalid("evidence insert did not produce a readable row".to_owned())
+            })
+    }
+
+    pub fn get_provenance(
+        &self,
+        fact_id: i64,
+        workspace: &str,
+    ) -> Result<Vec<Evidence>, StoreError> {
+        validate_context_workspace(workspace)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, fact_id, source_ref, source, checksum, fetched_at,
+                    repository_ref, path, symbol, line_start, line_end,
+                    column_start, column_end, selected_text_sha256,
+                    resolution_status, workspace_id, created_at
+             FROM evidence
+             WHERE fact_id = ?1 AND workspace_id = ?2
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![fact_id, workspace], map_evidence)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)?;
+        Ok(rows)
+    }
+
+    pub fn list_evidence(&self, workspace: &str) -> Result<Vec<Evidence>, StoreError> {
+        validate_context_workspace(workspace)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, fact_id, source_ref, source, checksum, fetched_at,
+                    repository_ref, path, symbol, line_start, line_end,
+                    column_start, column_end, selected_text_sha256,
+                    resolution_status, workspace_id, created_at
+             FROM evidence
+             WHERE workspace_id = ?1
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![workspace], map_evidence)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)?;
+        Ok(rows)
+    }
+
+    pub fn export_snapshot(&self, workspace: &str) -> Result<MemoryExport, StoreError> {
+        validate_context_workspace(workspace)?;
+        Ok(MemoryExport {
+            facts: self.list_facts(workspace)?,
+            contexts: self.list_contexts(workspace)?,
+            events: self.list_events(workspace)?,
+            handoffs: self.list_handoffs(workspace)?,
+            entities: self.list_entities(workspace)?,
+            relations: self.list_relations(workspace)?,
+            decisions: self.list_decisions(workspace)?,
+            evidence: self.list_evidence(workspace)?,
+        })
+    }
+
+    pub fn export_rdf(&self, workspace: &str) -> Result<String, StoreError> {
+        validate_graph_workspace(workspace)?;
+        let mut statement = self.connection.prepare(
+            "SELECT subject.name, relations.predicate, object.name
+             FROM relations
+             JOIN entities subject ON subject.id = relations.subject_id
+             JOIN entities object ON object.id = relations.object_id
+             WHERE relations.workspace_id = ?1
+             ORDER BY relations.id",
+        )?;
+        let rows = statement.query_map(params![workspace], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut output = String::new();
+        for row in rows {
+            let (subject, predicate, object) = row?;
+            output.push_str(&format!(
+                "<{}> <{}> <{}> .\n",
+                escape_rdf(&subject),
+                escape_rdf(&predicate),
+                escape_rdf(&object)
+            ));
+        }
+        Ok(output)
+    }
+
     pub fn stats(&self) -> Result<Stats, StoreError> {
         let facts = self
             .connection
@@ -1929,6 +2234,27 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    fn evidence_by_key(
+        &self,
+        fact_id: i64,
+        source_ref: &str,
+        workspace: &str,
+    ) -> Result<Option<Evidence>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, fact_id, source_ref, source, checksum, fetched_at,
+                        repository_ref, path, symbol, line_start, line_end,
+                        column_start, column_end, selected_text_sha256,
+                        resolution_status, workspace_id, created_at
+                 FROM evidence
+                 WHERE fact_id = ?1 AND source_ref = ?2 AND workspace_id = ?3",
+                params![fact_id, source_ref, workspace],
+                map_evidence,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     fn validate_timestamp(&self, value: &str, label: &str) -> Result<(), StoreError> {
         let parsed: Option<f64> =
             self.connection
@@ -2129,6 +2455,28 @@ fn map_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<Decision> {
     })
 }
 
+fn map_evidence(row: &rusqlite::Row<'_>) -> rusqlite::Result<Evidence> {
+    Ok(Evidence {
+        id: row.get(0)?,
+        fact_id: row.get(1)?,
+        source_ref: row.get(2)?,
+        source: row.get(3)?,
+        checksum: row.get(4)?,
+        fetched_at: row.get(5)?,
+        repository_ref: row.get(6)?,
+        path: row.get(7)?,
+        symbol: row.get(8)?,
+        line_start: row.get(9)?,
+        line_end: row.get(10)?,
+        column_start: row.get(11)?,
+        column_end: row.get(12)?,
+        selected_text_sha256: row.get(13)?,
+        resolution_status: row.get(14)?,
+        workspace: row.get(15)?,
+        created_at: row.get(16)?,
+    })
+}
+
 fn map_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspace> {
     Ok(Workspace {
         id: row.get(0)?,
@@ -2293,6 +2641,49 @@ fn canonical_name(name: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+fn validate_evidence_spec(spec: &EvidenceSpec) -> Result<(), StoreError> {
+    validate_context_workspace(&spec.workspace)?;
+    if spec.fact_id <= 0 {
+        return Err(StoreError::Invalid(
+            "evidence fact id must be positive".to_owned(),
+        ));
+    }
+    for (value, label) in [
+        (&spec.source_ref, "evidence source ref"),
+        (&spec.resolution_status, "evidence resolution status"),
+    ] {
+        if value.trim().is_empty() {
+            return Err(StoreError::Invalid(format!("{label} must not be empty")));
+        }
+    }
+    for (start, end, label) in [
+        (spec.line_start, spec.line_end, "line"),
+        (spec.column_start, spec.column_end, "column"),
+    ] {
+        if start.is_some_and(|value| value < 0) || end.is_some_and(|value| value < 0) {
+            return Err(StoreError::Invalid(format!(
+                "evidence {label} offsets must not be negative"
+            )));
+        }
+        if let (Some(start), Some(end)) = (start, end) {
+            if end < start {
+                return Err(StoreError::Invalid(format!(
+                    "evidence {label} end must not precede start"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn escape_rdf(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 fn validate_event_spec(spec: &EventSpec) -> Result<(), StoreError> {
@@ -2773,6 +3164,10 @@ mod tests {
         let graph = store.search_graph("rust", "workspace-a").unwrap();
         assert_eq!(graph.entities.len(), 1);
         assert_eq!(graph.relations, vec![relation]);
+        assert_eq!(
+            store.export_rdf("workspace-a").unwrap(),
+            "<Rust> <uses> <SQLite> .\n"
+        );
         assert!(store
             .search_graph("rust", "workspace-b")
             .unwrap()
@@ -2843,6 +3238,55 @@ mod tests {
             .query_decisions("fallback", "workspace-b")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn evidence_provenance_and_workspace_export_are_deterministic() {
+        let store = Store::in_memory().expect("fresh store");
+        let fact = store
+            .remember_fact("Evidence-backed fact", "workspace-a")
+            .expect("fact");
+        store
+            .put_context("ctx-a", "Context", "Evidence context", "workspace-a")
+            .expect("context");
+        let spec = EvidenceSpec {
+            fact_id: fact.id,
+            source_ref: "docs/current-contract.md".to_owned(),
+            source: "repository".to_owned(),
+            checksum: "source-checksum".to_owned(),
+            fetched_at: Some("2026-08-26T00:00:00Z".to_owned()),
+            repository_ref: "main".to_owned(),
+            path: "docs/current-contract.md".to_owned(),
+            symbol: "contract".to_owned(),
+            line_start: Some(1),
+            line_end: Some(3),
+            column_start: Some(1),
+            column_end: Some(20),
+            selected_text: "Evidence context".to_owned(),
+            resolution_status: "resolved".to_owned(),
+            workspace: "workspace-a".to_owned(),
+        };
+        let evidence = store.attach_evidence(&spec).expect("evidence");
+        assert_eq!(evidence.selected_text_sha256, sha256("Evidence context"));
+        assert_eq!(store.attach_evidence(&spec).unwrap(), evidence);
+        assert!(store
+            .attach_evidence(&EvidenceSpec {
+                checksum: "different".to_owned(),
+                ..spec.clone()
+            })
+            .is_err());
+        assert_eq!(
+            store.get_provenance(fact.id, "workspace-b").unwrap(),
+            Vec::new()
+        );
+        let export = store
+            .export_snapshot("workspace-a")
+            .expect("workspace export");
+        assert_eq!(export.facts.len(), 1);
+        assert_eq!(export.contexts.len(), 1);
+        assert_eq!(export.evidence, vec![evidence]);
+        assert!(export.events.is_empty());
+        assert!(export.handoffs.is_empty());
     }
 
     #[test]
@@ -2920,6 +3364,15 @@ mod tests {
                     INSERT INTO decisions
                         (subject, scenario, outcome, workspace_id)
                     VALUES ('legacy subject', 'legacy scenario', 'legacy outcome', 'legacy');
+                    CREATE TABLE evidence (
+                        id INTEGER PRIMARY KEY,
+                        fact_id INTEGER NOT NULL,
+                        source_ref TEXT NOT NULL,
+                        workspace_id TEXT NOT NULL
+                    );
+                    INSERT INTO evidence
+                        (fact_id, source_ref, workspace_id)
+                    VALUES (1, 'legacy-source', 'legacy');
                     CREATE TABLE lifecycle_events (
                         id INTEGER PRIMARY KEY,
                         idempotency_key TEXT NOT NULL,
@@ -2963,6 +3416,7 @@ mod tests {
             1
         );
         assert_eq!(store.query_decisions("legacy", "legacy").unwrap().len(), 1);
+        assert_eq!(store.list_evidence("legacy").unwrap().len(), 1);
         let _ = fs::remove_file(path);
     }
 }

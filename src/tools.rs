@@ -265,6 +265,60 @@ fn tool_contract(name: &str) -> (&'static str, Value) {
                 "required": ["query"]
             }),
         ),
+        "attach_evidence" => (
+            "Attach a bounded source anchor and selected-text hash to a fact.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "fact_id": {"type": "integer"},
+                    "id": {"type": "integer"},
+                    "source_ref": {"type": "string"},
+                    "source": {"type": "string"},
+                    "checksum": {"type": "string"},
+                    "fetched_at": {"type": "string"},
+                    "repository_ref": {"type": "string"},
+                    "repo_ref": {"type": "string"},
+                    "path": {"type": "string"},
+                    "symbol": {"type": "string"},
+                    "line_start": {"type": "integer", "minimum": 0},
+                    "line_end": {"type": "integer", "minimum": 0},
+                    "column_start": {"type": "integer", "minimum": 0},
+                    "column_end": {"type": "integer", "minimum": 0},
+                    "selected_text": {"type": "string"},
+                    "resolution_status": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["fact_id", "source_ref", "workspace"]
+            }),
+        ),
+        "get_provenance" => (
+            "List evidence anchors attached to a fact.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "fact_id": {"type": "integer"},
+                    "id": {"type": "integer"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["fact_id", "workspace"]
+            }),
+        ),
+        "export" => (
+            "Export a deterministic workspace-scoped memory snapshot.",
+            workspace_schema(),
+        ),
+        "export_rdf" => (
+            "Export workspace graph relations as deterministic RDF-like triples.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                }
+            }),
+        ),
         "put_context" => (
             "Store an immutable workspace-scoped context.",
             json!({

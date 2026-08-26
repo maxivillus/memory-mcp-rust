@@ -1,6 +1,6 @@
 use crate::store::{
-    ContextMetadata, DecisionSpec, EntitySpec, EventSpec, FactFilters, FactMetadata, HandoffSpec,
-    RelationSpec, Store, StoreError,
+    ContextMetadata, DecisionSpec, EntitySpec, EventSpec, EvidenceSpec, FactFilters, FactMetadata,
+    HandoffSpec, RelationSpec, Store, StoreError,
 };
 use crate::tools;
 use serde_json::{json, Map, Value};
@@ -530,6 +530,68 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
             )
             .expect("decision conflicts serialize")
         }
+        "attach_evidence" => {
+            let fact_id =
+                required_i64(arguments, "fact_id").or_else(|_| required_i64(arguments, "id"))?;
+            let source_ref = required_string(arguments, "source_ref")
+                .or_else(|_| required_string(arguments, "source"))?;
+            let spec = EvidenceSpec {
+                fact_id,
+                source_ref: source_ref.to_owned(),
+                source: optional_string(arguments, "source")?
+                    .unwrap_or("")
+                    .to_owned(),
+                checksum: optional_string(arguments, "checksum")?
+                    .unwrap_or("")
+                    .to_owned(),
+                fetched_at: optional_string(arguments, "fetched_at")?.map(ToOwned::to_owned),
+                repository_ref: optional_string(arguments, "repository_ref")?
+                    .or(optional_string(arguments, "repo_ref")?)
+                    .unwrap_or("")
+                    .to_owned(),
+                path: optional_string(arguments, "path")?.unwrap_or("").to_owned(),
+                symbol: optional_string(arguments, "symbol")?
+                    .unwrap_or("")
+                    .to_owned(),
+                line_start: optional_i64(arguments, &["line_start"])?,
+                line_end: optional_i64(arguments, &["line_end"])?,
+                column_start: optional_i64(arguments, &["column_start"])?,
+                column_end: optional_i64(arguments, &["column_end"])?,
+                selected_text: optional_string(arguments, "selected_text")?
+                    .unwrap_or("")
+                    .to_owned(),
+                resolution_status: optional_string(arguments, "resolution_status")?
+                    .unwrap_or("unresolved")
+                    .to_owned(),
+                workspace: required_context_workspace(arguments)?.to_owned(),
+            };
+            serde_json::to_value(store.attach_evidence(&spec).map_err(CallError::Execution)?)
+                .expect("evidence serializes")
+        }
+        "get_provenance" => {
+            let fact_id =
+                required_i64(arguments, "fact_id").or_else(|_| required_i64(arguments, "id"))?;
+            let workspace = required_context_workspace(arguments)?;
+            serde_json::to_value(
+                store
+                    .get_provenance(fact_id, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("provenance serializes")
+        }
+        "export" => {
+            let workspace = required_context_workspace(arguments)?;
+            serde_json::to_value(
+                store
+                    .export_snapshot(workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("memory export serializes")
+        }
+        "export_rdf" => {
+            serde_json::to_value(store.export_rdf(workspace).map_err(CallError::Execution)?)
+                .expect("RDF export serializes")
+        }
         "create_workspace" => {
             let id = workspace_argument(arguments)?;
             serde_json::to_value(store.create_workspace(id).map_err(CallError::Execution)?)
@@ -1013,5 +1075,48 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("\"outcome\":\"SQLite\""));
+    }
+
+    #[test]
+    fn evidence_and_export_tools_are_reachable_through_stdio_dispatch() {
+        let store = Store::in_memory().unwrap();
+        let fact = handle_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"remember_fact","arguments":{"text":"Evidence fact","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let fact_text = fact["result"]["content"][0]["text"].as_str().unwrap();
+        let fact_value: Value = serde_json::from_str(fact_text).unwrap();
+        let fact_id = fact_value["id"].as_i64().unwrap();
+        let put = handle_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"put_context","arguments":{"ref":"ctx-a","name":"Context","content":"Evidence context","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(!put["result"]["isError"].as_bool().unwrap());
+
+        let attach = format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"attach_evidence","arguments":{{"fact_id":{fact_id},"source_ref":"docs/current-contract.md","path":"docs/current-contract.md","selected_text":"Evidence context","resolution_status":"resolved","workspace":"w"}}}}}}"#
+        );
+        let attached = handle_line(&attach, &store).unwrap();
+        assert!(!attached["result"]["isError"].as_bool().unwrap());
+        let provenance = handle_line(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_provenance","arguments":{"fact_id":1,"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(provenance["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("docs/current-contract.md"));
+        let export = handle_line(
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"export","arguments":{"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(export["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"evidence\""));
     }
 }
