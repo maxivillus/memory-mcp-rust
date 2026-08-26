@@ -92,6 +92,21 @@ pub struct FactVerification {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FactChunk {
+    pub fact_id: i64,
+    pub index: i64,
+    pub total: i64,
+    pub content: String,
+    pub byte_size: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Recall {
+    pub facts: Vec<Fact>,
+    pub contexts: Vec<Context>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Entity {
     pub id: i64,
     pub name: String,
@@ -869,6 +884,17 @@ impl Store {
         })
     }
 
+    pub fn absorb(&self, texts: &[String], workspace: &str) -> Result<Vec<Fact>, StoreError> {
+        texts
+            .iter()
+            .map(|text| self.remember_fact(text, workspace))
+            .collect()
+    }
+
+    pub fn ingest_turn(&self, text: &str, workspace: &str) -> Result<Fact, StoreError> {
+        self.remember_fact(text, workspace)
+    }
+
     pub fn search_facts(&self, query: &str, workspace: &str) -> Result<Vec<Fact>, StoreError> {
         self.search_facts_with_filters(query, workspace, &FactFilters::default())
     }
@@ -1171,27 +1197,7 @@ impl Store {
         let context = self
             .context(reference, workspace)?
             .ok_or_else(|| StoreError::Invalid(format!("context not found: {reference}")))?;
-        let mut chunks = Vec::new();
-        let mut current = String::new();
-        let mut current_size = 0usize;
-        for character in context.content.chars() {
-            let character_size = character.len_utf8();
-            if character_size > max_bytes {
-                return Err(StoreError::Invalid(
-                    "context chunk size is smaller than one UTF-8 character".to_owned(),
-                ));
-            }
-            if current_size > 0 && current_size + character_size > max_bytes {
-                chunks.push(current);
-                current = String::new();
-                current_size = 0;
-            }
-            current.push(character);
-            current_size += character_size;
-        }
-        if !current.is_empty() || chunks.is_empty() {
-            chunks.push(current);
-        }
+        let chunks = split_utf8_chunks(&context.content, max_bytes)?;
         let total = chunks.len() as i64;
         Ok(chunks
             .into_iter()
@@ -2044,6 +2050,51 @@ impl Store {
         })
     }
 
+    pub fn chunk_fact(
+        &self,
+        id: i64,
+        max_bytes: usize,
+        workspace: &str,
+    ) -> Result<Vec<FactChunk>, StoreError> {
+        if max_bytes == 0 {
+            return Err(StoreError::Invalid(
+                "fact chunk size must be positive".to_owned(),
+            ));
+        }
+        let fact = self
+            .fact_by_id(id, workspace)?
+            .ok_or_else(|| StoreError::Invalid(format!("fact not found: {id}")))?;
+        let chunks = split_utf8_chunks(&fact.text, max_bytes)?;
+        let total = chunks.len() as i64;
+        Ok(chunks
+            .into_iter()
+            .enumerate()
+            .map(|(index, content)| FactChunk {
+                fact_id: id,
+                index: index as i64,
+                total,
+                byte_size: content.len() as i64,
+                content,
+            })
+            .collect())
+    }
+
+    pub fn search_semantic(&self, query: &str, workspace: &str) -> Result<Vec<Fact>, StoreError> {
+        self.search_facts(query, workspace)
+    }
+
+    pub fn compose_recall(&self, query: &str, workspace: &str) -> Result<Recall, StoreError> {
+        validate_context_workspace(workspace)?;
+        Ok(Recall {
+            facts: self.search_facts(query, workspace)?,
+            contexts: self.search_contexts(query, workspace)?,
+        })
+    }
+
+    pub fn search_index(&self, query: &str, workspace: &str) -> Result<Recall, StoreError> {
+        self.compose_recall(query, workspace)
+    }
+
     pub fn create_workspace(&self, id: &str) -> Result<Workspace, StoreError> {
         validate_workspace(id)?;
         self.connection.execute(
@@ -2686,6 +2737,36 @@ fn escape_rdf(value: &str) -> String {
         .replace('\r', "\\r")
 }
 
+fn split_utf8_chunks(content: &str, max_bytes: usize) -> Result<Vec<String>, StoreError> {
+    if max_bytes == 0 {
+        return Err(StoreError::Invalid(
+            "chunk size must be positive".to_owned(),
+        ));
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_size = 0usize;
+    for character in content.chars() {
+        let character_size = character.len_utf8();
+        if character_size > max_bytes {
+            return Err(StoreError::Invalid(
+                "chunk size is smaller than one UTF-8 character".to_owned(),
+            ));
+        }
+        if current_size > 0 && current_size + character_size > max_bytes {
+            chunks.push(current);
+            current = String::new();
+            current_size = 0;
+        }
+        current.push(character);
+        current_size += character_size;
+    }
+    if !current.is_empty() || chunks.is_empty() {
+        chunks.push(current);
+    }
+    Ok(chunks)
+}
+
 fn validate_event_spec(spec: &EventSpec) -> Result<(), StoreError> {
     validate_context_workspace(&spec.workspace)?;
     for (value, label) in [
@@ -2948,6 +3029,74 @@ mod tests {
             entry.child_reference == "ctx-reduced" && entry.relation == "reduced_from"
         }));
         assert_eq!(store.context_map(None, "workspace-b").unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn ingestion_fact_chunking_and_composed_recall_are_workspace_scoped() {
+        let store = Store::in_memory().expect("fresh store");
+        let absorbed = store
+            .absorb(
+                &[
+                    "Rust memory".to_owned(),
+                    "Rust memory".to_owned(),
+                    "SQLite index".to_owned(),
+                ],
+                "workspace-a",
+            )
+            .expect("absorbed facts");
+        assert_eq!(absorbed.len(), 3);
+        assert_eq!(absorbed[0].id, absorbed[1].id);
+        assert_ne!(absorbed[0].id, absorbed[2].id);
+
+        let turn = store
+            .ingest_turn("память", "workspace-a")
+            .expect("ingested turn");
+        let chunks = store
+            .chunk_fact(turn.id, 4, "workspace-a")
+            .expect("UTF-8-safe fact chunks");
+        assert!(chunks.iter().all(|chunk| chunk.byte_size <= 4));
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.content.as_str())
+                .collect::<String>(),
+            turn.text
+        );
+        assert!(chunks.iter().enumerate().all(|(index, chunk)| {
+            chunk.fact_id == turn.id
+                && chunk.index == index as i64
+                && chunk.total == chunks.len() as i64
+        }));
+        assert!(store.chunk_fact(turn.id, 1, "workspace-a").is_err());
+        assert!(store.chunk_fact(turn.id, 4, "workspace-b").is_err());
+
+        store
+            .put_context(
+                "ctx-rust",
+                "Rust context",
+                "Rust workspace context",
+                "workspace-a",
+            )
+            .expect("context");
+        let semantic = store
+            .search_semantic("SQLite", "workspace-a")
+            .expect("lexical semantic fallback");
+        assert_eq!(semantic, vec![absorbed[2].clone()]);
+
+        let recall = store
+            .compose_recall("Rust", "workspace-a")
+            .expect("composed recall");
+        assert!(recall.facts.iter().any(|fact| fact.text == "Rust memory"));
+        assert_eq!(recall.contexts.len(), 1);
+        assert_eq!(recall.contexts[0].reference, "ctx-rust");
+        assert_eq!(
+            store.search_index("Rust", "workspace-b").unwrap(),
+            Recall {
+                facts: Vec::new(),
+                contexts: Vec::new()
+            }
+        );
+        assert!(store.compose_recall("Rust", "").is_err());
     }
 
     #[test]

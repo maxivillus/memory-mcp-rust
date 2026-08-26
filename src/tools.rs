@@ -121,6 +121,32 @@ fn tool_contract(name: &str) -> (&'static str, Value) {
                 "required": ["text"]
             }),
         ),
+        "absorb" => (
+            "Deduplicate and store one or more facts.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "texts": {"type": "array", "items": {"type": "string"}},
+                    "facts": {"type": "array", "items": {"type": "string"}},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                }
+            }),
+        ),
+        "ingest_turn" => (
+            "Ingest one turn as a deduplicated fact.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "turn": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["text"]
+            }),
+        ),
         "search_facts" => (
             "Search active facts with optional provenance filters.",
             json!({
@@ -156,6 +182,45 @@ fn tool_contract(name: &str) -> (&'static str, Value) {
         "verify_facts" => (
             "Verify stored fact SHA-256 hashes in a workspace.",
             workspace_schema(),
+        ),
+        "chunk_fact" => (
+            "Return ordered UTF-8-safe byte-bounded fact chunks.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "fact_id": {"type": "integer"},
+                    "max_bytes": {"type": "integer", "minimum": 1},
+                    "chunk_size": {"type": "integer", "minimum": 1},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["id"]
+            }),
+        ),
+        "search_semantic" => (
+            "Search facts using the deterministic SQLite lexical fallback.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["query"]
+            }),
+        ),
+        "compose_recall" | "search_index" => (
+            "Compose a workspace-scoped lexical recall from facts and contexts.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["query", "workspace"]
+            }),
         ),
         "list_forgotten" => (
             "List forgotten facts with provenance metadata.",
@@ -561,6 +626,22 @@ mod tests {
         assert_eq!(
             put_context["inputSchema"]["required"],
             json!(["ref", "name", "content", "workspace"])
+        );
+        let absorb = advertised_tools()
+            .into_iter()
+            .find(|tool| tool["name"] == "absorb")
+            .expect("absorb schema");
+        assert_eq!(
+            absorb["inputSchema"]["properties"]["texts"]["type"],
+            "array"
+        );
+        let recall = advertised_tools()
+            .into_iter()
+            .find(|tool| tool["name"] == "compose_recall")
+            .expect("compose_recall schema");
+        assert_eq!(
+            recall["inputSchema"]["required"],
+            json!(["query", "workspace"])
         );
     }
 }

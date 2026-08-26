@@ -293,3 +293,20 @@ The seventh implementation slice adds evidence and deterministic export:
 
 Database selection/backup, aggregate measurement, feedback, and advanced
 retrieval remain staged. No Redis or embedding implementation is claimed.
+
+The eighth implementation slice adds bounded lexical ingestion and retrieval:
+
+- absorb deduplicates and stores a batch of facts, while ingest_turn provides
+  the single-turn form;
+- chunk_fact reuses the UTF-8-safe byte-bound contract already used by
+  chunk_context and preserves ordered chunk metadata;
+- search_semantic is explicitly a deterministic SQLite lexical fallback; it
+  does not claim an embedding provider or semantic similarity;
+- compose_recall and search_index combine workspace-scoped fact and context
+  matches into one recall payload;
+- store and stdio protocol tests cover deduplication, UTF-8 boundaries,
+  workspace isolation, aliases, and the recall payload.
+
+Database selection/backup, aggregate measurement, feedback, and the remaining
+advanced retrieval and document-ingestion tools remain staged. No Redis or
+embedding implementation is claimed.

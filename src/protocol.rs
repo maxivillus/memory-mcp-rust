@@ -154,6 +154,25 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
             )
             .expect("Fact serializes")
         }
+        "absorb" => {
+            let texts = string_array_or_single(arguments, &["texts", "facts"], &["text"])?;
+            serde_json::to_value(
+                store
+                    .absorb(&texts, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("absorbed facts serialize")
+        }
+        "ingest_turn" => {
+            let text = required_string(arguments, "text")
+                .or_else(|_| required_string(arguments, "turn"))?;
+            serde_json::to_value(
+                store
+                    .ingest_turn(text, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("ingested fact serializes")
+        }
         "search_facts" => {
             let query = arguments
                 .get("query")
@@ -168,6 +187,15 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
                     .map_err(CallError::Execution)?,
             )
             .expect("facts serialize")
+        }
+        "search_semantic" => {
+            let query = required_string(arguments, "query")?;
+            serde_json::to_value(
+                store
+                    .search_semantic(query, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("semantic fallback serializes")
         }
         "list_facts" => {
             let filters = fact_filters(arguments)?;
@@ -210,6 +238,28 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
                 .map_err(CallError::Execution)?,
         )
         .expect("fact verification serializes"),
+        "chunk_fact" => {
+            let id =
+                required_i64(arguments, "id").or_else(|_| required_i64(arguments, "fact_id"))?;
+            let max_bytes = optional_usize(arguments, &["max_bytes", "chunk_size"], 4096)?;
+            serde_json::to_value(
+                store
+                    .chunk_fact(id, max_bytes, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("fact chunks serialize")
+        }
+        "compose_recall" | "search_index" => {
+            let query = required_string(arguments, "query")?;
+            let context_workspace = required_context_workspace(arguments)?;
+            let recall = if name == "compose_recall" {
+                store.compose_recall(query, context_workspace)
+            } else {
+                store.search_index(query, context_workspace)
+            }
+            .map_err(CallError::Execution)?;
+            serde_json::to_value(recall).expect("recall serializes")
+        }
         "put_context" => {
             let reference = required_string(arguments, "ref")
                 .or_else(|_| required_string(arguments, "reference"))?;
@@ -691,6 +741,26 @@ fn required_string_array(
         .collect()
 }
 
+fn string_array_or_single(
+    arguments: &Map<String, Value>,
+    array_keys: &[&str],
+    single_keys: &[&str],
+) -> Result<Vec<String>, CallError> {
+    for key in array_keys {
+        if arguments.contains_key(*key) {
+            return Ok(optional_string_array(arguments, key)?.unwrap_or_default());
+        }
+    }
+    for key in single_keys {
+        if let Some(value) = optional_string(arguments, key)? {
+            return Ok(vec![value.to_owned()]);
+        }
+    }
+    Err(CallError::InvalidParams(
+        "tool requires text or an array of texts".to_owned(),
+    ))
+}
+
 fn optional_usize(
     arguments: &Map<String, Value>,
     keys: &[&str],
@@ -950,6 +1020,78 @@ mod tests {
         let map_value: Value = serde_json::from_str(map_text).unwrap();
         assert_eq!(map_value.as_array().unwrap().len(), 1);
         assert_eq!(map_value[0]["relation"], "reduced_from");
+    }
+
+    #[test]
+    fn ingestion_and_recall_tools_are_reachable_through_stdio_dispatch() {
+        let store = Store::in_memory().unwrap();
+        let absorbed = handle_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"absorb","arguments":{"texts":["Rust memory","SQLite index"],"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let absorbed_text = absorbed["result"]["content"][0]["text"].as_str().unwrap();
+        let absorbed_value: Value = serde_json::from_str(absorbed_text).unwrap();
+        assert_eq!(absorbed_value.as_array().unwrap().len(), 2);
+
+        let turn = handle_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ingest_turn","arguments":{"turn":"Rust turn","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let turn_text = turn["result"]["content"][0]["text"].as_str().unwrap();
+        let turn_value: Value = serde_json::from_str(turn_text).unwrap();
+        let turn_id = turn_value["id"].as_i64().unwrap();
+
+        let chunks_request = format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"chunk_fact","arguments":{{"fact_id":{turn_id},"max_bytes":4,"workspace":"w"}}}}}}"#
+        );
+        let chunks = handle_line(&chunks_request, &store).unwrap();
+        let chunks_text = chunks["result"]["content"][0]["text"].as_str().unwrap();
+        let chunks_value: Value = serde_json::from_str(chunks_text).unwrap();
+        assert_eq!(chunks_value[0]["fact_id"].as_i64().unwrap(), turn_id);
+        assert!(chunks_value
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|chunk| chunk["byte_size"].as_i64().unwrap() <= 4));
+
+        let put = handle_line(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"put_context","arguments":{"ref":"ctx-rust","name":"Rust context","content":"Rust workspace context","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(!put["result"]["isError"].as_bool().unwrap());
+
+        let semantic = handle_line(
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"search_semantic","arguments":{"query":"SQLite","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(semantic["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("SQLite index"));
+
+        let recall = handle_line(
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"compose_recall","arguments":{"query":"Rust","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let recall_text = recall["result"]["content"][0]["text"].as_str().unwrap();
+        let recall_value: Value = serde_json::from_str(recall_text).unwrap();
+        assert!(!recall_value["facts"].as_array().unwrap().is_empty());
+        assert_eq!(recall_value["contexts"][0]["reference"], "ctx-rust");
+
+        let index = handle_line(
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"search_index","arguments":{"query":"Rust","workspace_id":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(!index["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
