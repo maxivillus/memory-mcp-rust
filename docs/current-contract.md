@@ -451,6 +451,15 @@ policy above for the next implementation stages:
   present in the SQLite database and outbox before the response is returned;
 - the coordinator must expose standby lag and reconciliation state without
   exposing payloads or credentials;
+- the background synchronizer must be event/revision driven and bounded: it
+  polls a small health/revision key at a configurable interval, fetches the
+  state only when the revision changes, applies bounded batches, and backs off
+  on errors; it must not rescan the complete dataset on every tick;
+- the Redis watcher must share the coordinator's connection/lifecycle, avoid a
+  busy loop, use bounded timeouts, and stop cleanly with the process;
+- the full 80-tool route is an acceptance gate: every advertised tool and the
+  `add_fact` alias must cross the same coordinator, with no direct dispatcher
+  path that silently bypasses Redis, the standby, or the outbox;
 - credentials remain environment-only and are never emitted in logs, reports,
   test fixtures, or protocol responses.
 
@@ -465,12 +474,15 @@ that the existing adapter is already a full backend:
    lifecycle, indexing, export, and backup semantics for every Store entity;
 3. implement the Redis backend operation group by operation group, with a
    coverage test that maps all 80 advertised tools plus the `add_fact` alias;
-4. add the background replication cursor, SQLite outbox, controlled failover,
-   recovery reconciliation, Redis-priority conflict handling, and bounded
-   health/lag state;
-5. add reachable-Redis, unavailable-Redis, forced-connection-loss, offline
-   write, replay, conflict, migration, and isolation tests;
-6. update the runtime selection, documentation, benchmark interpretation, and
+4. add the resource-bounded replication cursor, SQLite outbox, controlled
+   failover, recovery reconciliation, Redis-priority conflict handling, and
+   bounded health/lag state;
+5. route all 80 advertised tools plus `add_fact` through the coordinator and
+   add a machine-readable coverage check;
+6. add reachable-Redis, unavailable-Redis, forced-connection-loss, offline
+   write, replay, conflict, migration, isolation, lag, backoff, and clean-stop
+   tests;
+7. update runtime selection, documentation, benchmark interpretation, and
    delivery gates only after the complete route and recovery protocol are
    covered.
 

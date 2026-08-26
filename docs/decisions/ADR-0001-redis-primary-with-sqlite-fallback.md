@@ -47,6 +47,15 @@ reconciliation audit until it is explicitly handled. The coordinator refreshes
 SQLite from the resulting Redis state and switches normal traffic back to Redis
 only after the Redis revision and standby cursor are durable.
 
+The synchronizer is deliberately resource-bounded. It uses one coordinator
+health/revision watcher with a configurable interval and bounded timeout, reads
+only a small revision/health value while the revision is unchanged, fetches
+state deltas in bounded batches, and applies exponential backoff after an
+error. It does not perform a full Redis/SQLite scan on every tick. The watcher
+has a clean stop path and exposes only safe counters/lag state. The 80-tool
+coverage check is a hard gate: all advertised tools and the `add_fact` alias
+must use the same coordinator path.
+
 The implementation is staged behind a coverage gate:
 
 1. define and test one backend interface and coordinator state machine;
@@ -77,5 +86,9 @@ adapter cannot be used as acceptance evidence for the full backend.
   degraded writes durably, and does not silently discard outbox entries;
 - recovery applies Redis-priority reconciliation and switches back only after
   both Redis and the SQLite standby are durable;
+- idle and steady-write watcher measurements stay within the agreed CPU,
+  command, byte, and lag budgets, with no unbounded polling or full scan;
+- the machine-readable route matrix covers all 80 advertised tools and the
+  `add_fact` alias;
 - no credentials appear in logs, reports, fixtures, or protocol responses;
 - QA and AppSec are green before PM acceptance.

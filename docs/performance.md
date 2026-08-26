@@ -36,3 +36,10 @@ Full-backend performance claims therefore wait for the parity, replication,
 and failover gates described in `current-contract.md`. Standby lag,
 reconciliation duration, and recovery success are separate reliability
 measurements; they must not be folded into a Redis speedup percentage.
+
+The replication budget is part of the acceptance contract. The watcher uses a
+small revision/health read, fetches a state batch only after a revision change,
+and applies bounded batches with exponential backoff on errors. Resource
+measurements must report watcher CPU time, Redis commands/bytes, SQLite write
+bytes, standby lag, and reconciliation duration under idle, steady-write, and
+recovery workloads. A full-dataset scan on every health tick fails this gate.
