@@ -423,3 +423,43 @@ This adapter is an experimental core-fact comparison surface, not a claim that
 Redis already replaces every SQLite-backed MCP table. The full MCP contract
 continues to use the SQLite store unless a later parity gate explicitly wires
 the Redis adapter into the server backend.
+
+## Redis-first backend contract
+
+The original backend requirement is restored and supersedes the optional-adapter
+policy above for the next implementation stages:
+
+- when the configured Redis endpoint passes the reachability/authentication
+  probe, Redis is the primary backend and every advertised MCP operation,
+  including database and workspace lifecycle operations, is routed through
+  that backend;
+- when Redis is not configured or cannot be reached, the complete operation
+  surface uses the existing SQLite backend as the fallback;
+- a partial Redis route is not an acceptable intermediate claim: an operation
+  must not silently use SQLite while Redis is the selected backend;
+- acknowledged writes must remain durable before a Redis-backed response is
+  returned; reconnect/failover behavior must not create divergent acknowledged
+  writes;
+- credentials remain environment-only and are never emitted in logs, reports,
+  test fixtures, or protocol responses.
+
+The current code does not yet satisfy this contract. `RedisAdapter` remains a
+four-operation benchmark adapter, while the stdio server is SQLite-backed.
+The implementation plan is therefore a gated migration rather than a claim
+that the existing adapter is already a full backend:
+
+1. define one backend interface matching the complete Store/protocol surface
+   and make the dispatcher depend only on that interface;
+2. define a workspace/database-isolated Redis schema with atomic idempotency,
+   lifecycle, indexing, export, and backup semantics for every Store entity;
+3. implement the Redis backend operation group by operation group, with a
+   coverage test that maps all 80 advertised tools plus the `add_fact` alias;
+4. add reachable-Redis integration tests, unavailable-Redis SQLite fallback
+   tests, migration/isolation tests, and controlled connection-loss tests;
+5. update the runtime selection, documentation, benchmark interpretation, and
+   delivery gates only after the complete route is covered.
+
+The proposed architecture and the runtime-loss policy are recorded in
+`docs/decisions/ADR-0001-redis-primary-with-sqlite-fallback.md`. Until the
+full route and its gates pass, the server intentionally remains on SQLite so
+that a reachable Redis endpoint cannot produce a misleading partial mode.

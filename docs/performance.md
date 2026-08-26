@@ -26,7 +26,11 @@ workspace/data shape, warm-up policy, Redis persistence settings, and repeated
 samples with p50/p95 results. Until those controls and an agreed threshold are
 recorded, performance_efficacy remains not_claimed.
 
-The Redis slice intentionally covers only the core fact comparison surface.
-The MCP server's complete parity path remains SQLite-backed; enabling Redis
-does not silently change the source of truth for contexts, lifecycle records,
-graph data, provenance, telemetry, or backups.
+The current Redis benchmark remains a core-fact measurement adapter; it is not
+evidence that the MCP server has switched backends. The Redis-first contract
+requires all advertised tools to use Redis when its probe succeeds and the
+complete SQLite implementation only when Redis is unavailable. The server must
+not enable a partial mode that sends facts to Redis while contexts, lifecycle
+records, graph data, provenance, telemetry, or backups continue on SQLite.
+Full-backend performance claims therefore wait for the parity and failover
+gates described in `current-contract.md`.
