@@ -431,9 +431,11 @@ server through `BackendCoordinator`:
 
 - Redis stores a bounded, namespaced SQLite state snapshot and a monotonic
   revision; `WATCH`/`MULTI`/`EXEC` protects the revision-checked publish;
-- the complete local `Store` remains the materialized execution engine, so all
-  80 advertised tools and the `add_fact` compatibility alias cross the same
-  coordinator route;
+- while Redis is healthy, the coordinator restores a private in-memory
+  materialization from the Redis snapshot and executes all 80 advertised tools
+  plus the `add_fact` compatibility alias against that Redis-owned state; the
+  file-backed SQLite store is updated only after the Redis revision commits and
+  is used as standby/fallback;
 - the coordinator selects Redis when its probe succeeds, otherwise serves the
   complete SQLite implementation, records degraded writes in a durable,
   idempotent JSONL outbox, and reconciles back with Redis priority;
@@ -444,15 +446,17 @@ server through `BackendCoordinator`:
 - the watcher reads only the small revision key while the state is unchanged,
   fetches a snapshot only after a revision change, uses bounded backoff, and
   stops with the coordinator lifecycle;
-- each workspace touched by a state-changing operation also receives a
+- each state-changing operation also receives a system projection for database
+  metadata, and each touched workspace receives a
   bounded native entity projection: hashed workspace/index keys point to
   individually addressable JSON records for facts, contexts, events,
   fact history, context lineage, handoffs, graph, decisions, evidence,
   categories, runs, measurements, feedback, and registered workspaces;
-- native projection replacement, the SQLite standby image, the monotonic
-  revision, and the durable operation ledger are committed in one
+- native projection replacement, the Redis-owned snapshot, the SQLite standby
+  image, the monotonic revision, and the durable operation ledger are committed in one
   `WATCH`/`MULTI`/`EXEC` transaction; a per-workspace manifest records the
-  projection schema version, revision, and bounded entity count;
+  projection schema version, revision, and bounded entity count. A version-2
+  native schema marker makes older snapshot-only namespaces rebuild on attach;
 - the operation ledger is keyed by the SHA-256 operation idempotency key and
   has no TTL. It stores only operation name, workspace hash, status, revision,
   entity count, and a bounded conflict reason. The seven-day marker remains a
@@ -461,15 +465,14 @@ server through `BackendCoordinator`:
   lag, outbox, Redis command/byte, and synchronization tick/error/duration
   counters; it never returns payloads or credentials.
 
-This remains a correctness-first migration slice, not a performance claim or a
-claim that Redis is already the sole execution engine. The native projection
-is now independently addressable and the durable ledger survives marker
-expiry, while the compatibility `Store` remains the materialized execution
-engine and SQLite standby needed for the full route. The bounded snapshot is
-still retained as a restart/standby backup until native reads, migration, and
-all auxiliary tables are independently accepted. The direct `handle_line` API
-remains a SQLite fixture path, while the shipped stdio binary uses
-`handle_line_with_coordinator`.
+This remains a correctness-first implementation, not a performance claim. Redis
+is the sole durable primary when configured: its bounded snapshot and native
+entity/database projections are the source of the active revision. The
+in-memory `Store` is retained as a deterministic compatibility/query engine,
+not as a second durable primary; the file-backed SQLite image is written only
+after a Redis commit and is the fallback/standby image. The direct
+`handle_line` API remains a SQLite fixture path, while the shipped stdio binary
+uses `handle_line_with_coordinator`.
 
 ## Redis-first backend contract
 
@@ -516,18 +519,15 @@ policy above for the next implementation stages:
   explicit URLs take precedence, and credentials remain environment-only and
   are never emitted in logs, reports, test fixtures, or protocol responses.
 
-The remaining production-acceptance work is a gated migration rather than a
-claim that this projection slice is already a complete native Redis backend:
-
-1. make native per-entity records the authoritative Redis read/write path for
-   every Store operation while preserving the complete SQLite semantics;
-2. extend projection coverage to selected database metadata and backup/rebuild
-   migration, with explicit handling of legacy snapshot-only namespaces;
-3. add real-service migration, isolation, conflict, lag, backoff, clean-stop,
-   and resource measurements rather than relying only on the bounded RESP
-   fixture;
-4. complete the formatter, test, lint, AppSec, artifact, QA, and PM gates and
-   only then make a production performance claim.
+Option A is now the selected implementation model: Redis owns the canonical
+revision and the complete operation state, while the compatibility engine is
+rebuilt from that state for each active process. The version-2 schema marker
+and atomic full projection publish migrate legacy snapshot-only namespaces;
+the virtual database catalog is included in the Redis snapshot and database
+metadata is independently indexed under the reserved system scope. Remaining
+release acceptance is limited to real-service migration/isolation/conflict/
+lag/backoff measurements, the formatter/test/lint/AppSec/artifact/QA/PM gates,
+and a separate performance decision. No speedup claim is made here.
 
 The proposed architecture and recovery protocol are recorded in
 `docs/decisions/ADR-0001-redis-primary-with-sqlite-fallback.md`; its status

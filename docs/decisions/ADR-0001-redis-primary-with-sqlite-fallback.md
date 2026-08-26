@@ -107,6 +107,33 @@ The implementation is staged behind a coverage gate:
    replay, conflict, and safe switch-back tests;
 5. run the complete formatter, test, lint, AppSec, artifact, QA, and PM gates.
 
+## Option A implementation checkpoint
+
+The product decision for the next stage is Option A: Redis is the canonical
+primary for the complete 80-tool surface and SQLite is fallback/standby. The
+coordinator now enforces that boundary at the state layer:
+
+- a Redis-primary process restores a private in-memory compatibility engine
+  from the Redis-owned snapshot before serving calls;
+- state-changing calls publish the next snapshot, native workspace entities,
+  database metadata, schema marker, revision, and operation ledger in one
+  revision-checked transaction;
+- the file-backed SQLite image is refreshed only after that Redis transaction
+  commits, so it is not a competing durable write path;
+- named databases in the active in-memory engine use snapshot-backed catalog
+  records, preserving create/list/select/archive/reset/delete/backup semantics
+  across Redis restart and migration;
+- attaching to a namespace without the current native schema marker performs a
+  bounded full projection rebuild before normal traffic resumes.
+
+The native JSON records are independently addressable for inspection and
+workspace/database indexing. The in-memory compatibility engine remains the
+deterministic implementation of the public semantics, but it is rebuilt from
+Redis and never persists independently while Redis is healthy. This preserves
+the full route without introducing a partial fact-only Redis mode. Performance
+efficacy remains unclaimed until the real-service measurements and release
+gates are complete.
+
 ## Consequences
 
 This avoids a misleading partial Redis mode and keeps the current SQLite parity

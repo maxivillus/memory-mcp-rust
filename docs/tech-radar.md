@@ -13,6 +13,9 @@
 | Durable SQLite outbox | Preserve acknowledged fallback writes until Redis recovery reconciliation completes. | `src/backend.rs` |
 | Bounded Redis operation markers | Detect a committed operation after a lost response without retaining operation payloads. | `src/redis.rs`, `src/backend.rs` |
 | Workspace-scoped native Redis entity projection | Store individually addressable bounded JSON records and a workspace index for the exported memory entities during the incremental Redis migration. | `src/redis.rs`, `src/backend.rs` |
+| Redis-owned in-memory execution state | Execute the complete tool surface from a private materialization restored from Redis; update SQLite only after the Redis revision commits. | `src/backend.rs`, `src/store.rs` |
+| Snapshot-backed virtual database catalog | Keep named database isolation, selection, backup, archive, reset, and deletion in the Redis-owned image without making the standby file the primary. | `src/store.rs` |
+| Native schema marker and rebuild | Detect version-1 snapshot-only namespaces and atomically rebuild system/workspace native keys at attach time. | `src/redis.rs`, `src/backend.rs` |
 | Durable Redis operation ledger | Preserve committed/conflict operation metadata beyond the compatibility marker TTL without retaining request payloads. | `src/redis.rs`, `src/backend.rs` |
 | Revision watcher with backoff | Avoid full scans while idle, retry failures without a busy loop, and stop with the coordinator. | `src/backend.rs` |
 | Payload-free resource counters | Measure Redis commands/bytes and synchronization ticks/errors/duration without exposing memory contents. | `src/redis.rs`, `src/backend.rs`, `src/bin/memory-bench.rs` |

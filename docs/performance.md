@@ -45,23 +45,23 @@ and failover gates described in `current-contract.md`. Standby lag,
 reconciliation duration, and recovery success are separate reliability
 measurements; they must not be folded into a Redis speedup percentage.
 
-The current coordinator implementation is a correctness-first Redis-primary
-migration path. A stateful operation still serializes the complete bounded
-SQLite image for standby/restart recovery, but it now also replaces a bounded
-workspace-scoped native entity projection in the same Redis transaction. The
-projection is capped at 4096 entities and 8 MiB per publish; each record is
-individually addressable through a hashed key and a workspace index. The same
-transaction writes a durable operation ledger record with no TTL plus the
-seven-day compatibility marker. These bounds make command and wire cost
-observable, but the local SQLite store remains the full-route materialized
-engine and standby; no native Redis performance win is claimed.
+The current coordinator implements the selected Redis-primary model. A
+stateful operation restores the complete bounded Redis image into a private
+in-memory compatibility engine, then atomically publishes the next Redis
+revision, native per-entity projection, system/database projection, durable
+operation ledger, and SQLite standby image. The file-backed SQLite store is
+not written before the Redis commit and is used only for fallback/standby.
+The projection is capped at 4096 entities and 8 MiB per publish; each record is
+individually addressable through a hashed key and a workspace index. A version-2
+schema marker triggers a bounded full rebuild for legacy snapshot-only
+namespaces. No native Redis performance win is claimed.
 
-The native projection is deliberately an incremental migration boundary. It
-covers the exported workspace entities (facts, contexts, events, fact history,
-context lineage, handoffs, graph, decisions, evidence, categories, runs,
-measurements, feedback, and registered workspaces), while selected database
-metadata and native Redis reads remain follow-up work. Measurements must
-separate projection cost from snapshot backup cost and report
+The native projection covers the exported workspace entities (facts, contexts,
+events, fact history, context lineage, handoffs, graph, decisions, evidence,
+categories, runs, measurements, feedback, and workspaces) plus database
+metadata in the reserved system scope. The complete database catalog, including
+named in-memory database snapshots, is carried in the Redis-owned state image.
+Measurements must separate projection cost from snapshot backup cost and report
 rejection/fallback behavior when either bound is reached.
 
 The replication budget is part of the acceptance contract. The watcher uses a

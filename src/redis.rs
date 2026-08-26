@@ -20,7 +20,8 @@ const MAX_NATIVE_ENTITY_BYTES: usize = 256 * 1024;
 const MAX_NATIVE_ENTITIES: usize = 4096;
 const MAX_NATIVE_PROJECTION_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LEDGER_RECORD_BYTES: usize = 8 * 1024;
-const NATIVE_SCHEMA_VERSION: u8 = 1;
+const NATIVE_SCHEMA_VERSION: u8 = 2;
+pub const NATIVE_SYSTEM_SCOPE: &str = "__system__";
 
 #[derive(Debug)]
 pub enum RedisError {
@@ -85,9 +86,10 @@ pub struct RedisEntityRecord {
     pub payload: serde_json::Value,
 }
 
-/// Bounded projection update for one workspace. A publish replaces this
-/// workspace's indexed entity set in the same Redis transaction as the
-/// revision and operation ledger entries.
+/// Bounded projection update for one scope. A publish replaces this scope's
+/// indexed entity set in the same Redis transaction as the revision and
+/// operation ledger entries. The reserved system scope carries database
+/// metadata.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RedisNativeProjection {
     pub workspace: String,
@@ -295,10 +297,11 @@ impl RedisAdapter {
         self.publish_state_with_projections(expected_revision, snapshot, &[], &operations)
     }
 
-    /// Atomically publish the SQLite standby image, native workspace entity
-    /// projections, a durable operation ledger, and compatibility markers.
-    /// The snapshot remains a bounded standby/backup transport; native entity
-    /// keys are independently addressable and indexed by workspace.
+    /// Atomically publish the Redis-primary state image, native workspace and
+    /// system projections, a durable operation ledger, and compatibility
+    /// markers. The snapshot is the bounded canonical state transport; native
+    /// entity keys are independently addressable and indexed by scope, while
+    /// the coordinator mirrors the committed image to SQLite standby.
     pub fn publish_state_with_projections(
         &self,
         expected_revision: u64,
@@ -379,6 +382,7 @@ impl RedisAdapter {
         let mut watch_keys = vec![
             self.state_snapshot_key().into_bytes(),
             self.state_revision_key().into_bytes(),
+            self.native_schema_key().into_bytes(),
         ];
         watch_keys.extend(
             projection_index_keys
@@ -440,6 +444,16 @@ impl RedisAdapter {
             self,
             vec![b"INCR".to_vec(), self.state_revision_key().into_bytes()],
             "INCR revision",
+        )?;
+        queued_count += 1;
+        queue_transaction_command(
+            self,
+            vec![
+                b"SET".to_vec(),
+                self.native_schema_key().into_bytes(),
+                NATIVE_SCHEMA_VERSION.to_string().into_bytes(),
+            ],
+            "SET native schema",
         )?;
         queued_count += 1;
         for key in &old_entity_keys {
@@ -573,6 +587,7 @@ impl RedisAdapter {
         }
         values.remove(0).into_success("SET snapshot")?;
         let revision = values.remove(0).into_integer("INCR")?;
+        values.remove(0).into_success("SET native schema")?;
         for _ in &old_entity_keys {
             values
                 .remove(0)
@@ -658,6 +673,22 @@ impl RedisAdapter {
         value
             .map(|value| from_slice(&value).map_err(RedisError::from))
             .transpose()
+    }
+
+    /// Return whether the native key layout needs a rebuild. A missing or
+    /// older schema marker is deliberately treated as a migration request;
+    /// the coordinator then republishes the complete bounded projection.
+    pub fn native_schema_needs_rebuild(&self) -> Result<bool, RedisError> {
+        let value = self
+            .command(vec![b"GET".to_vec(), self.native_schema_key().into_bytes()])?
+            .into_bulk("GET")?;
+        let Some(value) = value else {
+            return Ok(true);
+        };
+        let version = String::from_utf8(value).map_err(|_| {
+            RedisError::Protocol("native schema marker is not valid UTF-8".to_owned())
+        })?;
+        Ok(version.parse::<u8>().unwrap_or(0) < NATIVE_SCHEMA_VERSION)
     }
 
     /// Keep the durable ledger as the source of truth if a replay discovers a
@@ -857,6 +888,10 @@ impl RedisAdapter {
 
     fn native_manifest_key(&self, workspace: &str) -> String {
         self.key(&format!("native:manifest:{}", digest(workspace)))
+    }
+
+    fn native_schema_key(&self) -> String {
+        self.key("native:schema")
     }
 
     fn native_entity_key(&self, workspace: &str, entity: &RedisEntityRecord) -> String {
@@ -1746,6 +1781,7 @@ mod tests {
             name: "remember_fact".to_owned(),
             workspace: "workspace".to_owned(),
         };
+        assert!(adapter.native_schema_needs_rebuild().unwrap());
         assert_eq!(
             adapter
                 .publish_state_with_projections(
@@ -1757,6 +1793,7 @@ mod tests {
                 .unwrap(),
             1
         );
+        assert!(!adapter.native_schema_needs_rebuild().unwrap());
         assert_eq!(
             adapter.native_entities("workspace").unwrap(),
             projection.entities

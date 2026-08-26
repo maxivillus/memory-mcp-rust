@@ -585,6 +585,7 @@ pub struct Store {
     connection: ConnectionSlot,
     database_path: RefCell<Option<PathBuf>>,
     database_root: Option<PathBuf>,
+    memory_database_name: RefCell<Option<String>>,
 }
 
 impl Store {
@@ -644,7 +645,13 @@ impl Store {
         let result = create_private_file(&path, bytes)
             .and_then(|_| self.connection.restore(&path).map_err(StoreError::from));
         let _ = fs::remove_file(&path);
-        result
+        result.and_then(|_| {
+            if self.memory_database_name.borrow().is_some() {
+                self.initialize_memory_catalog()?;
+                self.refresh_memory_database_name()?;
+            }
+            Ok(())
+        })
     }
 
     fn from_connection(
@@ -657,12 +664,17 @@ impl Store {
              PRAGMA journal_mode = WAL;",
         )?;
         let database_root = database_path.as_deref().map(database_root_for_path);
+        let in_memory = database_path.is_none();
         let store = Self {
             connection: ConnectionSlot::new(connection),
             database_path: RefCell::new(database_path),
             database_root,
+            memory_database_name: RefCell::new(in_memory.then(|| "memory".to_owned())),
         };
         store.migrate()?;
+        if store.memory_database_name.borrow().is_some() {
+            store.initialize_memory_catalog()?;
+        }
         Ok(store)
     }
 
@@ -701,6 +713,15 @@ impl Store {
                     CHECK (status IN ('active', 'archived', 'reset')),
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS memory_database_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                name TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS memory_database_catalog (
+                name TEXT PRIMARY KEY,
+                archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1)),
+                snapshot BLOB NOT NULL
             );",
         )?;
 
@@ -979,6 +1000,30 @@ impl Store {
              END;
              INSERT INTO facts_fts(facts_fts) VALUES ('rebuild');",
         )?;
+        Ok(())
+    }
+
+    fn initialize_memory_catalog(&self) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO memory_database_state (id, name)
+             VALUES (1, 'memory')",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn refresh_memory_database_name(&self) -> Result<(), StoreError> {
+        let name = self
+            .connection
+            .query_row(
+                "SELECT name FROM memory_database_state WHERE id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| "memory".to_owned());
+        validate_database_name(&name)?;
+        *self.memory_database_name.borrow_mut() = Some(name);
         Ok(())
     }
 
@@ -2148,20 +2193,22 @@ impl Store {
     }
 
     pub fn current_database(&self) -> Result<DatabaseInfo, StoreError> {
+        if self.memory_database_name.borrow().is_some() {
+            return self.memory_current_database();
+        }
         let path = self.database_path.borrow().clone();
         match path {
             Some(path) => self.database_info(&path, true, false),
-            None => Ok(DatabaseInfo {
-                name: "memory".to_owned(),
-                path: ":memory:".to_owned(),
-                active: true,
-                archived: false,
-                bytes: 0,
-            }),
+            None => Err(StoreError::Invalid(
+                "database state is missing for the in-memory store".to_owned(),
+            )),
         }
     }
 
     pub fn list_databases(&self) -> Result<Vec<DatabaseInfo>, StoreError> {
+        if self.memory_database_name.borrow().is_some() {
+            return self.memory_list_databases();
+        }
         let root = self.database_root()?;
         fs::create_dir_all(&root)?;
         let active_path = self.database_path.borrow().clone();
@@ -2196,6 +2243,9 @@ impl Store {
 
     pub fn create_database(&self, name: &str) -> Result<DatabaseInfo, StoreError> {
         validate_database_name(name)?;
+        if self.memory_database_name.borrow().is_some() {
+            return self.memory_create_database(name);
+        }
         let root = self.database_root()?;
         fs::create_dir_all(&root)?;
         let path = root.join(format!("{name}.db"));
@@ -2211,6 +2261,9 @@ impl Store {
 
     pub fn archive_database(&self, name: &str) -> Result<Option<DatabaseInfo>, StoreError> {
         validate_database_name(name)?;
+        if self.memory_database_name.borrow().is_some() {
+            return self.memory_archive_database(name);
+        }
         let path = self.named_database_path(name)?;
         let archived_path = archived_database_path(&path);
         if !path.exists() {
@@ -2234,6 +2287,9 @@ impl Store {
         name: &str,
         output_path: &str,
     ) -> Result<DatabaseBackup, StoreError> {
+        if self.memory_database_name.borrow().is_some() {
+            return self.memory_backup_database(name, output_path);
+        }
         let source = self.database_source_path(name)?;
         let output = validate_database_backup_path(output_path)?;
         if same_database_path(&source, &output) {
@@ -2277,6 +2333,9 @@ impl Store {
 
     pub fn delete_database(&self, name: &str) -> Result<bool, StoreError> {
         validate_database_name(name)?;
+        if self.memory_database_name.borrow().is_some() {
+            return self.memory_delete_database(name);
+        }
         let path = self.named_database_path(name)?;
         if self.is_active_path(&path) {
             return Err(StoreError::Invalid(
@@ -2296,6 +2355,9 @@ impl Store {
     }
 
     pub fn select_database(&self, name: &str) -> Result<DatabaseInfo, StoreError> {
+        if self.memory_database_name.borrow().is_some() {
+            return self.memory_select_database(name);
+        }
         if name == "current" {
             return self.current_database();
         }
@@ -2317,6 +2379,9 @@ impl Store {
     }
 
     pub fn reset_database(&self, name: &str) -> Result<DatabaseInfo, StoreError> {
+        if self.memory_database_name.borrow().is_some() {
+            return self.memory_reset_database(name);
+        }
         if name == "current" {
             self.clear_database()?;
             return self.current_database();
@@ -2336,6 +2401,300 @@ impl Store {
         let candidate = Self::open(&path)?;
         candidate.clear_database()?;
         self.database_info(&path, false, false)
+    }
+
+    fn memory_current_database(&self) -> Result<DatabaseInfo, StoreError> {
+        let name = self
+            .memory_database_name
+            .borrow()
+            .clone()
+            .ok_or_else(|| StoreError::Invalid("memory database name is missing".to_owned()))?;
+        let bytes = self.snapshot_bytes()?.len() as i64;
+        Ok(DatabaseInfo {
+            path: format!(":memory:{name}"),
+            name,
+            active: true,
+            archived: false,
+            bytes,
+        })
+    }
+
+    fn memory_database_record(&self, name: &str) -> Result<Option<(bool, Vec<u8>)>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT archived, snapshot
+                 FROM memory_database_catalog
+                 WHERE name = ?1",
+                params![name],
+                |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn memory_list_databases(&self) -> Result<Vec<DatabaseInfo>, StoreError> {
+        let current = self.memory_current_database()?;
+        let current_name = current.name.clone();
+        let mut databases = vec![current];
+        let mut statement = self.connection.prepare(
+            "SELECT name, archived, length(snapshot)
+             FROM memory_database_catalog
+             WHERE name <> ?1
+             ORDER BY name",
+        )?;
+        let rows = statement.query_map(params![current_name], |row| {
+            let name = row.get::<_, String>(0)?;
+            let archived = row.get::<_, i64>(1)? != 0;
+            let bytes = row.get::<_, i64>(2)?;
+            Ok(DatabaseInfo {
+                path: format!(":memory:{name}"),
+                name,
+                active: false,
+                archived,
+                bytes,
+            })
+        })?;
+        for row in rows {
+            databases.push(row?);
+        }
+        Ok(databases)
+    }
+
+    fn memory_create_database(&self, name: &str) -> Result<DatabaseInfo, StoreError> {
+        let current_name = self
+            .memory_database_name
+            .borrow()
+            .clone()
+            .expect("memory database mode has a current name");
+        if name == current_name || self.memory_database_record(name)?.is_some() {
+            return Err(StoreError::Invalid(format!(
+                "database already exists: {name}"
+            )));
+        }
+        let candidate = Self::in_memory()?;
+        candidate.set_memory_database_name(name)?;
+        let snapshot = candidate.snapshot_bytes()?;
+        self.connection.execute(
+            "INSERT INTO memory_database_catalog (name, archived, snapshot)
+             VALUES (?1, 0, ?2)",
+            params![name, snapshot],
+        )?;
+        Ok(DatabaseInfo {
+            name: name.to_owned(),
+            path: format!(":memory:{name}"),
+            active: false,
+            archived: false,
+            bytes: i64::try_from(snapshot.len()).unwrap_or(i64::MAX),
+        })
+    }
+
+    fn memory_archive_database(&self, name: &str) -> Result<Option<DatabaseInfo>, StoreError> {
+        let current_name = self
+            .memory_database_name
+            .borrow()
+            .clone()
+            .expect("memory database mode has a current name");
+        if name == current_name {
+            return Err(StoreError::Invalid(
+                "active database cannot be archived; select another database first".to_owned(),
+            ));
+        }
+        let Some((_, snapshot)) = self.memory_database_record(name)? else {
+            return Ok(None);
+        };
+        self.connection.execute(
+            "UPDATE memory_database_catalog SET archived = 1 WHERE name = ?1",
+            params![name],
+        )?;
+        Ok(Some(DatabaseInfo {
+            name: name.to_owned(),
+            path: format!(":memory:{name}"),
+            active: false,
+            archived: true,
+            bytes: i64::try_from(snapshot.len()).unwrap_or(i64::MAX),
+        }))
+    }
+
+    fn memory_snapshot_for_database(&self, name: &str) -> Result<Vec<u8>, StoreError> {
+        let current_name = self
+            .memory_database_name
+            .borrow()
+            .clone()
+            .expect("memory database mode has a current name");
+        if name == "current" || name == current_name {
+            return self.snapshot_bytes();
+        }
+        let Some((archived, snapshot)) = self.memory_database_record(name)? else {
+            return Err(StoreError::Invalid(format!("database not found: {name}")));
+        };
+        if archived {
+            return Err(StoreError::Invalid(format!("database is archived: {name}")));
+        }
+        Ok(snapshot)
+    }
+
+    fn memory_backup_database(
+        &self,
+        name: &str,
+        output_path: &str,
+    ) -> Result<DatabaseBackup, StoreError> {
+        let output = validate_database_backup_path(output_path)?;
+        if output.exists() {
+            return Err(StoreError::Invalid(
+                "database backup output already exists".to_owned(),
+            ));
+        }
+        if let Some(parent) = output.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let snapshot = self.memory_snapshot_for_database(name)?;
+        create_private_file(&output, &snapshot)?;
+        Ok(DatabaseBackup {
+            database: name.to_owned(),
+            path: output_path.to_owned(),
+            bytes: i64::try_from(snapshot.len()).unwrap_or(i64::MAX),
+        })
+    }
+
+    fn memory_delete_database(&self, name: &str) -> Result<bool, StoreError> {
+        let current_name = self
+            .memory_database_name
+            .borrow()
+            .clone()
+            .expect("memory database mode has a current name");
+        if name == current_name {
+            return Err(StoreError::Invalid(
+                "active database cannot be deleted; select another database first".to_owned(),
+            ));
+        }
+        Ok(self.connection.execute(
+            "DELETE FROM memory_database_catalog WHERE name = ?1",
+            params![name],
+        )? > 0)
+    }
+
+    fn memory_catalog(&self) -> Result<Vec<(String, bool, Vec<u8>)>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT name, archived, snapshot
+             FROM memory_database_catalog
+             ORDER BY name",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? != 0,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    fn memory_restore_catalog(
+        &self,
+        catalog: &[(String, bool, Vec<u8>)],
+    ) -> Result<(), StoreError> {
+        self.connection
+            .execute("DELETE FROM memory_database_catalog", [])?;
+        for (name, archived, snapshot) in catalog {
+            self.connection.execute(
+                "INSERT INTO memory_database_catalog (name, archived, snapshot)
+                 VALUES (?1, ?2, ?3)",
+                params![name, i64::from(*archived), snapshot],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn memory_save_current(&self) -> Result<(), StoreError> {
+        let name = self
+            .memory_database_name
+            .borrow()
+            .clone()
+            .expect("memory database mode has a current name");
+        let snapshot = self.snapshot_bytes()?;
+        self.connection.execute(
+            "INSERT INTO memory_database_catalog (name, archived, snapshot)
+             VALUES (?1, 0, ?2)
+             ON CONFLICT(name) DO UPDATE SET archived = 0, snapshot = excluded.snapshot",
+            params![name, snapshot],
+        )?;
+        Ok(())
+    }
+
+    fn set_memory_database_name(&self, name: &str) -> Result<(), StoreError> {
+        validate_database_name(name)?;
+        self.connection.execute(
+            "INSERT INTO memory_database_state (id, name) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name",
+            params![name],
+        )?;
+        *self.memory_database_name.borrow_mut() = Some(name.to_owned());
+        Ok(())
+    }
+
+    fn memory_select_database(&self, name: &str) -> Result<DatabaseInfo, StoreError> {
+        if name == "current" {
+            return self.current_database();
+        }
+        validate_database_name(name)?;
+        let current_name = self
+            .memory_database_name
+            .borrow()
+            .clone()
+            .expect("memory database mode has a current name");
+        if name == current_name {
+            return self.current_database();
+        }
+        let Some((archived, target_snapshot)) = self.memory_database_record(name)? else {
+            return Err(StoreError::Invalid(format!("database not found: {name}")));
+        };
+        if archived {
+            return Err(StoreError::Invalid(format!("database is archived: {name}")));
+        }
+        self.memory_save_current()?;
+        let catalog = self.memory_catalog()?;
+        self.restore_snapshot_bytes(&target_snapshot)?;
+        self.memory_restore_catalog(
+            &catalog
+                .into_iter()
+                .filter(|(catalog_name, _, _)| catalog_name != name)
+                .collect::<Vec<_>>(),
+        )?;
+        self.set_memory_database_name(name)?;
+        self.current_database()
+    }
+
+    fn memory_reset_database(&self, name: &str) -> Result<DatabaseInfo, StoreError> {
+        if name == "current" {
+            self.clear_database()?;
+            return self.current_database();
+        }
+        validate_database_name(name)?;
+        let Some((archived, snapshot)) = self.memory_database_record(name)? else {
+            return Err(StoreError::Invalid(format!("database not found: {name}")));
+        };
+        if archived {
+            return Err(StoreError::Invalid(format!("database is archived: {name}")));
+        }
+        let candidate = Self::in_memory()?;
+        candidate.restore_snapshot_bytes(&snapshot)?;
+        candidate.clear_database()?;
+        candidate.set_memory_database_name(name)?;
+        let empty_snapshot = candidate.snapshot_bytes()?;
+        self.connection.execute(
+            "UPDATE memory_database_catalog SET snapshot = ?2 WHERE name = ?1",
+            params![name, empty_snapshot],
+        )?;
+        Ok(DatabaseInfo {
+            name: name.to_owned(),
+            path: format!(":memory:{name}"),
+            active: false,
+            archived: false,
+            bytes: i64::try_from(empty_snapshot.len()).unwrap_or(i64::MAX),
+        })
     }
 
     fn into_connection(self) -> Connection {
@@ -5787,6 +6146,66 @@ mod tests {
 
         drop(store);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn in_memory_database_lifecycle_is_snapshot_backed() {
+        let backup_path = std::env::temp_dir().join(format!(
+            "memory-mcp-rust-memory-backup-{}.db",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&backup_path);
+        let store = Store::in_memory().expect("memory store");
+        store.remember_fact("main fact", "w").expect("main fact");
+        store.create_database("alpha").expect("alpha database");
+        store.select_database("alpha").expect("select alpha");
+        store.remember_fact("alpha fact", "w").expect("alpha fact");
+        store.select_database("memory").expect("select memory");
+        assert_eq!(store.list_facts("w").expect("memory facts").len(), 1);
+        store.select_database("alpha").expect("select alpha again");
+        assert_eq!(store.list_facts("w").expect("alpha facts").len(), 1);
+        let backup = store
+            .backup_database("current", backup_path.to_str().unwrap())
+            .expect("memory database backup");
+        assert!(backup.bytes > 0);
+        let backup_store = Store::open(&backup_path).expect("open memory backup");
+        assert_eq!(backup_store.list_facts("w").expect("backup facts").len(), 1);
+        drop(backup_store);
+
+        let snapshot = store.snapshot_bytes().expect("snapshot");
+        let restored = Store::in_memory().expect("restored memory store");
+        restored
+            .restore_snapshot_bytes(&snapshot)
+            .expect("restore snapshot");
+        assert_eq!(
+            restored.current_database().expect("current database").name,
+            "alpha"
+        );
+        assert_eq!(
+            restored.list_databases().expect("database catalog").len(),
+            2
+        );
+        assert_eq!(
+            restored
+                .list_facts("w")
+                .expect("restored alpha facts")
+                .len(),
+            1
+        );
+
+        store
+            .select_database("memory")
+            .expect("select memory again");
+        store.archive_database("alpha").expect("archive alpha");
+        assert!(store
+            .select_database("alpha")
+            .expect_err("archived database must not be selected")
+            .to_string()
+            .contains("archived"));
+        assert!(store
+            .delete_database("alpha")
+            .expect("delete archived alpha"));
+        let _ = fs::remove_file(backup_path);
     }
 
     #[test]

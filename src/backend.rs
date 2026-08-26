@@ -1,7 +1,7 @@
 use crate::protocol::replay_tool;
 use crate::redis::{
     RedisAdapter, RedisEntityRecord, RedisError, RedisMetrics, RedisNativeProjection,
-    RedisOperation,
+    RedisOperation, NATIVE_SYSTEM_SCOPE,
 };
 use crate::store::{Store, StoreError};
 use crate::tools;
@@ -205,7 +205,11 @@ impl Outbox {
 }
 
 struct CoordinatorInner {
+    /// The file-backed store is the SQLite standby/fallback image. While
+    /// Redis is healthy, operations run against the in-memory materialized
+    /// copy below and only become durable after Redis commits the revision.
     store: Store,
+    active_store: Option<Store>,
     redis: Option<RedisAdapter>,
     mode: BackendKind,
     revision: u64,
@@ -222,6 +226,7 @@ impl CoordinatorInner {
     fn new(path: &Path, redis_configured: bool) -> Result<Self, StoreError> {
         Ok(Self {
             store: Store::open(path)?,
+            active_store: None,
             redis: None,
             mode: BackendKind::Sqlite,
             revision: 0,
@@ -236,12 +241,28 @@ impl CoordinatorInner {
     }
 
     fn attach_redis(&mut self, adapter: RedisAdapter) -> Result<(), StoreError> {
+        let active_store = Store::in_memory()?;
         let remote = read_consistent_state(&adapter)?;
         match remote {
             Some((revision, snapshot)) => {
                 self.store.restore_snapshot_bytes(&snapshot)?;
-                self.revision = revision;
-                self.last_remote_revision = Some(revision);
+                active_store.restore_snapshot_bytes(&snapshot)?;
+                self.revision = if adapter
+                    .native_schema_needs_rebuild()
+                    .map_err(redis_store_error)?
+                {
+                    adapter
+                        .publish_state_with_projections(
+                            revision,
+                            &snapshot,
+                            &native_projections_for_all_workspaces(&active_store)?,
+                            &[],
+                        )
+                        .map_err(redis_store_error)?
+                } else {
+                    revision
+                };
+                self.last_remote_revision = Some(self.revision);
             }
             None => {
                 let snapshot = self.store.snapshot_bytes()?;
@@ -254,8 +275,10 @@ impl CoordinatorInner {
                     )
                     .map_err(redis_store_error)?;
                 self.last_remote_revision = Some(self.revision);
+                active_store.restore_snapshot_bytes(&snapshot)?;
             }
         }
+        self.active_store = Some(active_store);
         self.redis = Some(adapter);
         self.mode = BackendKind::Redis;
         self.reconcile_outbox()
@@ -291,6 +314,13 @@ impl CoordinatorInner {
             ));
         };
         self.store.restore_snapshot_bytes(&snapshot)?;
+        if self.active_store.is_none() {
+            self.active_store = Some(Store::in_memory()?);
+        }
+        self.active_store
+            .as_ref()
+            .expect("active store initialized")
+            .restore_snapshot_bytes(&snapshot)?;
         self.revision = revision;
         self.last_remote_revision = Some(revision);
         Ok(())
@@ -311,7 +341,10 @@ impl CoordinatorInner {
         operations: &[RedisOperation],
         projections: &[RedisNativeProjection],
     ) -> Result<(), RedisError> {
-        let snapshot = self.store.snapshot_bytes().map_err(store_redis_error)?;
+        let snapshot = self
+            .active_store()
+            .snapshot_bytes()
+            .map_err(store_redis_error)?;
         let adapter = self
             .redis
             .as_ref()
@@ -322,8 +355,18 @@ impl CoordinatorInner {
             projections,
             operations,
         )?;
+        // The file-backed image is updated only after Redis accepts the
+        // revision. This makes it a standby/fallback copy rather than the
+        // primary write path.
+        self.store
+            .restore_snapshot_bytes(&snapshot)
+            .map_err(store_redis_error)?;
         self.last_remote_revision = Some(self.revision);
         Ok(())
+    }
+
+    fn active_store(&self) -> &Store {
+        self.active_store.as_ref().unwrap_or(&self.store)
     }
 
     fn reconcile_outbox(&mut self) -> Result<(), StoreError> {
@@ -368,7 +411,7 @@ impl CoordinatorInner {
                 rejected.push((entry.clone(), "invalid_arguments"));
                 continue;
             };
-            match replay_tool(&entry.name, arguments, &self.store) {
+            match replay_tool(&entry.name, arguments, self.active_store()) {
                 Ok(_) => applied.push(entry.clone()),
                 // Redis is authoritative during recovery. A conflicting or
                 // invalid replay is therefore recorded rather than allowed to
@@ -391,7 +434,7 @@ impl CoordinatorInner {
                 .iter()
                 .map(redis_operation_for_entry)
                 .collect::<Vec<_>>();
-            let projections = native_projections_for_entries(&self.store, &applied)?;
+            let projections = native_projections_for_entries(self.active_store(), &applied)?;
             match self.publish_local_state(&operations, &projections) {
                 Ok(()) => {}
                 Err(RedisError::Conflict {
@@ -432,6 +475,11 @@ impl CoordinatorInner {
     }
 
     fn enter_sqlite_fallback(&mut self) {
+        if let Some(active_store) = self.active_store.take() {
+            if let Ok(snapshot) = active_store.snapshot_bytes() {
+                let _ = self.store.restore_snapshot_bytes(&snapshot);
+            }
+        }
         if let Some(adapter) = self.redis.take() {
             self.record_redis_metrics(adapter.metrics());
         }
@@ -615,21 +663,24 @@ impl BackendCoordinator {
             outbox_key = Some(key);
         }
 
-        let result = operation(&inner.store);
+        let result = operation(inner.active_store());
         match result {
             Ok(value) => {
                 if tools::is_state_mutating(name) && inner.mode == BackendKind::Redis {
                     let key = outbox_key
                         .as_deref()
                         .expect("state mutation has an outbox key");
-                    let projections =
-                        match native_projections_for_operation(&inner.store, name, arguments) {
-                            Ok(projections) => projections,
-                            Err(_) => {
-                                inner.enter_sqlite_fallback();
-                                return Ok(value);
-                            }
-                        };
+                    let projections = match native_projections_for_operation(
+                        inner.active_store(),
+                        name,
+                        arguments,
+                    ) {
+                        Ok(projections) => projections,
+                        Err(_) => {
+                            inner.enter_sqlite_fallback();
+                            return Ok(value);
+                        }
+                    };
                     let operation = RedisOperation {
                         idempotency_key: key.to_owned(),
                         name: name.to_owned(),
@@ -792,10 +843,11 @@ fn native_projections_for_operation(
     name: &str,
     arguments: &Map<String, Value>,
 ) -> Result<Vec<RedisNativeProjection>, StoreError> {
-    let Some(workspace) = operation_workspace(name, arguments) else {
-        return Ok(Vec::new());
-    };
-    Ok(vec![native_projection_for_workspace(store, &workspace)?])
+    let mut projections = vec![native_projection_for_databases(store)?];
+    if let Some(workspace) = operation_workspace(name, arguments) {
+        projections.push(native_projection_for_workspace(store, &workspace)?);
+    }
+    Ok(projections)
 }
 
 fn native_projections_for_entries(
@@ -810,20 +862,51 @@ fn native_projections_for_entries(
             }
         }
     }
-    workspaces
-        .into_iter()
-        .map(|workspace| native_projection_for_workspace(store, &workspace))
-        .collect()
+    let mut projections = vec![native_projection_for_databases(store)?];
+    projections.extend(
+        workspaces
+            .into_iter()
+            .map(|workspace| native_projection_for_workspace(store, &workspace))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    Ok(projections)
 }
 
 fn native_projections_for_all_workspaces(
     store: &Store,
 ) -> Result<Vec<RedisNativeProjection>, StoreError> {
-    store
-        .list_workspaces()?
+    let mut projections = vec![native_projection_for_databases(store)?];
+    projections.extend(
+        store
+            .list_workspaces()?
+            .into_iter()
+            .map(|workspace| native_projection_for_workspace(store, &workspace.id))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    Ok(projections)
+}
+
+fn native_projection_for_databases(store: &Store) -> Result<RedisNativeProjection, StoreError> {
+    let entities = store
+        .list_databases()?
         .into_iter()
-        .map(|workspace| native_projection_for_workspace(store, &workspace.id))
-        .collect()
+        .map(|database| {
+            Ok(RedisEntityRecord {
+                kind: "database".to_owned(),
+                id: database.name.clone(),
+                payload: json!({
+                    "name": database.name,
+                    "active": database.active,
+                    "archived": database.archived,
+                    "bytes": database.bytes.max(0),
+                }),
+            })
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    Ok(RedisNativeProjection {
+        workspace: NATIVE_SYSTEM_SCOPE.to_owned(),
+        entities,
+    })
 }
 
 fn native_projection_for_workspace(
@@ -1252,6 +1335,149 @@ mod tests {
     }
 
     #[test]
+    fn redis_primary_uses_memory_execution_store_and_mirrors_after_commit() {
+        let values = Arc::new(Mutex::new(HashMap::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server_values = Arc::clone(&values);
+        let server = thread::spawn(move || run_snapshot_redis(listener, server_values, None));
+        let adapter = RedisAdapter::connect(&format!("redis://{address}"), "primary-cache-test")
+            .expect("Redis adapter");
+        let database = test_database_path();
+        let mut inner = CoordinatorInner::new(&database, true).expect("coordinator state");
+        inner.attach_redis(adapter).expect("initial Redis state");
+        let coordinator = BackendCoordinator {
+            shared: Arc::new(Mutex::new(inner)),
+            stop: None,
+            watcher: None,
+        };
+
+        let arguments = json!({"text": "Redis-owned execution", "workspace": "w"});
+        coordinator
+            .execute_tool("remember_fact", arguments.as_object().unwrap(), |store| {
+                assert_eq!(
+                    store.current_database().expect("active database").name,
+                    "memory"
+                );
+                store
+                    .remember_fact("Redis-owned execution", "w")
+                    .map(|fact| serde_json::to_value(fact).expect("fact"))
+                    .map_err(BackendToolError::Execution)
+            })
+            .expect("Redis operation");
+
+        let state = coordinator.shared.lock().expect("coordinator lock");
+        assert!(state.active_store.is_some());
+        assert_eq!(state.store.list_facts("w").expect("standby facts").len(), 1);
+        assert_eq!(state.revision, 2);
+        drop(state);
+        drop(coordinator);
+        server.join().expect("Redis fixture");
+        let _ = fs::remove_file(database.with_extension("outbox.jsonl"));
+        let _ = fs::remove_file(database.with_extension("reconciliation.jsonl"));
+        let _ = fs::remove_file(database.with_extension("db-wal"));
+        let _ = fs::remove_file(database.with_extension("db-shm"));
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
+    fn redis_primary_database_catalog_is_snapshot_backed_and_projected() {
+        let values = Arc::new(Mutex::new(HashMap::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server_values = Arc::clone(&values);
+        let server = thread::spawn(move || run_snapshot_redis(listener, server_values, None));
+        let adapter = RedisAdapter::connect(&format!("redis://{address}"), "primary-db-test")
+            .expect("Redis adapter");
+        let database = test_database_path();
+        let mut inner = CoordinatorInner::new(&database, true).expect("coordinator state");
+        inner.attach_redis(adapter).expect("initial Redis state");
+        let coordinator = BackendCoordinator {
+            shared: Arc::new(Mutex::new(inner)),
+            stop: None,
+            watcher: None,
+        };
+
+        let create_arguments = json!({"name": "alpha"});
+        coordinator
+            .execute_tool(
+                "create_database",
+                create_arguments.as_object().unwrap(),
+                |store| {
+                    store
+                        .create_database("alpha")
+                        .map(|database| serde_json::to_value(database).expect("database"))
+                        .map_err(BackendToolError::Execution)
+                },
+            )
+            .expect("create Redis database");
+        let select_arguments = json!({"name": "alpha"});
+        coordinator
+            .execute_tool(
+                "select_database",
+                select_arguments.as_object().unwrap(),
+                |store| {
+                    store
+                        .select_database("alpha")
+                        .map(|database| serde_json::to_value(database).expect("database"))
+                        .map_err(BackendToolError::Execution)
+                },
+            )
+            .expect("select Redis database");
+        let fact_arguments = json!({"text": "alpha-only", "workspace": "w"});
+        coordinator
+            .execute_tool(
+                "remember_fact",
+                fact_arguments.as_object().unwrap(),
+                |store| {
+                    store
+                        .remember_fact("alpha-only", "w")
+                        .map(|fact| serde_json::to_value(fact).expect("fact"))
+                        .map_err(BackendToolError::Execution)
+                },
+            )
+            .expect("write alpha fact");
+        coordinator
+            .execute_tool(
+                "select_database",
+                json!({"name": "memory"}).as_object().unwrap(),
+                |store| {
+                    store
+                        .select_database("memory")
+                        .map(|database| serde_json::to_value(database).expect("database"))
+                        .map_err(BackendToolError::Execution)
+                },
+            )
+            .expect("return to memory database");
+
+        let state = coordinator.shared.lock().expect("coordinator lock");
+        assert_eq!(
+            state.active_store().current_database().unwrap().name,
+            "memory"
+        );
+        assert!(state.active_store().list_facts("w").unwrap().is_empty());
+        let databases = state.active_store().list_databases().unwrap();
+        assert!(databases.iter().any(|database| database.name == "alpha"));
+        let system = state
+            .redis
+            .as_ref()
+            .expect("Redis connection")
+            .native_entities(crate::redis::NATIVE_SYSTEM_SCOPE)
+            .expect("database projection");
+        assert!(system
+            .iter()
+            .any(|entity| entity.kind == "database" && entity.id == "alpha"));
+        drop(state);
+        drop(coordinator);
+        server.join().expect("Redis fixture");
+        let _ = fs::remove_file(database.with_extension("outbox.jsonl"));
+        let _ = fs::remove_file(database.with_extension("reconciliation.jsonl"));
+        let _ = fs::remove_file(database.with_extension("db-wal"));
+        let _ = fs::remove_file(database.with_extension("db-shm"));
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
     fn coordinator_projects_history_and_lineage_into_native_redis_state() {
         let values = Arc::new(Mutex::new(HashMap::new()));
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
@@ -1437,7 +1663,7 @@ mod tests {
             // The first native projection publish must commit before the
             // fixture drops the connection; the next operation then exercises
             // the real client-side loss path.
-            run_snapshot_redis(first_listener, first_values, Some(26));
+            run_snapshot_redis(first_listener, first_values, Some(39));
         });
         let adapter = RedisAdapter::connect(
             &format!("redis://{first_address}"),
@@ -1540,7 +1766,7 @@ mod tests {
                 .expect("committed ledger entry");
             assert_eq!(ledger.operation_name, "remember_fact");
             assert_eq!(ledger.status, "committed");
-            assert_eq!(ledger.entity_count, 4);
+            assert_eq!(ledger.entity_count, 5);
             assert_eq!(
                 adapter
                     .native_manifest("w")
