@@ -147,12 +147,32 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
                 strong: optional_bool(arguments, &["strong"], false)?,
                 importance: optional_f64(arguments, "importance")?.unwrap_or(0.5),
             };
-            serde_json::to_value(
-                store
-                    .remember_fact_with_metadata(text, workspace, &metadata)
-                    .map_err(CallError::Execution)?,
-            )
-            .expect("Fact serializes")
+            let mut fact = store
+                .remember_fact_with_metadata(text, workspace, &metadata)
+                .map_err(CallError::Execution)?;
+            if let Some(validity) = optional_string(arguments, "validity")? {
+                fact = store
+                    .set_fact_validity(fact.id, validity, workspace)
+                    .map_err(CallError::Execution)?
+                    .ok_or_else(|| {
+                        CallError::Execution(StoreError::Invalid(
+                            "fact disappeared while setting validity".to_owned(),
+                        ))
+                    })?;
+            }
+            if let Some(session_id) =
+                optional_string(arguments, "session_id")?.or(optional_string(arguments, "session")?)
+            {
+                fact = store
+                    .set_fact_session(fact.id, session_id, workspace)
+                    .map_err(CallError::Execution)?
+                    .ok_or_else(|| {
+                        CallError::Execution(StoreError::Invalid(
+                            "fact disappeared while setting session".to_owned(),
+                        ))
+                    })?;
+            }
+            serde_json::to_value(fact).expect("Fact serializes")
         }
         "absorb" => {
             let texts = string_array_or_single(arguments, &["texts", "facts"], &["text"])?;
@@ -172,6 +192,98 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
                     .map_err(CallError::Execution)?,
             )
             .expect("ingested fact serializes")
+        }
+        "review_pending" => serde_json::to_value(
+            store
+                .review_pending(workspace)
+                .map_err(CallError::Execution)?,
+        )
+        .expect("pending facts serialize"),
+        "confirm_fact" => {
+            let id =
+                required_i64(arguments, "id").or_else(|_| required_i64(arguments, "fact_id"))?;
+            let note = optional_string(arguments, "note")?
+                .or(optional_string(arguments, "reason")?)
+                .unwrap_or("");
+            serde_json::to_value(
+                store
+                    .confirm_fact(id, note, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("confirmed fact serializes")
+        }
+        "fact_history" => {
+            let id =
+                required_i64(arguments, "id").or_else(|_| required_i64(arguments, "fact_id"))?;
+            serde_json::to_value(
+                store
+                    .fact_history(id, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("fact history serializes")
+        }
+        "facts_for_session" => {
+            let session_id = required_string(arguments, "session_id")
+                .or_else(|_| required_string(arguments, "session"))?;
+            serde_json::to_value(
+                store
+                    .facts_for_session(session_id, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("session facts serialize")
+        }
+        "list_sessions" => serde_json::to_value(
+            store
+                .list_sessions(workspace)
+                .map_err(CallError::Execution)?,
+        )
+        .expect("sessions serialize"),
+        "fact_references" => {
+            let id =
+                required_i64(arguments, "id").or_else(|_| required_i64(arguments, "fact_id"))?;
+            let workspace = required_context_workspace(arguments)?;
+            serde_json::to_value(
+                store
+                    .fact_references(id, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("fact references serialize")
+        }
+        "search_guard" => {
+            let query = required_string(arguments, "query")?;
+            let workspace = required_context_workspace(arguments)?;
+            serde_json::to_value(
+                store
+                    .search_guard(query, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("guarded search serializes")
+        }
+        "auto_orient" => {
+            let query = required_string(arguments, "query")?;
+            let workspace = required_context_workspace(arguments)?;
+            serde_json::to_value(
+                store
+                    .auto_orient(query, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("orientation serializes")
+        }
+        "summarize_index" => serde_json::to_value(
+            store
+                .summarize_index(workspace)
+                .map_err(CallError::Execution)?,
+        )
+        .expect("index summary serializes"),
+        "prepare_summary" => {
+            let query = optional_string(arguments, "query")?.unwrap_or("");
+            let workspace = required_context_workspace(arguments)?;
+            serde_json::to_value(
+                store
+                    .prepare_summary(query, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("prepared summary serializes")
         }
         "run_begin" => {
             let run_id = required_string(arguments, "run_id")
@@ -1367,6 +1479,94 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("fb-1"));
+    }
+
+    #[test]
+    fn review_sessions_and_guard_tools_are_reachable() {
+        let store = Store::in_memory().unwrap();
+        let remember = handle_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add_fact","arguments":{"text":"review candidate","validity":"pending","session_id":"s-1","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(!remember["result"]["isError"].as_bool().unwrap());
+        let remember_text = remember["result"]["content"][0]["text"].as_str().unwrap();
+        let fact_value: Value = serde_json::from_str(remember_text).unwrap();
+        let fact_id = fact_value["id"].as_i64().unwrap();
+        assert_eq!(fact_value["validity"], "pending");
+        assert_eq!(fact_value["session_id"], "s-1");
+
+        let pending = handle_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"review_pending","arguments":{"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(pending["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(&fact_id.to_string()));
+        let confirm_request = format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"confirm_fact","arguments":{{"fact_id":{fact_id},"note":"checked","workspace":"w"}}}}}}"#
+        );
+        let confirmed = handle_line(&confirm_request, &store).unwrap();
+        assert!(confirmed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"validity\":\"valid\""));
+        let history_request = format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"fact_history","arguments":{{"id":{fact_id},"workspace":"w"}}}}}}"#
+        );
+        let history = handle_line(&history_request, &store).unwrap();
+        assert!(history["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("validity_changed"));
+        let sessions = handle_line(
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"list_sessions","arguments":{"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(sessions["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("s-1"));
+        let facts = handle_line(
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"facts_for_session","arguments":{"session":"s-1","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(facts["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("review candidate"));
+
+        let guard = handle_line(
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"search_guard","arguments":{"query":"not present","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(guard["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"status\":\"abstain\""));
+        let summary = handle_line(
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"summarize_index","arguments":{"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(summary["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"active_facts\":1"));
+        let prepared = handle_line(
+            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"prepare_summary","arguments":{"query":"review","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(prepared["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"recall\""));
     }
 
     #[test]

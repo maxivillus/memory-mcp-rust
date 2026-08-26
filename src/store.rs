@@ -51,6 +51,9 @@ pub struct Fact {
     pub strong: bool,
     pub importance: f64,
     pub category_id: Option<i64>,
+    pub validity: String,
+    pub session_id: String,
+    pub access_count: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -423,6 +426,44 @@ pub struct Category {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FactHistory {
+    pub id: i64,
+    pub fact_id: i64,
+    pub event: String,
+    pub from_lifecycle: String,
+    pub to_lifecycle: String,
+    pub note: String,
+    pub workspace: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RetrievalGuard {
+    pub status: String,
+    pub reason: String,
+    pub facts: Vec<Fact>,
+    pub contexts: Vec<Context>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct IndexSummary {
+    pub facts: i64,
+    pub active_facts: i64,
+    pub forgotten_facts: i64,
+    pub contexts: i64,
+    pub categories: i64,
+    pub runs: i64,
+    pub measurements: i64,
+    pub feedback: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PreparedSummary {
+    pub summary: IndexSummary,
+    pub recall: Recall,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Stats {
     pub facts: i64,
     pub contexts: i64,
@@ -653,6 +694,17 @@ impl Store {
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE (name, workspace_id)
             );
+            CREATE TABLE IF NOT EXISTS fact_history (
+                id INTEGER PRIMARY KEY,
+                fact_id INTEGER NOT NULL,
+                event TEXT NOT NULL,
+                from_lifecycle TEXT NOT NULL DEFAULT '',
+                to_lifecycle TEXT NOT NULL DEFAULT '',
+                note TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (fact_id) REFERENCES facts(id) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS runs (
                 id INTEGER PRIMARY KEY,
                 run_id TEXT NOT NULL,
@@ -695,6 +747,7 @@ impl Store {
             );",
         )?;
         self.ensure_category_columns()?;
+        self.ensure_fact_history_columns()?;
         self.ensure_run_columns()?;
         self.ensure_measurement_columns()?;
         self.ensure_feedback_columns()?;
@@ -711,6 +764,8 @@ impl Store {
                 ON evidence (workspace_id, fact_id);
              CREATE INDEX IF NOT EXISTS categories_workspace_idx
                 ON categories (workspace_id, name);
+             CREATE INDEX IF NOT EXISTS fact_history_fact_idx
+                ON fact_history (workspace_id, fact_id, id);
              CREATE INDEX IF NOT EXISTS runs_workspace_state_idx
                 ON runs (workspace_id, state, id);
              CREATE INDEX IF NOT EXISTS measurements_workspace_idx
@@ -770,6 +825,10 @@ impl Store {
             ("strong", "INTEGER NOT NULL DEFAULT 0"),
             ("importance", "REAL NOT NULL DEFAULT 0.5"),
             ("category_id", "INTEGER"),
+            ("validity", "TEXT NOT NULL DEFAULT 'valid'"),
+            ("session_id", "TEXT NOT NULL DEFAULT ''"),
+            ("access_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_accessed_at", "TEXT"),
             ("lifecycle", "TEXT NOT NULL DEFAULT 'active'"),
             ("workspace_id", "TEXT NOT NULL DEFAULT ''"),
             // SQLite requires a constant default for ALTER TABLE ADD COLUMN.
@@ -1019,6 +1078,31 @@ impl Store {
         Ok(())
     }
 
+    fn ensure_fact_history_columns(&self) -> Result<(), StoreError> {
+        let mut statement = self.connection.prepare("PRAGMA table_info(fact_history)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let additions = [
+            ("fact_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("event", "TEXT NOT NULL DEFAULT ''"),
+            ("from_lifecycle", "TEXT NOT NULL DEFAULT ''"),
+            ("to_lifecycle", "TEXT NOT NULL DEFAULT ''"),
+            ("note", "TEXT NOT NULL DEFAULT ''"),
+            ("workspace_id", "TEXT NOT NULL DEFAULT ''"),
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+        ];
+        for (name, definition) in additions {
+            if !columns.iter().any(|column| column == name) {
+                self.connection.execute(
+                    &format!("ALTER TABLE fact_history ADD COLUMN {name} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn ensure_run_columns(&self) -> Result<(), StoreError> {
         let mut statement = self.connection.prepare("PRAGMA table_info(runs)")?;
         let columns = statement
@@ -1121,6 +1205,7 @@ impl Store {
         }
         validate_fact_metadata(metadata)?;
         let sha256 = sha256(text);
+        let was_present = self.fact_by_hash(&sha256, workspace)?.is_some();
         self.connection.execute(
             "INSERT OR IGNORE INTO facts
                 (text, sha256, source, project, domain, trust, strong, importance, workspace_id)
@@ -1137,9 +1222,20 @@ impl Store {
                 workspace
             ],
         )?;
-        self.fact_by_hash(&sha256, workspace)?.ok_or_else(|| {
+        let fact = self.fact_by_hash(&sha256, workspace)?.ok_or_else(|| {
             StoreError::Invalid("fact insert did not produce a readable row".to_owned())
-        })
+        })?;
+        if !was_present {
+            self.record_fact_history(
+                fact.id,
+                "created",
+                "",
+                &fact.lifecycle,
+                "fact inserted",
+                workspace,
+            )?;
+        }
+        Ok(fact)
     }
 
     pub fn absorb(&self, texts: &[String], workspace: &str) -> Result<Vec<Fact>, StoreError> {
@@ -1468,6 +1564,255 @@ impl Store {
         Ok(rows)
     }
 
+    pub fn review_pending(&self, workspace: &str) -> Result<Vec<Fact>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, text, sha256, workspace_id, lifecycle,
+                    source, project, domain, trust, strong, importance, category_id,
+                    validity, session_id, access_count
+             FROM facts
+             WHERE (workspace_id = '' OR workspace_id = ?1)
+               AND lifecycle != 'forgotten'
+               AND (validity != 'valid' OR lifecycle = 'degraded')
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![workspace], map_fact)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn set_fact_validity(
+        &self,
+        id: i64,
+        validity: &str,
+        workspace: &str,
+    ) -> Result<Option<Fact>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        if id <= 0 {
+            return Err(StoreError::Invalid("fact id must be positive".to_owned()));
+        }
+        if !matches!(validity, "valid" | "pending" | "invalid") {
+            return Err(StoreError::Invalid(
+                "fact validity must be valid, pending, or invalid".to_owned(),
+            ));
+        }
+        let Some(existing) = self.fact_by_id(id, workspace)? else {
+            return Ok(None);
+        };
+        if existing.validity != validity {
+            self.connection.execute(
+                "UPDATE facts SET validity = ?1 WHERE id = ?2",
+                params![validity, id],
+            )?;
+            self.record_fact_history(
+                id,
+                "validity_changed",
+                &existing.lifecycle,
+                &existing.lifecycle,
+                validity,
+                &existing.workspace,
+            )?;
+        }
+        self.fact_by_id(id, workspace)
+    }
+
+    pub fn confirm_fact(
+        &self,
+        id: i64,
+        note: &str,
+        workspace: &str,
+    ) -> Result<Option<Fact>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        if id <= 0 {
+            return Err(StoreError::Invalid("fact id must be positive".to_owned()));
+        }
+        let Some(existing) = self.fact_by_id(id, workspace)? else {
+            return Ok(None);
+        };
+        if existing.validity != "valid" || existing.lifecycle != "active" {
+            self.connection.execute(
+                "UPDATE facts SET validity = 'valid', lifecycle = 'active' WHERE id = ?1",
+                params![id],
+            )?;
+            self.record_fact_history(
+                id,
+                "confirmed",
+                &existing.lifecycle,
+                "active",
+                note,
+                &existing.workspace,
+            )?;
+        }
+        self.fact_by_id(id, workspace)
+    }
+
+    pub fn fact_history(&self, id: i64, workspace: &str) -> Result<Vec<FactHistory>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        if id <= 0 {
+            return Err(StoreError::Invalid("fact id must be positive".to_owned()));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT id, fact_id, event, from_lifecycle, to_lifecycle,
+                    note, workspace_id, created_at
+             FROM fact_history
+             WHERE fact_id = ?1 AND (workspace_id = '' OR workspace_id = ?2)
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![id, workspace], map_fact_history)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn set_fact_session(
+        &self,
+        id: i64,
+        session_id: &str,
+        workspace: &str,
+    ) -> Result<Option<Fact>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        if id <= 0 {
+            return Err(StoreError::Invalid("fact id must be positive".to_owned()));
+        }
+        if self.fact_by_id(id, workspace)?.is_none() {
+            return Ok(None);
+        }
+        self.connection.execute(
+            "UPDATE facts SET session_id = ?1 WHERE id = ?2",
+            params![session_id, id],
+        )?;
+        self.fact_by_id(id, workspace)
+    }
+
+    pub fn facts_for_session(
+        &self,
+        session_id: &str,
+        workspace: &str,
+    ) -> Result<Vec<Fact>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        if session_id.trim().is_empty() {
+            return Err(StoreError::Invalid(
+                "session_id must not be empty".to_owned(),
+            ));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT id, text, sha256, workspace_id, lifecycle,
+                    source, project, domain, trust, strong, importance, category_id,
+                    validity, session_id, access_count
+             FROM facts
+             WHERE session_id = ?1
+               AND (workspace_id = '' OR workspace_id = ?2)
+               AND lifecycle != 'forgotten'
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![session_id, workspace], map_fact)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn list_sessions(&self, workspace: &str) -> Result<Vec<String>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT session_id
+             FROM facts
+             WHERE session_id <> ''
+               AND (workspace_id = '' OR workspace_id = ?1)
+             ORDER BY session_id",
+        )?;
+        let rows = statement
+            .query_map(params![workspace], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn fact_references(&self, id: i64, workspace: &str) -> Result<Vec<Evidence>, StoreError> {
+        self.get_provenance(id, workspace)
+    }
+
+    pub fn search_guard(&self, query: &str, workspace: &str) -> Result<RetrievalGuard, StoreError> {
+        let recall = self.compose_recall(query, workspace)?;
+        let matched = !recall.facts.is_empty() || !recall.contexts.is_empty();
+        Ok(RetrievalGuard {
+            status: if matched { "ok" } else { "abstain" }.to_owned(),
+            reason: if matched { "match" } else { "no_match" }.to_owned(),
+            facts: recall.facts,
+            contexts: recall.contexts,
+        })
+    }
+
+    pub fn auto_orient(&self, query: &str, workspace: &str) -> Result<Recall, StoreError> {
+        self.compose_recall(query, workspace)
+    }
+
+    pub fn summarize_index(&self, workspace: &str) -> Result<IndexSummary, StoreError> {
+        validate_graph_workspace(workspace)?;
+        let facts = self.connection.query_row(
+            "SELECT COUNT(*) FROM facts WHERE workspace_id = '' OR workspace_id = ?1",
+            params![workspace],
+            |row| row.get(0),
+        )?;
+        let active_facts = self.connection.query_row(
+            "SELECT COUNT(*) FROM facts
+             WHERE (workspace_id = '' OR workspace_id = ?1) AND lifecycle = 'active'",
+            params![workspace],
+            |row| row.get(0),
+        )?;
+        let forgotten_facts = self.connection.query_row(
+            "SELECT COUNT(*) FROM facts
+             WHERE (workspace_id = '' OR workspace_id = ?1) AND lifecycle = 'forgotten'",
+            params![workspace],
+            |row| row.get(0),
+        )?;
+        let contexts = self.connection.query_row(
+            "SELECT COUNT(*) FROM contexts WHERE workspace_id = ?1",
+            params![workspace],
+            |row| row.get(0),
+        )?;
+        let categories = self.connection.query_row(
+            "SELECT COUNT(*) FROM categories WHERE workspace_id = ?1",
+            params![workspace],
+            |row| row.get(0),
+        )?;
+        let runs = self.connection.query_row(
+            "SELECT COUNT(*) FROM runs WHERE workspace_id = ?1",
+            params![workspace],
+            |row| row.get(0),
+        )?;
+        let measurements = self.connection.query_row(
+            "SELECT COUNT(*) FROM measurement_observations WHERE workspace_id = ?1",
+            params![workspace],
+            |row| row.get(0),
+        )?;
+        let feedback = self.connection.query_row(
+            "SELECT COUNT(*) FROM memory_feedback WHERE workspace_id = ?1",
+            params![workspace],
+            |row| row.get(0),
+        )?;
+        Ok(IndexSummary {
+            facts,
+            active_facts,
+            forgotten_facts,
+            contexts,
+            categories,
+            runs,
+            measurements,
+            feedback,
+        })
+    }
+
+    pub fn prepare_summary(
+        &self,
+        query: &str,
+        workspace: &str,
+    ) -> Result<PreparedSummary, StoreError> {
+        Ok(PreparedSummary {
+            summary: self.summarize_index(workspace)?,
+            recall: self.compose_recall(query, workspace)?,
+        })
+    }
+
     fn category_by_name(
         &self,
         name: &str,
@@ -1538,6 +1883,31 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    fn record_fact_history(
+        &self,
+        fact_id: i64,
+        event: &str,
+        from_lifecycle: &str,
+        to_lifecycle: &str,
+        note: &str,
+        workspace: &str,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO fact_history
+                (fact_id, event, from_lifecycle, to_lifecycle, note, workspace_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                fact_id,
+                event,
+                from_lifecycle,
+                to_lifecycle,
+                note,
+                workspace
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn search_facts(&self, query: &str, workspace: &str) -> Result<Vec<Fact>, StoreError> {
         self.search_facts_with_filters(query, workspace, &FactFilters::default())
     }
@@ -1560,7 +1930,7 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT f.id, f.text, f.sha256, f.workspace_id, f.lifecycle,
                     f.source, f.project, f.domain, f.trust, f.strong, f.importance,
-                    f.category_id
+                    f.category_id, f.validity, f.session_id, f.access_count
              FROM facts_fts
              JOIN facts f ON f.id = facts_fts.rowid
              WHERE facts_fts MATCH ?1
@@ -1595,7 +1965,8 @@ impl Store {
         let like = format!("%{}%", query);
         let mut fallback = self.connection.prepare(
             "SELECT id, text, sha256, workspace_id, lifecycle,
-                    source, project, domain, trust, strong, importance, category_id
+                    source, project, domain, trust, strong, importance, category_id,
+                    validity, session_id, access_count
              FROM facts
              WHERE text LIKE ?1
                AND (workspace_id = '' OR workspace_id = ?2)
@@ -1636,7 +2007,8 @@ impl Store {
         validate_fact_filters(filters)?;
         let mut statement = self.connection.prepare(
             "SELECT id, text, sha256, workspace_id, lifecycle,
-                    source, project, domain, trust, strong, importance, category_id
+                    source, project, domain, trust, strong, importance, category_id,
+                    validity, session_id, access_count
              FROM facts
              WHERE (workspace_id = '' OR workspace_id = ?1)
                AND lifecycle != 'forgotten'
@@ -2656,7 +3028,8 @@ impl Store {
     pub fn list_forgotten(&self, workspace: &str) -> Result<Vec<Fact>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT id, text, sha256, workspace_id, lifecycle,
-                    source, project, domain, trust, strong, importance, category_id
+                    source, project, domain, trust, strong, importance, category_id,
+                    validity, session_id, access_count
              FROM facts
              WHERE (workspace_id = '' OR workspace_id = ?1)
                AND lifecycle = 'forgotten'
@@ -2800,10 +3173,29 @@ impl Store {
         if id <= 0 {
             return Err(StoreError::Invalid("fact id must be positive".to_owned()));
         }
+        if !matches!(lifecycle, "active" | "degraded" | "forgotten") {
+            return Err(StoreError::Invalid(
+                "fact lifecycle must be active, degraded, or forgotten".to_owned(),
+            ));
+        }
+        let Some(existing) = self.fact_by_id(id, workspace)? else {
+            return Ok(None);
+        };
+        if existing.lifecycle == lifecycle {
+            return Ok(Some(existing));
+        }
         self.connection.execute(
             "UPDATE facts SET lifecycle = ?1
              WHERE id = ?2 AND (workspace_id = '' OR workspace_id = ?3)",
             params![lifecycle, id, workspace],
+        )?;
+        self.record_fact_history(
+            id,
+            "lifecycle_changed",
+            &existing.lifecycle,
+            lifecycle,
+            "lifecycle updated",
+            &existing.workspace,
         )?;
         self.fact_by_id(id, workspace)
     }
@@ -2812,7 +3204,8 @@ impl Store {
         self.connection
             .query_row(
                 "SELECT id, text, sha256, workspace_id, lifecycle,
-                        source, project, domain, trust, strong, importance, category_id
+                        source, project, domain, trust, strong, importance, category_id,
+                        validity, session_id, access_count
                  FROM facts
                  WHERE sha256 = ?1 AND workspace_id = ?2",
                 params![hash, workspace],
@@ -2826,7 +3219,8 @@ impl Store {
         self.connection
             .query_row(
                 "SELECT id, text, sha256, workspace_id, lifecycle,
-                        source, project, domain, trust, strong, importance, category_id
+                        source, project, domain, trust, strong, importance, category_id,
+                        validity, session_id, access_count
                  FROM facts
                  WHERE id = ?1 AND (workspace_id = '' OR workspace_id = ?2)",
                 params![id, workspace],
@@ -3111,6 +3505,9 @@ fn map_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Fact> {
         strong: row.get::<_, i64>(9)? != 0,
         importance: row.get(10)?,
         category_id: row.get(11)?,
+        validity: row.get(12)?,
+        session_id: row.get(13)?,
+        access_count: row.get(14)?,
     })
 }
 
@@ -3120,6 +3517,19 @@ fn map_category(row: &rusqlite::Row<'_>) -> rusqlite::Result<Category> {
         name: row.get(1)?,
         workspace: row.get(2)?,
         created_at: row.get(3)?,
+    })
+}
+
+fn map_fact_history(row: &rusqlite::Row<'_>) -> rusqlite::Result<FactHistory> {
+    Ok(FactHistory {
+        id: row.get(0)?,
+        fact_id: row.get(1)?,
+        event: row.get(2)?,
+        from_lifecycle: row.get(3)?,
+        to_lifecycle: row.get(4)?,
+        note: row.get(5)?,
+        workspace: row.get(6)?,
+        created_at: row.get(7)?,
     })
 }
 
@@ -3985,6 +4395,70 @@ mod tests {
                 ..feedback_spec
             })
             .is_err());
+    }
+
+    #[test]
+    fn fact_review_history_sessions_and_guarded_summaries_are_deterministic() {
+        let store = Store::in_memory().expect("fresh store");
+        let fact = store
+            .remember_fact("Rust review candidate", "workspace-a")
+            .expect("fact");
+        let pending = store
+            .set_fact_validity(fact.id, "pending", "workspace-a")
+            .unwrap()
+            .expect("pending fact");
+        assert_eq!(pending.validity, "pending");
+        assert_eq!(store.review_pending("workspace-a").unwrap(), vec![pending]);
+        let confirmed = store
+            .confirm_fact(fact.id, "reviewed", "workspace-a")
+            .unwrap()
+            .expect("confirmed fact");
+        assert_eq!(confirmed.validity, "valid");
+        assert_eq!(confirmed.lifecycle, "active");
+        let history = store.fact_history(fact.id, "workspace-a").unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].event, "created");
+        assert_eq!(history[1].event, "validity_changed");
+        assert_eq!(history[2].event, "confirmed");
+
+        let session_fact = store
+            .set_fact_session(fact.id, "session-a", "workspace-a")
+            .unwrap()
+            .expect("session fact");
+        assert_eq!(session_fact.session_id, "session-a");
+        assert_eq!(
+            store.facts_for_session("session-a", "workspace-a").unwrap(),
+            vec![session_fact.clone()]
+        );
+        assert_eq!(
+            store.list_sessions("workspace-a").unwrap(),
+            vec!["session-a".to_owned()]
+        );
+        assert!(store
+            .fact_references(fact.id, "workspace-a")
+            .unwrap()
+            .is_empty());
+
+        let guarded = store
+            .search_guard("Rust", "workspace-a")
+            .expect("guarded match");
+        assert_eq!(guarded.status, "ok");
+        assert_eq!(guarded.reason, "match");
+        let abstained = store
+            .search_guard("missing", "workspace-a")
+            .expect("guarded abstention");
+        assert_eq!(abstained.status, "abstain");
+        assert_eq!(abstained.reason, "no_match");
+
+        let summary = store.summarize_index("workspace-a").unwrap();
+        assert_eq!(summary.facts, 1);
+        assert_eq!(summary.active_facts, 1);
+        assert_eq!(summary.contexts, 0);
+        let prepared = store
+            .prepare_summary("Rust", "workspace-a")
+            .expect("prepared summary");
+        assert_eq!(prepared.summary, summary);
+        assert_eq!(prepared.recall.facts, vec![session_fact]);
     }
 
     #[test]

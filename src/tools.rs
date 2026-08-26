@@ -115,6 +115,9 @@ fn tool_contract(name: &str) -> (&'static str, Value) {
                     "trust": {"type": "string", "enum": ["high", "medium", "low"]},
                     "strong": {"type": "boolean"},
                     "importance": {"type": "number", "minimum": 0, "maximum": 1},
+                    "validity": {"type": "string", "enum": ["valid", "pending", "invalid"]},
+                    "session_id": {"type": "string"},
+                    "session": {"type": "string"},
                     "workspace": {"type": "string"},
                     "workspace_id": {"type": "string"}
                 },
@@ -145,6 +148,108 @@ fn tool_contract(name: &str) -> (&'static str, Value) {
                     "workspace_id": {"type": "string"}
                 },
                 "required": ["text"]
+            }),
+        ),
+        "review_pending" => (
+            "List active facts that require validity review.",
+            workspace_schema(),
+        ),
+        "confirm_fact" => (
+            "Confirm a fact and record the review transition.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "fact_id": {"type": "integer"},
+                    "note": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["id", "workspace"]
+            }),
+        ),
+        "fact_history" => (
+            "Read immutable fact lifecycle history.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "fact_id": {"type": "integer"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["id", "workspace"]
+            }),
+        ),
+        "facts_for_session" => (
+            "List active facts associated with a session.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "session": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["session_id", "workspace"]
+            }),
+        ),
+        "list_sessions" => (
+            "List session identifiers associated with active facts.",
+            workspace_schema(),
+        ),
+        "fact_references" => (
+            "List evidence references attached to a fact.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "fact_id": {"type": "integer"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["id", "workspace"]
+            }),
+        ),
+        "search_guard" => (
+            "Return a typed lexical recall result or abstain on no match.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["query", "workspace"]
+            }),
+        ),
+        "auto_orient" => (
+            "Compose workspace-scoped recall for orientation.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["query", "workspace"]
+            }),
+        ),
+        "summarize_index" => (
+            "Return deterministic workspace index counts.",
+            workspace_schema(),
+        ),
+        "prepare_summary" => (
+            "Prepare index counts and lexical recall for a workspace.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["workspace"]
             }),
         ),
         "search_facts" => (

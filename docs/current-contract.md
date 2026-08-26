@@ -331,3 +331,21 @@ The ninth implementation slice adds bounded observability and classification:
 Database selection/backup, local document path ingestion, retention/review
 flows, and the remaining advanced retrieval tools remain staged. No Redis or
 embedding implementation is claimed.
+
+The tenth implementation slice adds review and abstention-facing helpers:
+
+- facts carry validity, session, category, and access-count metadata; review
+  transitions are recorded in an immutable fact_history table;
+- review_pending and confirm_fact expose deterministic validity review, while
+  fact_history and fact_references provide audit/provenance reads;
+- facts_for_session and list_sessions provide workspace-scoped session views;
+- search_guard returns a typed `ok` match or `abstain`/`no_match` result, and
+  auto_orient/prepare_summary compose the existing lexical recall safely;
+- summarize_index reports deterministic counts across the implemented SQLite
+  surfaces, and the migration remains additive for legacy facts tables;
+- tests cover the `add_fact` compatibility alias, review history, sessions,
+  typed abstention, summaries, and JSON-RPC reachability.
+
+Local document path ingestion, retention/decay policy, database selection and
+backups, and optional embedding or Redis adapters remain staged. No semantic
+provider is claimed by the SQLite fallback.
