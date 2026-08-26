@@ -12,6 +12,8 @@
 | Revision-checked `WATCH`/`MULTI`/`EXEC` publish | Prevent stale snapshot writes from silently overwriting a newer Redis state. | `src/redis.rs` |
 | Durable SQLite outbox | Preserve acknowledged fallback writes until Redis recovery reconciliation completes. | `src/backend.rs` |
 | Bounded Redis operation markers | Detect a committed operation after a lost response without retaining operation payloads. | `src/redis.rs`, `src/backend.rs` |
+| Workspace-scoped native Redis entity projection | Store individually addressable bounded JSON records and a workspace index for the exported memory entities during the incremental Redis migration. | `src/redis.rs`, `src/backend.rs` |
+| Durable Redis operation ledger | Preserve committed/conflict operation metadata beyond the compatibility marker TTL without retaining request payloads. | `src/redis.rs`, `src/backend.rs` |
 | Revision watcher with backoff | Avoid full scans while idle, retry failures without a busy loop, and stop with the coordinator. | `src/backend.rs` |
 | Payload-free resource counters | Measure Redis commands/bytes and synchronization ticks/errors/duration without exposing memory contents. | `src/redis.rs`, `src/backend.rs`, `src/bin/memory-bench.rs` |
 
@@ -29,7 +31,8 @@ library.
 - `src/store.rs`: owns the full SQLite schema, migrations, FTS5 behavior,
   snapshot/restore, and tool operation semantics.
 - `src/redis.rs`: owns the bounded RESP2 connection, Redis state snapshot,
-  revision publish, operation markers, and connection resource counters.
+  revision publish, native entity projection/index/manifest, operation marker
+  and durable ledger primitives, and connection resource counters.
 - `src/tools.rs`: owns the advertised tool inventory and explicit mutation
   classification.
 - `src/bin/memory-bench.rs`: runs the bounded SQLite/core-fact Redis timing

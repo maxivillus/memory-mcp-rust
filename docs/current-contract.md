@@ -444,17 +444,31 @@ server through `BackendCoordinator`:
 - the watcher reads only the small revision key while the state is unchanged,
   fetches a snapshot only after a revision change, uses bounded backoff, and
   stops with the coordinator lifecycle;
+- each workspace touched by a state-changing operation also receives a
+  bounded native entity projection: hashed workspace/index keys point to
+  individually addressable JSON records for facts, contexts, events,
+  handoffs, graph, decisions, evidence, categories, runs, measurements,
+  feedback, and registered workspaces;
+- native projection replacement, the SQLite standby image, the monotonic
+  revision, and the durable operation ledger are committed in one
+  `WATCH`/`MULTI`/`EXEC` transaction; a per-workspace manifest records the
+  projection schema version, revision, and bounded entity count;
+- the operation ledger is keyed by the SHA-256 operation idempotency key and
+  has no TTL. It stores only operation name, workspace hash, status, revision,
+  entity count, and a bounded conflict reason. The seven-day marker remains a
+  compatibility fast path, while recovery consults the durable ledger first;
 - `BackendCoordinator::status()` exposes only backend, connection, revision,
   lag, outbox, Redis command/byte, and synchronization tick/error/duration
   counters; it never returns payloads or credentials.
 
-This is a correctness-first snapshot coordinator, not yet a claim of a native
-per-entity Redis schema or a performance win. The bounded marker protocol
-protects recovery from replaying a transaction whose response was lost, but it
-is not yet a complete per-entity operation ledger or conflict record. The
-compatibility `Store` is deliberately retained as the materialized state
-needed for the full route; the direct `handle_line` API remains a SQLite
-fixture path, while the shipped stdio binary uses
+This remains a correctness-first migration slice, not a performance claim or a
+claim that Redis is already the sole execution engine. The native projection
+is now independently addressable and the durable ledger survives marker
+expiry, while the compatibility `Store` remains the materialized execution
+engine and SQLite standby needed for the full route. The bounded snapshot is
+still retained as a restart/standby backup until native reads, migration, and
+all auxiliary tables are independently accepted. The direct `handle_line` API
+remains a SQLite fixture path, while the shipped stdio binary uses
 `handle_line_with_coordinator`.
 
 ## Redis-first backend contract
@@ -503,15 +517,16 @@ policy above for the next implementation stages:
   are never emitted in logs, reports, test fixtures, or protocol responses.
 
 The remaining production-acceptance work is a gated migration rather than a
-claim that the snapshot coordinator is already a native Redis backend:
+claim that this projection slice is already a complete native Redis backend:
 
-1. replace the bounded snapshot transport with a workspace/database-isolated
-   per-entity Redis schema while preserving the complete Store semantics;
-2. replace the bounded marker window with a durable per-entity operation ledger
-   and conflict records across reconnects, including backup semantics and
-   explicit handling after marker expiry;
-3. add migration, isolation, conflict, lag, backoff, clean-stop, and resource
-   measurements against a real Redis service, not only the bounded RESP fixture;
+1. make native per-entity records the authoritative Redis read/write path for
+   every Store operation while preserving the complete SQLite semantics;
+2. extend projection coverage to fact history, context lineage, selected
+   database metadata, and backup/rebuild migration, with explicit handling of
+   legacy snapshot-only namespaces;
+3. add real-service migration, isolation, conflict, lag, backoff, clean-stop,
+   and resource measurements rather than relying only on the bounded RESP
+   fixture;
 4. complete the formatter, test, lint, AppSec, artifact, QA, and PM gates and
    only then make a production performance claim.
 

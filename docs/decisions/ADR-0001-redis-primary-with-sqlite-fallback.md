@@ -77,6 +77,25 @@ per-entity Redis schema, a complete operation ledger/conflict history, or
 production performance. Those remain acceptance work; the ADR status stays
 Proposed until PM/TechLead review.
 
+## Incremental native projection checkpoint
+
+The next migration slice adds a bounded workspace-scoped native projection
+without changing the public Store contract. After each successful state change,
+the coordinator derives the selected workspace export into individually
+addressable Redis JSON records, replaces that workspace's index, and writes a
+schema manifest. Snapshot, projection keys, monotonic revision, durable ledger,
+and compatibility marker are committed in one revision-checked transaction.
+The ledger stores only operation hash/name, workspace hash, status, revision,
+entity count, and an optional bounded conflict reason; it has no TTL, so replay
+handling remains available after the seven-day marker expires.
+
+This is an incremental projection and standby migration boundary, not yet a
+native Redis execution engine. The SQLite Store remains the complete
+materialized engine and restart backup; fact history, context lineage,
+selected-database metadata, native Redis reads for all tools, migration from
+snapshot-only namespaces, and production measurements remain gated follow-up
+work.
+
 The implementation is staged behind a coverage gate:
 
 1. define and test one backend interface and coordinator state machine;

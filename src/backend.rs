@@ -1,11 +1,15 @@
 use crate::protocol::replay_tool;
-use crate::redis::{RedisAdapter, RedisError, RedisMetrics};
+use crate::redis::{
+    RedisAdapter, RedisEntityRecord, RedisError, RedisMetrics, RedisNativeProjection,
+    RedisOperation,
+};
 use crate::store::{Store, StoreError};
 use crate::tools;
 use hex::encode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -242,7 +246,12 @@ impl CoordinatorInner {
             None => {
                 let snapshot = self.store.snapshot_bytes()?;
                 self.revision = adapter
-                    .publish_state(0, &snapshot)
+                    .publish_state_with_projections(
+                        0,
+                        &snapshot,
+                        &native_projections_for_all_workspaces(&self.store)?,
+                        &[],
+                    )
                     .map_err(redis_store_error)?;
                 self.last_remote_revision = Some(self.revision);
             }
@@ -297,14 +306,22 @@ impl CoordinatorInner {
         result
     }
 
-    fn publish_local_state(&mut self, idempotency_keys: &[&str]) -> Result<(), RedisError> {
+    fn publish_local_state(
+        &mut self,
+        operations: &[RedisOperation],
+        projections: &[RedisNativeProjection],
+    ) -> Result<(), RedisError> {
         let snapshot = self.store.snapshot_bytes().map_err(store_redis_error)?;
         let adapter = self
             .redis
             .as_ref()
             .ok_or_else(|| RedisError::Protocol("Redis connection is not available".to_owned()))?;
-        self.revision =
-            adapter.publish_state_with_operations(self.revision, &snapshot, idempotency_keys)?;
+        self.revision = adapter.publish_state_with_projections(
+            self.revision,
+            &snapshot,
+            projections,
+            operations,
+        )?;
         self.last_remote_revision = Some(self.revision);
         Ok(())
     }
@@ -317,6 +334,26 @@ impl CoordinatorInner {
         let mut applied = Vec::new();
         let mut rejected: Vec<(OutboxEntry, &'static str)> = Vec::new();
         for entry in pending.iter().take(MAX_REPLAY_BATCH) {
+            let adapter = self.redis.as_ref().ok_or_else(|| {
+                StoreError::Invalid("Redis connection is not available".to_owned())
+            })?;
+            let ledger = adapter
+                .operation_ledger(&entry.idempotency_key)
+                .map_err(redis_store_error)?;
+            if ledger
+                .as_ref()
+                .is_some_and(|record| record.status == "committed")
+            {
+                rejected.push((entry.clone(), "already_committed_in_redis_ledger"));
+                continue;
+            }
+            if ledger
+                .as_ref()
+                .is_some_and(|record| record.status == "conflict")
+            {
+                rejected.push((entry.clone(), "redis_ledger_conflict"));
+                continue;
+            }
             let already_applied = self
                 .redis
                 .as_ref()
@@ -336,18 +373,42 @@ impl CoordinatorInner {
                 // Redis is authoritative during recovery. A conflicting or
                 // invalid replay is therefore recorded rather than allowed to
                 // overwrite the recovered Redis state.
-                Err(_) => rejected.push((entry.clone(), "redis_priority_replay_rejected")),
+                Err(_) => {
+                    adapter
+                        .record_operation_conflict(
+                            &redis_operation_for_entry(entry),
+                            "redis_priority_replay_rejected",
+                            self.revision,
+                        )
+                        .map_err(redis_store_error)?;
+                    rejected.push((entry.clone(), "redis_priority_replay_rejected"));
+                }
             }
         }
 
         if !applied.is_empty() {
-            let operation_keys = applied
+            let operations = applied
                 .iter()
-                .map(|entry| entry.idempotency_key.as_str())
+                .map(redis_operation_for_entry)
                 .collect::<Vec<_>>();
-            match self.publish_local_state(&operation_keys) {
+            let projections = native_projections_for_entries(&self.store, &applied)?;
+            match self.publish_local_state(&operations, &projections) {
                 Ok(()) => {}
-                Err(RedisError::Conflict { .. }) => {
+                Err(RedisError::Conflict {
+                    expected: _expected,
+                    actual,
+                }) => {
+                    if let Some(adapter) = self.redis.as_ref() {
+                        for entry in &applied {
+                            adapter
+                                .record_operation_conflict(
+                                    &redis_operation_for_entry(entry),
+                                    "redis_priority_conflict",
+                                    actual,
+                                )
+                                .map_err(redis_store_error)?;
+                        }
+                    }
                     self.sync_from_redis_current()?;
                     rejected.extend(
                         applied
@@ -561,7 +622,20 @@ impl BackendCoordinator {
                     let key = outbox_key
                         .as_deref()
                         .expect("state mutation has an outbox key");
-                    match inner.publish_local_state(&[key]) {
+                    let projections =
+                        match native_projections_for_operation(&inner.store, name, arguments) {
+                            Ok(projections) => projections,
+                            Err(_) => {
+                                inner.enter_sqlite_fallback();
+                                return Ok(value);
+                            }
+                        };
+                    let operation = RedisOperation {
+                        idempotency_key: key.to_owned(),
+                        name: name.to_owned(),
+                        workspace: operation_workspace(name, arguments).unwrap_or_default(),
+                    };
+                    match inner.publish_local_state(&[operation], &projections) {
                         Ok(()) => {
                             inner
                                 .outbox
@@ -678,6 +752,186 @@ fn operation_key(name: &str, arguments: &Map<String, Value>) -> Result<String, S
     Ok(encode(Sha256::digest(encoded)))
 }
 
+fn redis_operation_for_entry(entry: &OutboxEntry) -> RedisOperation {
+    RedisOperation {
+        idempotency_key: entry.idempotency_key.clone(),
+        name: entry.name.clone(),
+        workspace: entry
+            .arguments
+            .as_object()
+            .and_then(|arguments| operation_workspace(&entry.name, arguments))
+            .unwrap_or_default(),
+    }
+}
+
+fn operation_workspace(name: &str, arguments: &Map<String, Value>) -> Option<String> {
+    let workspace = arguments
+        .get("workspace")
+        .or_else(|| arguments.get("workspace_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
+    workspace.or_else(|| {
+        matches!(
+            name,
+            "create_workspace" | "archive_workspace" | "reset_workspace"
+        )
+        .then(|| {
+            arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .flatten()
+    })
+}
+
+fn native_projections_for_operation(
+    store: &Store,
+    name: &str,
+    arguments: &Map<String, Value>,
+) -> Result<Vec<RedisNativeProjection>, StoreError> {
+    let Some(workspace) = operation_workspace(name, arguments) else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![native_projection_for_workspace(store, &workspace)?])
+}
+
+fn native_projections_for_entries(
+    store: &Store,
+    entries: &[OutboxEntry],
+) -> Result<Vec<RedisNativeProjection>, StoreError> {
+    let mut workspaces = BTreeSet::new();
+    for entry in entries {
+        if let Some(arguments) = entry.arguments.as_object() {
+            if let Some(workspace) = operation_workspace(&entry.name, arguments) {
+                workspaces.insert(workspace);
+            }
+        }
+    }
+    workspaces
+        .into_iter()
+        .map(|workspace| native_projection_for_workspace(store, &workspace))
+        .collect()
+}
+
+fn native_projections_for_all_workspaces(
+    store: &Store,
+) -> Result<Vec<RedisNativeProjection>, StoreError> {
+    store
+        .list_workspaces()?
+        .into_iter()
+        .map(|workspace| native_projection_for_workspace(store, &workspace.id))
+        .collect()
+}
+
+fn native_projection_for_workspace(
+    store: &Store,
+    workspace: &str,
+) -> Result<RedisNativeProjection, StoreError> {
+    let exported = store.export_snapshot(workspace)?;
+    let mut entities = Vec::new();
+    if let Some(workspace_record) = store
+        .list_workspaces()?
+        .into_iter()
+        .find(|record| record.id == workspace)
+    {
+        push_native_entity(
+            &mut entities,
+            "workspace",
+            &workspace_record.id,
+            &workspace_record,
+        )?;
+    }
+    for fact in exported.facts {
+        push_native_entity(&mut entities, "fact", &fact.id.to_string(), &fact)?;
+    }
+    for context in exported.contexts {
+        push_native_entity(&mut entities, "context", &context.reference, &context)?;
+    }
+    for event in exported.events {
+        push_native_entity(&mut entities, "event", &event.id.to_string(), &event)?;
+    }
+    for handoff in exported.handoffs {
+        push_native_entity(&mut entities, "handoff", &handoff.id.to_string(), &handoff)?;
+    }
+    for entity in exported.entities {
+        push_native_entity(&mut entities, "entity", &entity.id.to_string(), &entity)?;
+    }
+    for relation in exported.relations {
+        push_native_entity(
+            &mut entities,
+            "relation",
+            &relation.id.to_string(),
+            &relation,
+        )?;
+    }
+    for decision in exported.decisions {
+        push_native_entity(
+            &mut entities,
+            "decision",
+            &decision.id.to_string(),
+            &decision,
+        )?;
+    }
+    for evidence in exported.evidence {
+        push_native_entity(
+            &mut entities,
+            "evidence",
+            &evidence.id.to_string(),
+            &evidence,
+        )?;
+    }
+    for category in exported.categories {
+        push_native_entity(
+            &mut entities,
+            "category",
+            &category.id.to_string(),
+            &category,
+        )?;
+    }
+    for run in exported.runs {
+        push_native_entity(&mut entities, "run", &run.id.to_string(), &run)?;
+    }
+    for measurement in exported.measurements {
+        push_native_entity(
+            &mut entities,
+            "measurement",
+            &measurement.id.to_string(),
+            &measurement,
+        )?;
+    }
+    for feedback in exported.feedback {
+        push_native_entity(
+            &mut entities,
+            "feedback",
+            &feedback.id.to_string(),
+            &feedback,
+        )?;
+    }
+    Ok(RedisNativeProjection {
+        workspace: workspace.to_owned(),
+        entities,
+    })
+}
+
+fn push_native_entity<T: Serialize>(
+    entities: &mut Vec<RedisEntityRecord>,
+    kind: &str,
+    id: &str,
+    value: &T,
+) -> Result<(), StoreError> {
+    let payload = serde_json::to_value(value)
+        .map_err(|error| StoreError::Invalid(format!("native entity encoding failed: {error}")))?;
+    entities.push(RedisEntityRecord {
+        kind: kind.to_owned(),
+        id: id.to_owned(),
+        payload,
+    });
+    Ok(())
+}
+
 fn redis_store_error(error: RedisError) -> StoreError {
     StoreError::Invalid(format!("Redis backend unavailable: {error}"))
 }
@@ -772,7 +1026,7 @@ fn open_private_rewrite(path: &Path) -> Result<File, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1072,7 +1326,10 @@ mod tests {
         let first_address = first_listener.local_addr().expect("first address");
         let first_values = Arc::clone(&values);
         let first_server = thread::spawn(move || {
-            run_snapshot_redis(first_listener, first_values, Some(18));
+            // The first native projection publish must commit before the
+            // fixture drops the connection; the next operation then exercises
+            // the real client-side loss path.
+            run_snapshot_redis(first_listener, first_values, Some(24));
         });
         let adapter = RedisAdapter::connect(
             &format!("redis://{first_address}"),
@@ -1158,6 +1415,33 @@ mod tests {
             })
             .expect("recovered read");
         assert_eq!(facts.as_array().unwrap().len(), 2);
+        {
+            let state = coordinator.shared.lock().expect("coordinator lock");
+            let adapter = state.redis.as_ref().expect("recovered Redis connection");
+            let native = adapter.native_entities("w").expect("native projection");
+            assert_eq!(
+                native.iter().filter(|entity| entity.kind == "fact").count(),
+                2
+            );
+            let fallback_key =
+                operation_key("remember_fact", fallback_arguments.as_object().unwrap())
+                    .expect("fallback operation key");
+            let ledger = adapter
+                .operation_ledger(&fallback_key)
+                .expect("operation ledger")
+                .expect("committed ledger entry");
+            assert_eq!(ledger.operation_name, "remember_fact");
+            assert_eq!(ledger.status, "committed");
+            assert_eq!(ledger.entity_count, 2);
+            assert_eq!(
+                adapter
+                    .native_manifest("w")
+                    .expect("native manifest")
+                    .unwrap()
+                    .revision,
+                state.revision
+            );
+        }
 
         drop(coordinator);
         second_server.join().expect("second Redis fixture");
@@ -1175,6 +1459,7 @@ mod tests {
     ) {
         let (mut stream, _) = listener.accept().expect("Redis client");
         let mut transaction: Option<Vec<Vec<Vec<u8>>>> = None;
+        let mut sets = HashMap::<Vec<u8>, BTreeSet<Vec<u8>>>::new();
         let mut command_count = 0;
         while let Some(arguments) = read_request(&mut stream) {
             command_count += 1;
@@ -1183,6 +1468,9 @@ mod tests {
                 if command != b"EXEC" {
                     queue.push(arguments);
                     write_simple(&mut stream, b"QUEUED");
+                    if close_after == Some(command_count) {
+                        return;
+                    }
                     continue;
                 }
             }
@@ -1220,6 +1508,18 @@ mod tests {
                                     .expect("Redis values")
                                     .insert(command[1].clone(), revision.to_string().into_bytes());
                             }
+                            b"DEL" => {
+                                shared_values
+                                    .lock()
+                                    .expect("Redis values")
+                                    .remove(&command[1]);
+                                sets.remove(&command[1]);
+                            }
+                            b"SADD" => {
+                                sets.entry(command[1].clone())
+                                    .or_default()
+                                    .insert(command[2].clone());
+                            }
                             _ => {}
                         }
                     }
@@ -1233,6 +1533,15 @@ mod tests {
                 b"GET" => {
                     let values = shared_values.lock().expect("Redis values");
                     write_bulk(&mut stream, values.get(&arguments[1]));
+                }
+                b"SMEMBERS" => {
+                    let members = sets
+                        .get(&arguments[1])
+                        .into_iter()
+                        .flat_map(|members| members.iter())
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    write_array(&mut stream, &members);
                 }
                 b"SET" => {
                     shared_values
@@ -1254,6 +1563,25 @@ mod tests {
                         .expect("Redis values")
                         .insert(arguments[1].clone(), revision.to_string().into_bytes());
                     write_integer(&mut stream, revision);
+                }
+                b"SADD" => {
+                    let inserted = sets
+                        .entry(arguments[1].clone())
+                        .or_default()
+                        .insert(arguments[2].clone());
+                    write_integer(&mut stream, i64::from(inserted));
+                }
+                b"DEL" => {
+                    let mut deleted = shared_values
+                        .lock()
+                        .expect("Redis values")
+                        .remove(&arguments[1])
+                        .is_some();
+                    deleted |= sets.remove(&arguments[1]).is_some();
+                    for members in sets.values_mut() {
+                        deleted |= members.remove(&arguments[1]);
+                    }
+                    write_integer(&mut stream, i64::from(deleted));
                 }
                 _ => write_error(&mut stream, b"unsupported test command"),
             }
@@ -1325,6 +1653,15 @@ mod tests {
             .expect("bulk response");
         stream.write_all(value).expect("bulk response");
         stream.write_all(b"\r\n").expect("bulk response");
+    }
+
+    fn write_array(stream: &mut TcpStream, values: &[Vec<u8>]) {
+        stream
+            .write_all(format!("*{}\r\n", values.len()).as_bytes())
+            .expect("array response");
+        for value in values {
+            write_bulk(stream, Some(value));
+        }
     }
 
     fn write_error(stream: &mut TcpStream, value: &[u8]) {

@@ -46,14 +46,23 @@ reconciliation duration, and recovery success are separate reliability
 measurements; they must not be folded into a Redis speedup percentage.
 
 The current coordinator implementation is a correctness-first Redis-primary
-snapshot path. A stateful operation serializes the complete bounded SQLite
-image into the namespaced Redis state key, so its network and Redis write cost
-must be measured separately from the existing core-fact benchmark. It also
-queues one small idempotency-marker `SET ... EX` per stateful operation in the
-same transaction; the seven-day TTL bounds marker retention but does not remove
-the snapshot cost. The local SQLite store is the materialized full-route engine
-and standby; this design does not provide evidence of native Redis per-entity
-performance.
+migration path. A stateful operation still serializes the complete bounded
+SQLite image for standby/restart recovery, but it now also replaces a bounded
+workspace-scoped native entity projection in the same Redis transaction. The
+projection is capped at 4096 entities and 8 MiB per publish; each record is
+individually addressable through a hashed key and a workspace index. The same
+transaction writes a durable operation ledger record with no TTL plus the
+seven-day compatibility marker. These bounds make command and wire cost
+observable, but the local SQLite store remains the full-route materialized
+engine and standby; no native Redis performance win is claimed.
+
+The native projection is deliberately an incremental migration boundary. It
+covers the exported workspace entities (facts, contexts, events, handoffs,
+graph, decisions, evidence, categories, runs, measurements, feedback, and
+registered workspaces), while fact history, context lineage, selected database
+metadata, and native Redis reads remain follow-up work. Measurements must
+separate projection cost from snapshot backup cost and report rejection/fallback
+behavior when either bound is reached.
 
 The replication budget is part of the acceptance contract. The watcher uses a
 small revision/health read, fetches a state batch only after a revision change,
