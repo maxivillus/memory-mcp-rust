@@ -401,3 +401,24 @@ The thirteenth implementation slice completes the SQLite database lifecycle:
 The SQLite implementation now covers the file-backed database lifecycle in
 the pinned tool inventory. Optional embedding and Redis adapters remain
 disabled and unclaimed.
+
+The fourteenth implementation slice adds a bounded performance harness and an
+optional Redis core-fact adapter:
+
+- memory-bench measures the same persistent-connection workload against
+  SQLite, and can run the corresponding namespaced fact workload against a
+  configured Redis endpoint;
+- the Redis adapter uses a persistent RESP2 connection, optional AUTH/database
+  selection, hashed workspace/fact keys, SET-NX deduplication, and deterministic
+  list/search/reset operations;
+- Redis configuration is optional: no URL, an invalid endpoint, or an
+  unavailable service selects the SQLite fallback without exposing connection
+  credentials;
+- the benchmark emits the selected backend and fallback reason, but keeps
+  performance efficacy explicitly not claimed until a paired workload and
+  environment review is available.
+
+This adapter is an experimental core-fact comparison surface, not a claim that
+Redis already replaces every SQLite-backed MCP table. The full MCP contract
+continues to use the SQLite store unless a later parity gate explicitly wires
+the Redis adapter into the server backend.

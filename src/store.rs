@@ -1,6 +1,6 @@
 use hex::encode;
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::{RefCell, UnsafeCell};
 use std::fmt::{Display, Formatter};
@@ -39,7 +39,7 @@ impl From<rusqlite::Error> for StoreError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct Fact {
     pub id: i64,
     pub text: String,
