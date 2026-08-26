@@ -902,6 +902,88 @@ fn tool_contract(name: &str) -> (&'static str, Value) {
                 "required": ["idempotency_key", "actor", "workspace"]
             }),
         ),
+        "create_database" => (
+            "Create and initialize a named SQLite database.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "database": {"type": "string"}
+                },
+                "required": ["name"]
+            }),
+        ),
+        "list_databases" => (
+            "List the active, named, and archived SQLite databases.",
+            json!({
+                "type": "object",
+                "properties": {}
+            }),
+        ),
+        "archive_database" => (
+            "Archive an inactive named SQLite database.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "database": {"type": "string"}
+                },
+                "required": ["name"]
+            }),
+        ),
+        "backup_database" => (
+            "Create a physical SQLite backup at an explicit output path.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "database": {"type": "string"},
+                    "path": {"type": "string"},
+                    "output": {"type": "string"}
+                },
+                "required": ["path"]
+            }),
+        ),
+        "delete_database" => (
+            "Delete an inactive named or archived SQLite database.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "database": {"type": "string"}
+                },
+                "required": ["name"]
+            }),
+        ),
+        "select_database" => (
+            "Select a named SQLite database for subsequent calls in this process.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "database": {"type": "string"}
+                },
+                "required": ["name"]
+            }),
+        ),
+        "current_database" => (
+            "Return the database selected for the current process.",
+            json!({
+                "type": "object",
+                "properties": {}
+            }),
+        ),
+        "reset_database" => (
+            "Clear all data from a named or current SQLite database.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "database": {"type": "string"}
+                },
+                "required": ["name"]
+            }),
+        ),
         "backup_workspace" => (
             "Write a deterministic JSON snapshot to an explicit workspace path.",
             json!({

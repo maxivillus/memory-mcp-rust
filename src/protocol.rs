@@ -957,6 +957,52 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
             serde_json::to_value(store.export_rdf(workspace).map_err(CallError::Execution)?)
                 .expect("RDF export serializes")
         }
+        "create_database" => {
+            let name = database_name_argument(arguments)?;
+            serde_json::to_value(store.create_database(name).map_err(CallError::Execution)?)
+                .expect("database serializes")
+        }
+        "list_databases" => {
+            serde_json::to_value(store.list_databases().map_err(CallError::Execution)?)
+                .expect("databases serialize")
+        }
+        "archive_database" => {
+            let name = database_name_argument(arguments)?;
+            serde_json::to_value(store.archive_database(name).map_err(CallError::Execution)?)
+                .expect("database serializes")
+        }
+        "backup_database" => {
+            let name = optional_string(arguments, "database")?
+                .or(optional_string(arguments, "name")?)
+                .unwrap_or("current");
+            let path = required_string(arguments, "path")
+                .or_else(|_| required_string(arguments, "output"))?;
+            serde_json::to_value(
+                store
+                    .backup_database(name, path)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("database backup serializes")
+        }
+        "delete_database" => {
+            let name = database_name_argument(arguments)?;
+            serde_json::to_value(store.delete_database(name).map_err(CallError::Execution)?)
+                .expect("database deletion serializes")
+        }
+        "select_database" => {
+            let name = database_name_argument(arguments)?;
+            serde_json::to_value(store.select_database(name).map_err(CallError::Execution)?)
+                .expect("database serializes")
+        }
+        "current_database" => {
+            serde_json::to_value(store.current_database().map_err(CallError::Execution)?)
+                .expect("current database serializes")
+        }
+        "reset_database" => {
+            let name = database_name_argument(arguments)?;
+            serde_json::to_value(store.reset_database(name).map_err(CallError::Execution)?)
+                .expect("database serializes")
+        }
         "create_workspace" => {
             let id = workspace_argument(arguments)?;
             serde_json::to_value(store.create_workspace(id).map_err(CallError::Execution)?)
@@ -1006,6 +1052,10 @@ fn required_string<'a>(arguments: &'a Map<String, Value>, key: &str) -> Result<&
         .get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| CallError::InvalidParams(format!("tool argument {key} must be a string")))
+}
+
+fn database_name_argument(arguments: &Map<String, Value>) -> Result<&str, CallError> {
+    required_string(arguments, "name").or_else(|_| required_string(arguments, "database"))
 }
 
 fn optional_string<'a>(
@@ -1273,6 +1323,87 @@ mod tests {
         .unwrap();
         let text = search["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("SQLite fallback"));
+    }
+
+    #[test]
+    fn database_tools_switch_and_backup_a_file_backed_store() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-mcp-rust-protocol-databases-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("facts.db");
+        let backup_path = root.join("protocol-backup.db");
+        let store = Store::open(&path).unwrap();
+
+        let create = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_database",
+                    "arguments": {"name": "protocol"}
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        assert!(create["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"name\":\"protocol\""));
+
+        let select = handle_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"select_database","arguments":{"name":"protocol"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(select["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"active\":true"));
+
+        let remember = handle_line(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"remember_fact","arguments":{"text":"protocol database fact","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(!remember["result"]["isError"].as_bool().unwrap());
+
+        let backup = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "backup_database",
+                    "arguments": {
+                        "database": "current",
+                        "path": backup_path.to_str().unwrap()
+                    }
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        assert!(backup["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"bytes\""));
+
+        let current = handle_line(
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"current_database","arguments":{}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(current["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"name\":\"protocol\""));
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

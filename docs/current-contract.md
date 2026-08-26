@@ -378,7 +378,26 @@ The twelfth implementation slice adds deterministic anchor and backup helpers:
 - store and stdio tests cover anchor matching, consolidation reporting, and
   backup readback.
 
-Named database selection/archive/delete and physical database backups remain
-staged because the current connection is intentionally single-store; the
-implemented backup is an explicit workspace JSON snapshot. Optional embedding
-and Redis adapters remain disabled and unclaimed.
+At the twelfth implementation slice, named database
+selection/archive/delete and physical database backups remained staged because
+the connection was intentionally single-store; the implemented backup was an
+explicit workspace JSON snapshot. Optional embedding and Redis adapters
+remained disabled and unclaimed.
+
+The thirteenth implementation slice completes the SQLite database lifecycle:
+
+- create_database initializes a safe named database under the sibling
+  databases/ directory, and list_databases reports active, named, and
+  archived files;
+- select_database swaps the single-process connection to an existing named
+  store, while archive_database and delete_database reject the active store;
+- reset_database clears the selected store or an inactive named store without
+  changing its schema;
+- backup_database uses SQLite VACUUM INTO at an explicit output path, so
+  active WAL state is included in a consistent physical backup;
+- store and stdio tests cover isolation across selected databases, archive and
+  deletion safeguards, reset behavior, path validation, and backup readback.
+
+The SQLite implementation now covers the file-backed database lifecycle in
+the pinned tool inventory. Optional embedding and Redis adapters remain
+disabled and unclaimed.

@@ -2,8 +2,10 @@ use hex::encode;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::cell::{RefCell, UnsafeCell};
 use std::fmt::{Display, Formatter};
 use std::fs;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -493,6 +495,22 @@ pub struct WorkspaceBackup {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DatabaseInfo {
+    pub name: String,
+    pub path: String,
+    pub active: bool,
+    pub archived: bool,
+    pub bytes: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DatabaseBackup {
+    pub database: String,
+    pub path: String,
+    pub bytes: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Stats {
     pub facts: i64,
     pub contexts: i64,
@@ -508,8 +526,43 @@ const MAX_EVENT_PAYLOAD_BYTES: usize = 16 * 1024;
 const MAX_RUN_FILES_BYTES: usize = 64 * 1024;
 const MAX_RUN_DIFF_BYTES: usize = 128 * 1024;
 
+struct ConnectionSlot {
+    connection: UnsafeCell<Connection>,
+}
+
+impl ConnectionSlot {
+    fn new(connection: Connection) -> Self {
+        Self {
+            connection: UnsafeCell::new(connection),
+        }
+    }
+
+    fn replace(&self, connection: Connection) -> Connection {
+        // SAFETY: Store is deliberately !Sync because this slot is only used by
+        // the single-threaded stdio dispatcher. No public operation can hold a
+        // reference into the slot across a database selection.
+        unsafe { std::mem::replace(&mut *self.connection.get(), connection) }
+    }
+
+    fn into_inner(self) -> Connection {
+        self.connection.into_inner()
+    }
+}
+
+impl Deref for ConnectionSlot {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: The slot is accessed serially by the single-threaded Store
+        // dispatcher; see replace for the ownership invariant.
+        unsafe { &*self.connection.get() }
+    }
+}
+
 pub struct Store {
-    connection: Connection,
+    connection: ConnectionSlot,
+    database_path: RefCell<Option<PathBuf>>,
+    database_root: Option<PathBuf>,
 }
 
 impl Store {
@@ -521,20 +574,28 @@ impl Store {
             }
         }
         let connection = Connection::open(path)?;
-        Self::from_connection(connection)
+        Self::from_connection(connection, Some(path.to_path_buf()))
     }
 
     pub fn in_memory() -> Result<Self, StoreError> {
-        Self::from_connection(Connection::open_in_memory()?)
+        Self::from_connection(Connection::open_in_memory()?, None)
     }
 
-    fn from_connection(connection: Connection) -> Result<Self, StoreError> {
+    fn from_connection(
+        connection: Connection,
+        database_path: Option<PathBuf>,
+    ) -> Result<Self, StoreError> {
         connection.execute_batch(
             "PRAGMA busy_timeout = 5000;
              PRAGMA foreign_keys = ON;
              PRAGMA journal_mode = WAL;",
         )?;
-        let store = Self { connection };
+        let database_root = database_path.as_deref().map(database_root_for_path);
+        let store = Self {
+            connection: ConnectionSlot::new(connection),
+            database_path: RefCell::new(database_path),
+            database_root,
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -2018,6 +2079,284 @@ impl Store {
             facts: snapshot.facts.len() as i64,
             contexts: snapshot.contexts.len() as i64,
         })
+    }
+
+    pub fn current_database(&self) -> Result<DatabaseInfo, StoreError> {
+        let path = self.database_path.borrow().clone();
+        match path {
+            Some(path) => self.database_info(&path, true, false),
+            None => Ok(DatabaseInfo {
+                name: "memory".to_owned(),
+                path: ":memory:".to_owned(),
+                active: true,
+                archived: false,
+                bytes: 0,
+            }),
+        }
+    }
+
+    pub fn list_databases(&self) -> Result<Vec<DatabaseInfo>, StoreError> {
+        let root = self.database_root()?;
+        fs::create_dir_all(&root)?;
+        let active_path = self.database_path.borrow().clone();
+        let mut databases = Vec::new();
+
+        if let Some(path) = active_path.as_deref() {
+            databases.push(self.database_info(path, true, false)?);
+        }
+
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(archived) = database_path_kind(&path) else {
+                continue;
+            };
+            if active_path
+                .as_deref()
+                .is_some_and(|active| same_database_path(active, &path))
+            {
+                continue;
+            }
+            databases.push(self.database_info(&path, false, archived)?);
+        }
+
+        databases.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        Ok(databases)
+    }
+
+    pub fn create_database(&self, name: &str) -> Result<DatabaseInfo, StoreError> {
+        validate_database_name(name)?;
+        let root = self.database_root()?;
+        fs::create_dir_all(&root)?;
+        let path = root.join(format!("{name}.db"));
+        let archived_path = archived_database_path(&path);
+        if path.exists() || archived_path.exists() {
+            return Err(StoreError::Invalid(format!(
+                "database already exists: {name}"
+            )));
+        }
+        drop(Self::open(&path)?);
+        self.database_info(&path, false, false)
+    }
+
+    pub fn archive_database(&self, name: &str) -> Result<Option<DatabaseInfo>, StoreError> {
+        validate_database_name(name)?;
+        let path = self.named_database_path(name)?;
+        let archived_path = archived_database_path(&path);
+        if !path.exists() {
+            return if archived_path.exists() {
+                Ok(Some(self.database_info(&archived_path, false, true)?))
+            } else {
+                Ok(None)
+            };
+        }
+        if self.is_active_path(&path) {
+            return Err(StoreError::Invalid(
+                "active database cannot be archived; select another database first".to_owned(),
+            ));
+        }
+        fs::rename(&path, &archived_path)?;
+        Ok(Some(self.database_info(&archived_path, false, true)?))
+    }
+
+    pub fn backup_database(
+        &self,
+        name: &str,
+        output_path: &str,
+    ) -> Result<DatabaseBackup, StoreError> {
+        let source = self.database_source_path(name)?;
+        let output = validate_database_backup_path(output_path)?;
+        if same_database_path(&source, &output) {
+            return Err(StoreError::Invalid(
+                "database backup output must differ from the source database".to_owned(),
+            ));
+        }
+        if output.exists() {
+            return Err(StoreError::Invalid(
+                "database backup output already exists".to_owned(),
+            ));
+        }
+        if let Some(parent) = output.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        let active_path = self.database_path.borrow().clone();
+        if active_path
+            .as_deref()
+            .is_some_and(|active| same_database_path(active, &source))
+        {
+            let output = output.to_string_lossy().into_owned();
+            self.connection.execute("VACUUM INTO ?1", params![output])?;
+        } else {
+            let source_store = Self::open(&source)?;
+            let output = output.to_string_lossy().into_owned();
+            source_store
+                .connection
+                .execute("VACUUM INTO ?1", params![output])?;
+        }
+
+        let bytes = fs::metadata(&output)?.len() as i64;
+        Ok(DatabaseBackup {
+            database: name.to_owned(),
+            path: output_path.to_owned(),
+            bytes,
+        })
+    }
+
+    pub fn delete_database(&self, name: &str) -> Result<bool, StoreError> {
+        validate_database_name(name)?;
+        let path = self.named_database_path(name)?;
+        if self.is_active_path(&path) {
+            return Err(StoreError::Invalid(
+                "active database cannot be deleted; select another database first".to_owned(),
+            ));
+        }
+        if path.exists() {
+            fs::remove_file(path)?;
+            return Ok(true);
+        }
+        let archived_path = archived_database_path(&path);
+        if archived_path.exists() {
+            fs::remove_file(archived_path)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub fn select_database(&self, name: &str) -> Result<DatabaseInfo, StoreError> {
+        if name == "current" {
+            return self.current_database();
+        }
+        validate_database_name(name)?;
+        let path = self.named_database_path(name)?;
+        if !path.exists() {
+            if archived_database_path(&path).exists() {
+                return Err(StoreError::Invalid(format!("database is archived: {name}")));
+            }
+            return Err(StoreError::Invalid(format!("database not found: {name}")));
+        }
+
+        let candidate = Self::open(&path)?;
+        let replacement = candidate.into_connection();
+        let previous = self.connection.replace(replacement);
+        drop(previous);
+        *self.database_path.borrow_mut() = Some(path.clone());
+        self.current_database()
+    }
+
+    pub fn reset_database(&self, name: &str) -> Result<DatabaseInfo, StoreError> {
+        if name == "current" {
+            self.clear_database()?;
+            return self.current_database();
+        }
+        validate_database_name(name)?;
+        let path = self.named_database_path(name)?;
+        if self.is_active_path(&path) {
+            self.clear_database()?;
+            return self.current_database();
+        }
+        if !path.exists() {
+            if archived_database_path(&path).exists() {
+                return Err(StoreError::Invalid(format!("database is archived: {name}")));
+            }
+            return Err(StoreError::Invalid(format!("database not found: {name}")));
+        }
+        let candidate = Self::open(&path)?;
+        candidate.clear_database()?;
+        self.database_info(&path, false, false)
+    }
+
+    fn into_connection(self) -> Connection {
+        self.connection.into_inner()
+    }
+
+    fn database_root(&self) -> Result<PathBuf, StoreError> {
+        self.database_root.clone().ok_or_else(|| {
+            StoreError::Invalid("named database operations require a file-backed store".to_owned())
+        })
+    }
+
+    fn named_database_path(&self, name: &str) -> Result<PathBuf, StoreError> {
+        let root = self.database_root()?;
+        Ok(root.join(format!("{name}.db")))
+    }
+
+    fn database_source_path(&self, name: &str) -> Result<PathBuf, StoreError> {
+        if name == "current" {
+            return self.database_path.borrow().clone().ok_or_else(|| {
+                StoreError::Invalid(
+                    "the in-memory database cannot be backed up as a file".to_owned(),
+                )
+            });
+        }
+        validate_database_name(name)?;
+        let path = self.named_database_path(name)?;
+        if path.exists() {
+            return Ok(path);
+        }
+        let archived_path = archived_database_path(&path);
+        if archived_path.exists() {
+            return Ok(archived_path);
+        }
+        Err(StoreError::Invalid(format!("database not found: {name}")))
+    }
+
+    fn database_info(
+        &self,
+        path: &Path,
+        active: bool,
+        archived: bool,
+    ) -> Result<DatabaseInfo, StoreError> {
+        let bytes = fs::metadata(path)?.len() as i64;
+        let name = database_name_from_path(path, archived).ok_or_else(|| {
+            StoreError::Invalid(format!(
+                "database path has no supported name: {}",
+                path.display()
+            ))
+        })?;
+        Ok(DatabaseInfo {
+            name,
+            path: path.to_string_lossy().into_owned(),
+            active,
+            archived,
+            bytes,
+        })
+    }
+
+    fn is_active_path(&self, path: &Path) -> bool {
+        self.database_path
+            .borrow()
+            .as_deref()
+            .is_some_and(|active| same_database_path(active, path))
+    }
+
+    fn clear_database(&self) -> Result<(), StoreError> {
+        self.connection.execute_batch(
+            "DELETE FROM handoffs;
+             DELETE FROM lifecycle_events;
+             DELETE FROM context_lineage;
+             DELETE FROM evidence;
+             DELETE FROM fact_history;
+             DELETE FROM fact_embeddings;
+             DELETE FROM relations;
+             DELETE FROM facts;
+             DELETE FROM decision_embeddings;
+             DELETE FROM decisions;
+             DELETE FROM contexts;
+             DELETE FROM entities;
+             DELETE FROM categories;
+             DELETE FROM runs;
+             DELETE FROM measurement_observations;
+             DELETE FROM memory_feedback;
+             DELETE FROM workspaces;",
+        )?;
+        Ok(())
     }
 
     fn category_by_name(
@@ -3760,6 +4099,94 @@ pub fn default_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("data/facts.db"))
 }
 
+fn database_root_for_path(path: &Path) -> PathBuf {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(
+            || PathBuf::from("databases"),
+            |parent| parent.join("databases"),
+        )
+}
+
+fn validate_database_name(name: &str) -> Result<(), StoreError> {
+    if name.is_empty() || name.trim() != name {
+        return Err(StoreError::Invalid(
+            "database name must not be empty or padded with whitespace".to_owned(),
+        ));
+    }
+    if !name
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+    {
+        return Err(StoreError::Invalid(
+            "database name may contain only ASCII letters, digits, '.', '_' or '-'".to_owned(),
+        ));
+    }
+    if matches!(name, "." | "..") {
+        return Err(StoreError::Invalid(
+            "database name must not be a path traversal component".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_database_backup_path(path: &str) -> Result<PathBuf, StoreError> {
+    if path.trim().is_empty() {
+        return Err(StoreError::Invalid(
+            "database backup path must not be empty".to_owned(),
+        ));
+    }
+    let path = PathBuf::from(path);
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(StoreError::Invalid(
+            "database backup path must not contain parent-directory components".to_owned(),
+        ));
+    }
+    if path.exists() && path.is_dir() {
+        return Err(StoreError::Invalid(
+            "database backup path must reference a file".to_owned(),
+        ));
+    }
+    Ok(path)
+}
+
+fn archived_database_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.archived", path.to_string_lossy()))
+}
+
+fn database_path_kind(path: &Path) -> Option<bool> {
+    let name = path.file_name()?.to_str()?;
+    if name.ends_with(".db.archived") {
+        Some(true)
+    } else if name.ends_with(".db") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn database_name_from_path(path: &Path, archived: bool) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    let suffix = if archived { ".db.archived" } else { ".db" };
+    file_name
+        .strip_suffix(suffix)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn same_database_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
 fn sha256(text: &str) -> String {
     encode(Sha256::digest(text.as_bytes()))
 }
@@ -5175,6 +5602,64 @@ mod tests {
         assert_eq!(export.evidence, vec![evidence]);
         assert!(export.events.is_empty());
         assert!(export.handoffs.is_empty());
+    }
+
+    #[test]
+    fn named_database_lifecycle_switches_isolates_and_backs_up() {
+        let root =
+            std::env::temp_dir().join(format!("memory-mcp-rust-databases-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let main_path = root.join("facts.db");
+        let backup_path = root.join("beta-backup.db");
+        let store = Store::open(&main_path).expect("file-backed store");
+
+        assert_eq!(store.current_database().unwrap().name, "facts");
+        let alpha = store.create_database("alpha").expect("alpha database");
+        let beta = store.create_database("beta").expect("beta database");
+        assert!(!alpha.active);
+        assert!(!beta.active);
+        assert!(store
+            .list_databases()
+            .unwrap()
+            .iter()
+            .any(|database| database.name == "facts" && database.active));
+
+        store.select_database("alpha").expect("select alpha");
+        store.remember_fact("alpha fact", "workspace-a").unwrap();
+        store.select_database("beta").expect("select beta");
+        store.remember_fact("beta fact", "workspace-a").unwrap();
+        assert_eq!(store.list_facts("workspace-a").unwrap().len(), 1);
+        assert_eq!(
+            store.list_facts("workspace-a").unwrap()[0].text,
+            "beta fact"
+        );
+        assert!(store.select_database("missing").is_err());
+
+        let backup = store
+            .backup_database("current", backup_path.to_str().unwrap())
+            .expect("physical database backup");
+        assert_eq!(backup.database, "current");
+        assert!(backup.bytes > 0);
+        let backup_store = Store::open(&backup_path).expect("read backup");
+        assert_eq!(backup_store.list_facts("workspace-a").unwrap().len(), 1);
+        drop(backup_store);
+
+        store.reset_database("beta").expect("reset beta");
+        assert!(store.list_facts("workspace-a").unwrap().is_empty());
+        assert!(store.delete_database("beta").is_err());
+        store.archive_database("alpha").expect("archive alpha");
+        assert!(store
+            .list_databases()
+            .unwrap()
+            .iter()
+            .any(|database| database.name == "alpha" && database.archived));
+        assert!(store.delete_database("alpha").unwrap());
+        assert!(!store.delete_database("missing").unwrap());
+        assert!(store.create_database("../unsafe").is_err());
+        assert!(store.backup_database("current", "../unsafe.db").is_err());
+
+        drop(store);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
