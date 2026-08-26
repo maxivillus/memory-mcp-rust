@@ -229,3 +229,23 @@ This slice deliberately keeps local document ingestion, lifecycle events,
 typed handoffs, graph/decision tables, and database management for later
 parity slices. Redis and embedding adapters remain out of scope until the
 SQLite behavior has a broader deterministic test baseline.
+
+The fourth implementation slice adds SQLite-backed lifecycle events and
+one-shot handoffs:
+
+- capture_event stores event type, metadata, payload hash/size/truncation, and
+  an immutable workspace-scoped context reference; the idempotency key is
+  replay-safe and conflicting replays are rejected;
+- list_events and read_event provide deterministic workspace-scoped reads;
+- handoff_begin stores owner/session/source, sharing, expiry, and state, with
+  idempotency and one handoff per context in a workspace;
+- list_handoffs materializes expired open handoffs as expired, while
+  handoff_accept and handoff_cancel enforce one-way state transitions and keep
+  actor/timestamp audit fields;
+- fresh and additive legacy-table migration paths are covered by tests, and
+  all handlers are reachable through the single stdio JSON-RPC dispatcher.
+
+Database management, local document ingestion, graph/decision/provenance
+tables, aggregate measurements, feedback, and the remaining fact retrieval
+tools are still separate parity slices. No Redis or embedding implementation
+is claimed.

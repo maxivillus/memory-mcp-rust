@@ -1,4 +1,4 @@
-use crate::store::{ContextMetadata, Store, StoreError};
+use crate::store::{ContextMetadata, EventSpec, HandoffSpec, Store, StoreError};
 use crate::tools;
 use serde_json::{json, Map, Value};
 
@@ -297,6 +297,107 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
             }
             serde_json::to_value(lineage).expect("context map serializes")
         }
+        "capture_event" => {
+            let idempotency_key = required_string(arguments, "idempotency_key")
+                .or_else(|_| required_string(arguments, "event_id"))?;
+            let event_type = required_string(arguments, "event_type")
+                .or_else(|_| required_string(arguments, "type"))?;
+            let context_reference = required_string(arguments, "context_ref")
+                .or_else(|_| required_string(arguments, "context"))?;
+            let metadata = arguments
+                .get("metadata")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let payload = arguments.get("payload").cloned().unwrap_or(Value::Null);
+            let workspace = required_context_workspace(arguments)?;
+            let spec = EventSpec {
+                idempotency_key: idempotency_key.to_owned(),
+                event_type: event_type.to_owned(),
+                context_reference: context_reference.to_owned(),
+                metadata: serde_json::to_string(&metadata).expect("event metadata serializes"),
+                payload: serde_json::to_string(&payload).expect("event payload serializes"),
+                workspace: workspace.to_owned(),
+            };
+            serde_json::to_value(store.capture_event(&spec).map_err(CallError::Execution)?)
+                .expect("event serializes")
+        }
+        "list_events" => {
+            let workspace = required_context_workspace(arguments)?;
+            serde_json::to_value(store.list_events(workspace).map_err(CallError::Execution)?)
+                .expect("events serialize")
+        }
+        "read_event" => {
+            let idempotency_key = required_string(arguments, "idempotency_key")
+                .or_else(|_| required_string(arguments, "event_id"))?;
+            let workspace = required_context_workspace(arguments)?;
+            serde_json::to_value(
+                store
+                    .read_event(idempotency_key, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("event serializes")
+        }
+        "handoff_begin" => {
+            let idempotency_key = required_string(arguments, "idempotency_key")
+                .or_else(|_| required_string(arguments, "handoff_id"))?;
+            let context_reference = required_string(arguments, "context_ref")
+                .or_else(|_| required_string(arguments, "context"))?;
+            let owner = required_string(arguments, "owner")?;
+            let session = optional_string(arguments, "session")?.unwrap_or("");
+            let source = optional_string(arguments, "source")?.unwrap_or("");
+            let shared = optional_bool(arguments, &["shared", "share"], false)?;
+            let ttl_seconds = optional_i64(arguments, &["ttl_seconds", "ttl"])?;
+            let expires_at = optional_string(arguments, "expires_at")?;
+            let workspace = required_context_workspace(arguments)?;
+            let spec = HandoffSpec {
+                idempotency_key: idempotency_key.to_owned(),
+                context_reference: context_reference.to_owned(),
+                owner: owner.to_owned(),
+                session: session.to_owned(),
+                source: source.to_owned(),
+                workspace: workspace.to_owned(),
+                shared,
+                ttl_seconds,
+                expires_at: expires_at.map(ToOwned::to_owned),
+            };
+            serde_json::to_value(store.begin_handoff(&spec).map_err(CallError::Execution)?)
+                .expect("handoff serializes")
+        }
+        "list_handoffs" => {
+            let workspace = required_context_workspace(arguments)?;
+            serde_json::to_value(
+                store
+                    .list_handoffs(workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("handoffs serialize")
+        }
+        "handoff_accept" => {
+            let idempotency_key = required_string(arguments, "idempotency_key")
+                .or_else(|_| required_string(arguments, "handoff_id"))?;
+            let actor = required_string(arguments, "actor")
+                .or_else(|_| required_string(arguments, "accepted_by"))?;
+            let workspace = required_context_workspace(arguments)?;
+            serde_json::to_value(
+                store
+                    .accept_handoff(idempotency_key, actor, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("accepted handoff serializes")
+        }
+        "handoff_cancel" => {
+            let idempotency_key = required_string(arguments, "idempotency_key")
+                .or_else(|_| required_string(arguments, "handoff_id"))?;
+            let actor = required_string(arguments, "actor")
+                .or_else(|_| required_string(arguments, "cancelled_by"))?;
+            let workspace = required_context_workspace(arguments)?;
+            serde_json::to_value(
+                store
+                    .cancel_handoff(idempotency_key, actor, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("cancelled handoff serializes")
+        }
         "create_workspace" => {
             let id = workspace_argument(arguments)?;
             serde_json::to_value(store.create_workspace(id).map_err(CallError::Execution)?)
@@ -396,6 +497,35 @@ fn optional_usize(
             "tool argument {key} is too large for this platform"
         ))
     })
+}
+
+fn optional_i64(arguments: &Map<String, Value>, keys: &[&str]) -> Result<Option<i64>, CallError> {
+    let Some((key, value)) = keys
+        .iter()
+        .find_map(|key| arguments.get(*key).map(|value| (*key, value)))
+    else {
+        return Ok(None);
+    };
+    value
+        .as_i64()
+        .map(Some)
+        .ok_or_else(|| CallError::InvalidParams(format!("tool argument {key} must be an integer")))
+}
+
+fn optional_bool(
+    arguments: &Map<String, Value>,
+    keys: &[&str],
+    default: bool,
+) -> Result<bool, CallError> {
+    let Some((key, value)) = keys
+        .iter()
+        .find_map(|key| arguments.get(*key).map(|value| (*key, value)))
+    else {
+        return Ok(default);
+    };
+    value
+        .as_bool()
+        .ok_or_else(|| CallError::InvalidParams(format!("tool argument {key} must be a boolean")))
 }
 
 fn required_context_workspace(arguments: &Map<String, Value>) -> Result<&str, CallError> {
@@ -582,5 +712,55 @@ mod tests {
         let map_value: Value = serde_json::from_str(map_text).unwrap();
         assert_eq!(map_value.as_array().unwrap().len(), 1);
         assert_eq!(map_value[0]["relation"], "reduced_from");
+    }
+
+    #[test]
+    fn lifecycle_and_handoff_tools_are_reachable_through_stdio_dispatch() {
+        let store = Store::in_memory().unwrap();
+        let put = handle_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"put_context","arguments":{"ref":"ctx-a","name":"A","content":"context","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(!put["result"]["isError"].as_bool().unwrap());
+
+        let event = handle_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"capture_event","arguments":{"idempotency_key":"e-1","event_type":"captured","context_ref":"ctx-a","metadata":{"source":"test"},"payload":{"turn":1},"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(!event["result"]["isError"].as_bool().unwrap());
+        let events = handle_line(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_events","arguments":{"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(events["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("e-1"));
+
+        let handoff = handle_line(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"handoff_begin","arguments":{"idempotency_key":"h-1","context_ref":"ctx-a","owner":"agent-a","session":"s-1","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(!handoff["result"]["isError"].as_bool().unwrap());
+        let accepted = handle_line(
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"handoff_accept","arguments":{"idempotency_key":"h-1","actor":"agent-b","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let accepted_text = accepted["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(accepted_text.contains("\"accepted\""));
+        let listed = handle_line(
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"list_handoffs","arguments":{"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(listed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("agent-b"));
     }
 }

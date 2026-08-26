@@ -215,6 +215,94 @@ fn tool_contract(name: &str) -> (&'static str, Value) {
                 "required": ["workspace"]
             }),
         ),
+        "capture_event" => (
+            "Capture one idempotent lifecycle event for a context.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "idempotency_key": {"type": "string"},
+                    "event_id": {"type": "string"},
+                    "event_type": {"type": "string"},
+                    "type": {"type": "string"},
+                    "context_ref": {"type": "string"},
+                    "context": {"type": "string"},
+                    "metadata": {"type": "object"},
+                    "payload": {},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["idempotency_key", "event_type", "context_ref", "workspace"]
+            }),
+        ),
+        "list_events" => ("List lifecycle events in a workspace.", workspace_schema()),
+        "read_event" => (
+            "Read one lifecycle event by idempotency key.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "idempotency_key": {"type": "string"},
+                    "event_id": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["idempotency_key", "workspace"]
+            }),
+        ),
+        "handoff_begin" => (
+            "Open one idempotent one-shot handoff for a context.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "idempotency_key": {"type": "string"},
+                    "handoff_id": {"type": "string"},
+                    "context_ref": {"type": "string"},
+                    "context": {"type": "string"},
+                    "owner": {"type": "string"},
+                    "session": {"type": "string"},
+                    "source": {"type": "string"},
+                    "shared": {"type": "boolean"},
+                    "ttl_seconds": {"type": "integer", "minimum": 0},
+                    "expires_at": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["idempotency_key", "context_ref", "owner", "workspace"]
+            }),
+        ),
+        "list_handoffs" => (
+            "List handoffs and refresh expired open states.",
+            workspace_schema(),
+        ),
+        "handoff_accept" => (
+            "Accept an open handoff exactly once.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "idempotency_key": {"type": "string"},
+                    "handoff_id": {"type": "string"},
+                    "actor": {"type": "string"},
+                    "accepted_by": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["idempotency_key", "actor", "workspace"]
+            }),
+        ),
+        "handoff_cancel" => (
+            "Cancel an open handoff exactly once.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "idempotency_key": {"type": "string"},
+                    "handoff_id": {"type": "string"},
+                    "actor": {"type": "string"},
+                    "cancelled_by": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["idempotency_key", "actor", "workspace"]
+            }),
+        ),
         _ => (
             "Compatibility inventory entry; handler and schema parity is ported incrementally.",
             json!({

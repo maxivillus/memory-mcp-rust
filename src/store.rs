@@ -83,6 +83,62 @@ pub struct ContextLineage {
     pub workspace: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventSpec {
+    pub idempotency_key: String,
+    pub event_type: String,
+    pub context_reference: String,
+    pub metadata: String,
+    pub payload: String,
+    pub workspace: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LifecycleEvent {
+    pub id: i64,
+    pub idempotency_key: String,
+    pub event_type: String,
+    pub context_reference: String,
+    pub metadata: String,
+    pub payload_sha256: String,
+    pub payload_size: i64,
+    pub payload_truncated: bool,
+    pub workspace: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoffSpec {
+    pub idempotency_key: String,
+    pub context_reference: String,
+    pub owner: String,
+    pub session: String,
+    pub source: String,
+    pub workspace: String,
+    pub shared: bool,
+    pub ttl_seconds: Option<i64>,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Handoff {
+    pub id: i64,
+    pub idempotency_key: String,
+    pub context_reference: String,
+    pub owner: String,
+    pub session: String,
+    pub source: String,
+    pub workspace: String,
+    pub shared: bool,
+    pub expires_at: Option<String>,
+    pub state: String,
+    pub accepted_at: Option<String>,
+    pub accepted_by: Option<String>,
+    pub cancelled_at: Option<String>,
+    pub cancelled_by: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Stats {
     pub facts: i64,
@@ -94,6 +150,8 @@ pub struct Workspace {
     pub id: String,
     pub status: String,
 }
+
+const MAX_EVENT_PAYLOAD_BYTES: usize = 16 * 1024;
 
 pub struct Store {
     connection: Connection,
@@ -183,6 +241,58 @@ impl Store {
                 ON context_lineage (workspace_id, child_ref);",
         )?;
         self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS lifecycle_events (
+                id INTEGER PRIMARY KEY,
+                idempotency_key TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                context_ref TEXT NOT NULL,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                payload_sha256 TEXT NOT NULL,
+                payload_size INTEGER NOT NULL DEFAULT 0,
+                payload_truncated INTEGER NOT NULL DEFAULT 0,
+                workspace_id TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (workspace_id, idempotency_key),
+                UNIQUE (workspace_id, context_ref),
+                FOREIGN KEY (context_ref) REFERENCES contexts(ref) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS handoffs (
+                id INTEGER PRIMARY KEY,
+                idempotency_key TEXT NOT NULL,
+                context_ref TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                session TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL,
+                shared INTEGER NOT NULL DEFAULT 0 CHECK (shared IN (0, 1)),
+                expires_at TEXT,
+                state TEXT NOT NULL DEFAULT 'open'
+                    CHECK (state IN ('open', 'accepted', 'cancelled', 'expired')),
+                accepted_at TEXT,
+                accepted_by TEXT,
+                cancelled_at TEXT,
+                cancelled_by TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (workspace_id, idempotency_key),
+                UNIQUE (workspace_id, context_ref),
+                FOREIGN KEY (context_ref) REFERENCES contexts(ref) ON DELETE CASCADE
+            );",
+        )?;
+        self.ensure_event_columns()?;
+        self.ensure_handoff_columns()?;
+        self.connection.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS lifecycle_events_workspace_key_idx
+                ON lifecycle_events (workspace_id, idempotency_key);
+             CREATE UNIQUE INDEX IF NOT EXISTS lifecycle_events_workspace_context_idx
+                ON lifecycle_events (workspace_id, context_ref);
+             CREATE UNIQUE INDEX IF NOT EXISTS handoffs_workspace_key_idx
+                ON handoffs (workspace_id, idempotency_key);
+             CREATE UNIQUE INDEX IF NOT EXISTS handoffs_workspace_context_idx
+                ON handoffs (workspace_id, context_ref);
+             CREATE INDEX IF NOT EXISTS handoffs_state_idx
+                ON handoffs (workspace_id, state);",
+        )?;
+        self.connection.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts
                 USING fts5(text, content='facts', content_rowid='id');
              CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
@@ -257,6 +367,67 @@ impl Store {
              WHERE byte_size = 0 AND content <> ''",
             [],
         )?;
+        Ok(())
+    }
+
+    fn ensure_event_columns(&self) -> Result<(), StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("PRAGMA table_info(lifecycle_events)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let additions = [
+            ("idempotency_key", "TEXT NOT NULL DEFAULT ''"),
+            ("event_type", "TEXT NOT NULL DEFAULT ''"),
+            ("context_ref", "TEXT NOT NULL DEFAULT ''"),
+            ("metadata", "TEXT NOT NULL DEFAULT '{}'"),
+            ("payload_sha256", "TEXT NOT NULL DEFAULT ''"),
+            ("payload_size", "INTEGER NOT NULL DEFAULT 0"),
+            ("payload_truncated", "INTEGER NOT NULL DEFAULT 0"),
+            ("workspace_id", "TEXT NOT NULL DEFAULT ''"),
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+        ];
+        for (name, definition) in additions {
+            if !columns.iter().any(|column| column == name) {
+                self.connection.execute(
+                    &format!("ALTER TABLE lifecycle_events ADD COLUMN {name} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_handoff_columns(&self) -> Result<(), StoreError> {
+        let mut statement = self.connection.prepare("PRAGMA table_info(handoffs)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let additions = [
+            ("idempotency_key", "TEXT NOT NULL DEFAULT ''"),
+            ("context_ref", "TEXT NOT NULL DEFAULT ''"),
+            ("owner", "TEXT NOT NULL DEFAULT ''"),
+            ("session", "TEXT NOT NULL DEFAULT ''"),
+            ("source", "TEXT NOT NULL DEFAULT ''"),
+            ("workspace_id", "TEXT NOT NULL DEFAULT ''"),
+            ("shared", "INTEGER NOT NULL DEFAULT 0"),
+            ("expires_at", "TEXT"),
+            ("state", "TEXT NOT NULL DEFAULT 'open'"),
+            ("accepted_at", "TEXT"),
+            ("accepted_by", "TEXT"),
+            ("cancelled_at", "TEXT"),
+            ("cancelled_by", "TEXT"),
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+        ];
+        for (name, definition) in additions {
+            if !columns.iter().any(|column| column == name) {
+                self.connection.execute(
+                    &format!("ALTER TABLE handoffs ADD COLUMN {name} {definition}"),
+                    [],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -353,6 +524,9 @@ impl Store {
         workspace: &str,
     ) -> Result<Context, StoreError> {
         validate_context(reference, name, workspace, metadata.expires_at.as_deref())?;
+        if let Some(expires_at) = metadata.expires_at.as_deref() {
+            self.validate_timestamp(expires_at, "context expiry")?;
+        }
         let sha256 = sha256(content);
         let byte_size = content.len() as i64;
         if let Some(existing) = self.context_raw(reference, workspace)? {
@@ -629,6 +803,230 @@ impl Store {
         Ok(reduced)
     }
 
+    pub fn capture_event(&self, spec: &EventSpec) -> Result<LifecycleEvent, StoreError> {
+        validate_event_spec(spec)?;
+        if self
+            .context(&spec.context_reference, &spec.workspace)?
+            .is_none()
+        {
+            return Err(StoreError::Invalid(format!(
+                "context not found: {}",
+                spec.context_reference
+            )));
+        }
+        let payload_size = i64::try_from(spec.payload.len())
+            .map_err(|_| StoreError::Invalid("event payload is too large".to_owned()))?;
+        let payload_sha256 = sha256(&spec.payload);
+        let payload_truncated = spec.payload.len() > MAX_EVENT_PAYLOAD_BYTES;
+        if let Some(existing) = self.event_by_key(&spec.idempotency_key, &spec.workspace)? {
+            if existing.event_type != spec.event_type
+                || existing.context_reference != spec.context_reference
+                || existing.metadata != spec.metadata
+                || existing.payload_sha256 != payload_sha256
+                || existing.payload_size != payload_size
+            {
+                return Err(StoreError::Invalid(
+                    "event idempotency key conflicts with an existing event".to_owned(),
+                ));
+            }
+            return Ok(existing);
+        }
+        if self
+            .event_by_context(&spec.context_reference, &spec.workspace)?
+            .is_some()
+        {
+            return Err(StoreError::Invalid(
+                "context already has a lifecycle event".to_owned(),
+            ));
+        }
+        self.connection.execute(
+            "INSERT INTO lifecycle_events
+                (idempotency_key, event_type, context_ref, metadata,
+                 payload_sha256, payload_size, payload_truncated, workspace_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                spec.idempotency_key,
+                spec.event_type,
+                spec.context_reference,
+                spec.metadata,
+                payload_sha256,
+                payload_size,
+                payload_truncated as i64,
+                spec.workspace
+            ],
+        )?;
+        self.event_by_key(&spec.idempotency_key, &spec.workspace)?
+            .ok_or_else(|| {
+                StoreError::Invalid("event insert did not produce a readable row".to_owned())
+            })
+    }
+
+    pub fn read_event(
+        &self,
+        idempotency_key: &str,
+        workspace: &str,
+    ) -> Result<Option<LifecycleEvent>, StoreError> {
+        validate_context_workspace(workspace)?;
+        self.event_by_key(idempotency_key, workspace)
+    }
+
+    pub fn list_events(&self, workspace: &str) -> Result<Vec<LifecycleEvent>, StoreError> {
+        validate_context_workspace(workspace)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, idempotency_key, event_type, context_ref, metadata,
+                    payload_sha256, payload_size, payload_truncated, workspace_id, created_at
+             FROM lifecycle_events
+             WHERE workspace_id = ?1
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![workspace], map_lifecycle_event)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn begin_handoff(&self, spec: &HandoffSpec) -> Result<Handoff, StoreError> {
+        validate_handoff_spec(spec)?;
+        if self
+            .context(&spec.context_reference, &spec.workspace)?
+            .is_none()
+        {
+            return Err(StoreError::Invalid(format!(
+                "context not found: {}",
+                spec.context_reference
+            )));
+        }
+        let expires_at = self.handoff_expiry(spec)?;
+        if let Some(existing) = self.handoff_by_key(&spec.idempotency_key, &spec.workspace)? {
+            if existing.context_reference != spec.context_reference
+                || existing.owner != spec.owner
+                || existing.session != spec.session
+                || existing.source != spec.source
+                || existing.shared != spec.shared
+            {
+                return Err(StoreError::Invalid(
+                    "handoff idempotency key conflicts with an existing handoff".to_owned(),
+                ));
+            }
+            return Ok(existing);
+        }
+        if self
+            .handoff_by_context(&spec.context_reference, &spec.workspace)?
+            .is_some()
+        {
+            return Err(StoreError::Invalid(
+                "context already has a handoff".to_owned(),
+            ));
+        }
+        self.connection.execute(
+            "INSERT INTO handoffs
+                (idempotency_key, context_ref, owner, session, source,
+                 workspace_id, shared, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                spec.idempotency_key,
+                spec.context_reference,
+                spec.owner,
+                spec.session,
+                spec.source,
+                spec.workspace,
+                spec.shared as i64,
+                expires_at
+            ],
+        )?;
+        self.handoff_by_key(&spec.idempotency_key, &spec.workspace)?
+            .ok_or_else(|| {
+                StoreError::Invalid("handoff insert did not produce a readable row".to_owned())
+            })
+    }
+
+    pub fn list_handoffs(&self, workspace: &str) -> Result<Vec<Handoff>, StoreError> {
+        validate_context_workspace(workspace)?;
+        self.refresh_expired_handoffs(workspace)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, idempotency_key, context_ref, owner, session, source,
+                    workspace_id, shared, expires_at, state, accepted_at,
+                    accepted_by, cancelled_at, cancelled_by, created_at
+             FROM handoffs
+             WHERE workspace_id = ?1
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![workspace], map_handoff)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn accept_handoff(
+        &self,
+        idempotency_key: &str,
+        actor: &str,
+        workspace: &str,
+    ) -> Result<Option<Handoff>, StoreError> {
+        validate_context_workspace(workspace)?;
+        if actor.trim().is_empty() {
+            return Err(StoreError::Invalid(
+                "handoff acceptor must not be empty".to_owned(),
+            ));
+        }
+        self.refresh_expired_handoffs(workspace)?;
+        let Some(existing) = self.handoff_by_key(idempotency_key, workspace)? else {
+            return Ok(None);
+        };
+        match existing.state.as_str() {
+            "open" => {
+                self.connection.execute(
+                    "UPDATE handoffs
+                     SET state = 'accepted', accepted_at = CURRENT_TIMESTAMP, accepted_by = ?1
+                     WHERE id = ?2",
+                    params![actor, existing.id],
+                )?;
+            }
+            "accepted" => return Ok(Some(existing)),
+            state => {
+                return Err(StoreError::Invalid(format!(
+                    "cannot accept handoff in state {state}"
+                )))
+            }
+        }
+        self.handoff_by_key(idempotency_key, workspace)
+    }
+
+    pub fn cancel_handoff(
+        &self,
+        idempotency_key: &str,
+        actor: &str,
+        workspace: &str,
+    ) -> Result<Option<Handoff>, StoreError> {
+        validate_context_workspace(workspace)?;
+        if actor.trim().is_empty() {
+            return Err(StoreError::Invalid(
+                "handoff canceller must not be empty".to_owned(),
+            ));
+        }
+        self.refresh_expired_handoffs(workspace)?;
+        let Some(existing) = self.handoff_by_key(idempotency_key, workspace)? else {
+            return Ok(None);
+        };
+        match existing.state.as_str() {
+            "open" => {
+                self.connection.execute(
+                    "UPDATE handoffs
+                     SET state = 'cancelled', cancelled_at = CURRENT_TIMESTAMP, cancelled_by = ?1
+                     WHERE id = ?2",
+                    params![actor, existing.id],
+                )?;
+            }
+            "cancelled" => return Ok(Some(existing)),
+            state => {
+                return Err(StoreError::Invalid(format!(
+                    "cannot cancel handoff in state {state}"
+                )))
+            }
+        }
+        self.handoff_by_key(idempotency_key, workspace)
+    }
+
     pub fn stats(&self) -> Result<Stats, StoreError> {
         let facts = self
             .connection
@@ -759,6 +1157,138 @@ impl Store {
             .optional()
             .map_err(StoreError::from)
     }
+
+    fn validate_timestamp(&self, value: &str, label: &str) -> Result<(), StoreError> {
+        let parsed: Option<f64> =
+            self.connection
+                .query_row("SELECT julianday(?1)", params![value], |row| row.get(0))?;
+        if parsed.is_none() {
+            return Err(StoreError::Invalid(format!(
+                "{label} is not a valid timestamp"
+            )));
+        }
+        Ok(())
+    }
+
+    fn event_by_key(
+        &self,
+        idempotency_key: &str,
+        workspace: &str,
+    ) -> Result<Option<LifecycleEvent>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, idempotency_key, event_type, context_ref, metadata,
+                        payload_sha256, payload_size, payload_truncated,
+                        workspace_id, created_at
+                 FROM lifecycle_events
+                 WHERE idempotency_key = ?1 AND workspace_id = ?2",
+                params![idempotency_key, workspace],
+                map_lifecycle_event,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn event_by_context(
+        &self,
+        context_reference: &str,
+        workspace: &str,
+    ) -> Result<Option<LifecycleEvent>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, idempotency_key, event_type, context_ref, metadata,
+                        payload_sha256, payload_size, payload_truncated,
+                        workspace_id, created_at
+                 FROM lifecycle_events
+                 WHERE context_ref = ?1 AND workspace_id = ?2",
+                params![context_reference, workspace],
+                map_lifecycle_event,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn handoff_expiry(&self, spec: &HandoffSpec) -> Result<Option<String>, StoreError> {
+        if spec.ttl_seconds.is_some() && spec.expires_at.is_some() {
+            return Err(StoreError::Invalid(
+                "handoff cannot specify both ttl_seconds and expires_at".to_owned(),
+            ));
+        }
+        if let Some(expires_at) = spec.expires_at.as_deref() {
+            self.validate_timestamp(expires_at, "handoff expiry")?;
+            return Ok(Some(expires_at.to_owned()));
+        }
+        let Some(ttl_seconds) = spec.ttl_seconds else {
+            return Ok(None);
+        };
+        if ttl_seconds < 0 {
+            return Err(StoreError::Invalid(
+                "handoff ttl_seconds must not be negative".to_owned(),
+            ));
+        }
+        let modifier = format!("+{ttl_seconds} seconds");
+        let expires_at: Option<String> =
+            self.connection
+                .query_row("SELECT datetime('now', ?1)", params![modifier], |row| {
+                    row.get(0)
+                })?;
+        expires_at
+            .ok_or_else(|| {
+                StoreError::Invalid("handoff ttl_seconds produced an invalid expiry".to_owned())
+            })
+            .map(Some)
+    }
+
+    fn handoff_by_key(
+        &self,
+        idempotency_key: &str,
+        workspace: &str,
+    ) -> Result<Option<Handoff>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, idempotency_key, context_ref, owner, session, source,
+                        workspace_id, shared, expires_at, state, accepted_at,
+                        accepted_by, cancelled_at, cancelled_by, created_at
+                 FROM handoffs
+                 WHERE idempotency_key = ?1 AND workspace_id = ?2",
+                params![idempotency_key, workspace],
+                map_handoff,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn handoff_by_context(
+        &self,
+        context_reference: &str,
+        workspace: &str,
+    ) -> Result<Option<Handoff>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, idempotency_key, context_ref, owner, session, source,
+                        workspace_id, shared, expires_at, state, accepted_at,
+                        accepted_by, cancelled_at, cancelled_by, created_at
+                 FROM handoffs
+                 WHERE context_ref = ?1 AND workspace_id = ?2",
+                params![context_reference, workspace],
+                map_handoff,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn refresh_expired_handoffs(&self, workspace: &str) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE handoffs
+             SET state = 'expired'
+             WHERE workspace_id = ?1
+               AND state = 'open'
+               AND expires_at IS NOT NULL
+               AND julianday(expires_at) <= julianday('now')",
+            params![workspace],
+        )?;
+        Ok(())
+    }
 }
 
 pub fn default_path() -> PathBuf {
@@ -818,6 +1348,83 @@ fn map_context_lineage(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContextLinea
         relation: row.get(2)?,
         workspace: row.get(3)?,
     })
+}
+
+fn map_lifecycle_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<LifecycleEvent> {
+    Ok(LifecycleEvent {
+        id: row.get(0)?,
+        idempotency_key: row.get(1)?,
+        event_type: row.get(2)?,
+        context_reference: row.get(3)?,
+        metadata: row.get(4)?,
+        payload_sha256: row.get(5)?,
+        payload_size: row.get(6)?,
+        payload_truncated: row.get::<_, i64>(7)? != 0,
+        workspace: row.get(8)?,
+        created_at: row.get(9)?,
+    })
+}
+
+fn map_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<Handoff> {
+    Ok(Handoff {
+        id: row.get(0)?,
+        idempotency_key: row.get(1)?,
+        context_reference: row.get(2)?,
+        owner: row.get(3)?,
+        session: row.get(4)?,
+        source: row.get(5)?,
+        workspace: row.get(6)?,
+        shared: row.get::<_, i64>(7)? != 0,
+        expires_at: row.get(8)?,
+        state: row.get(9)?,
+        accepted_at: row.get(10)?,
+        accepted_by: row.get(11)?,
+        cancelled_at: row.get(12)?,
+        cancelled_by: row.get(13)?,
+        created_at: row.get(14)?,
+    })
+}
+
+fn validate_event_spec(spec: &EventSpec) -> Result<(), StoreError> {
+    validate_context_workspace(&spec.workspace)?;
+    for (value, label) in [
+        (&spec.idempotency_key, "event idempotency key"),
+        (&spec.event_type, "event type"),
+        (&spec.context_reference, "event context ref"),
+    ] {
+        if value.trim().is_empty() {
+            return Err(StoreError::Invalid(format!("{label} must not be empty")));
+        }
+    }
+    Ok(())
+}
+
+fn validate_handoff_spec(spec: &HandoffSpec) -> Result<(), StoreError> {
+    validate_context_workspace(&spec.workspace)?;
+    for (value, label) in [
+        (&spec.idempotency_key, "handoff idempotency key"),
+        (&spec.context_reference, "handoff context ref"),
+        (&spec.owner, "handoff owner"),
+    ] {
+        if value.trim().is_empty() {
+            return Err(StoreError::Invalid(format!("{label} must not be empty")));
+        }
+    }
+    if spec.ttl_seconds.is_some_and(|ttl| ttl < 0) {
+        return Err(StoreError::Invalid(
+            "handoff ttl_seconds must not be negative".to_owned(),
+        ));
+    }
+    if spec
+        .expires_at
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(StoreError::Invalid(
+            "handoff expiry must not be empty".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_context_workspace(workspace: &str) -> Result<(), StoreError> {
@@ -1043,6 +1650,93 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_events_and_handoffs_are_idempotent_and_workspace_scoped() {
+        let store = Store::in_memory().expect("fresh store");
+        store
+            .put_context("ctx-a", "A", "context a", "workspace-a")
+            .expect("context a");
+        store
+            .put_context("ctx-b", "B", "context b", "workspace-b")
+            .expect("context b");
+
+        let event_spec = EventSpec {
+            idempotency_key: "event-1".to_owned(),
+            event_type: "captured".to_owned(),
+            context_reference: "ctx-a".to_owned(),
+            metadata: r#"{"source":"test"}"#.to_owned(),
+            payload: r#"{"turn":1}"#.to_owned(),
+            workspace: "workspace-a".to_owned(),
+        };
+        let event = store.capture_event(&event_spec).expect("event");
+        assert_eq!(event.payload_size, event_spec.payload.len() as i64);
+        assert!(!event.payload_truncated);
+        assert_eq!(store.capture_event(&event_spec).unwrap(), event);
+        assert!(store
+            .capture_event(&EventSpec {
+                event_type: "different".to_owned(),
+                ..event_spec.clone()
+            })
+            .is_err());
+        assert_eq!(store.list_events("workspace-a").unwrap().len(), 1);
+        assert!(store
+            .read_event("missing", "workspace-a")
+            .unwrap()
+            .is_none());
+
+        let handoff_spec = HandoffSpec {
+            idempotency_key: "handoff-1".to_owned(),
+            context_reference: "ctx-a".to_owned(),
+            owner: "agent-a".to_owned(),
+            session: "session-a".to_owned(),
+            source: "test".to_owned(),
+            workspace: "workspace-a".to_owned(),
+            shared: true,
+            ttl_seconds: Some(3600),
+            expires_at: None,
+        };
+        let handoff = store.begin_handoff(&handoff_spec).expect("handoff");
+        assert_eq!(handoff.state, "open");
+        assert!(handoff.expires_at.is_some());
+        assert_eq!(store.begin_handoff(&handoff_spec).unwrap(), handoff);
+        let accepted = store
+            .accept_handoff("handoff-1", "agent-b", "workspace-a")
+            .unwrap()
+            .expect("accepted handoff");
+        assert_eq!(accepted.state, "accepted");
+        assert_eq!(accepted.accepted_by.as_deref(), Some("agent-b"));
+        assert_eq!(
+            store
+                .accept_handoff("handoff-1", "agent-c", "workspace-a")
+                .unwrap(),
+            Some(accepted.clone())
+        );
+        assert!(store
+            .cancel_handoff("handoff-1", "agent-b", "workspace-a")
+            .is_err());
+        assert!(store.list_handoffs("workspace-b").unwrap().is_empty());
+
+        let expired = store
+            .begin_handoff(&HandoffSpec {
+                idempotency_key: "handoff-expired".to_owned(),
+                context_reference: "ctx-b".to_owned(),
+                owner: "agent-b".to_owned(),
+                session: String::new(),
+                source: String::new(),
+                workspace: "workspace-b".to_owned(),
+                shared: false,
+                ttl_seconds: None,
+                expires_at: Some("2000-01-01T00:00:00Z".to_owned()),
+            })
+            .expect("expired handoff");
+        assert_eq!(expired.state, "open");
+        let listed = store.list_handoffs("workspace-b").unwrap();
+        assert_eq!(listed[0].state, "expired");
+        assert!(store
+            .accept_handoff("handoff-expired", "agent-b", "workspace-b")
+            .is_err());
+    }
+
+    #[test]
     fn legacy_facts_table_is_upgraded_before_serving_calls() {
         let path =
             std::env::temp_dir().join(format!("memory-mcp-rust-legacy-{}.db", std::process::id()));
@@ -1089,7 +1783,27 @@ mod tests {
                     );
                     INSERT INTO contexts
                         (ref, name, content, sha256, workspace_id)
-                    VALUES ('legacy-ctx', 'Legacy', 'old context', 'legacy-hash', 'legacy');",
+                    VALUES ('legacy-ctx', 'Legacy', 'old context', 'legacy-hash', 'legacy');
+                    CREATE TABLE lifecycle_events (
+                        id INTEGER PRIMARY KEY,
+                        idempotency_key TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        context_ref TEXT NOT NULL,
+                        workspace_id TEXT NOT NULL
+                    );
+                    INSERT INTO lifecycle_events
+                        (idempotency_key, event_type, context_ref, workspace_id)
+                    VALUES ('legacy-event', 'captured', 'legacy-ctx', 'legacy');
+                    CREATE TABLE handoffs (
+                        id INTEGER PRIMARY KEY,
+                        idempotency_key TEXT NOT NULL,
+                        context_ref TEXT NOT NULL,
+                        owner TEXT NOT NULL,
+                        workspace_id TEXT NOT NULL
+                    );
+                    INSERT INTO handoffs
+                        (idempotency_key, context_ref, owner, workspace_id)
+                    VALUES ('legacy-handoff', 'legacy-ctx', 'agent', 'legacy');",
                 )
                 .expect("legacy context schema");
         }
@@ -1102,6 +1816,8 @@ mod tests {
         assert_eq!(context.schema, "");
         assert_eq!(context.byte_size, "old context".len() as i64);
         assert!(store.context_map(None, "legacy").unwrap().is_empty());
+        assert_eq!(store.list_events("legacy").unwrap().len(), 1);
+        assert_eq!(store.list_handoffs("legacy").unwrap().len(), 1);
         let _ = fs::remove_file(path);
     }
 }
