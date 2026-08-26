@@ -151,6 +151,22 @@ relations during rebuilds, keep workspace-scoped deduplication, and rebuild
 FTS5 indexes when required. Migration tests must cover both a fresh store and
 the legacy fixtures used by the upstream suite.
 
+## Copy-first database migration
+
+The shipped `memory-mcp-rust` binary also provides a migration subcommand:
+
+```text
+memory-mcp-rust migrate --source LEGACY.db --target RUST.db
+```
+
+The source is opened read-only inside one consistent SQLite snapshot. The
+target must not exist. Rust schema migrations run on a private temporary copy,
+which is published without overwrite only after durable source-table row counts,
+per-row typed fingerprints, and target integrity checks pass. The command
+prints counts and fingerprints only; it does not print database paths or
+memory payloads. `scripts/memory-mcp-migrate.sh` is the environment-variable
+wrapper for the same operation.
+
 ## Compatibility test baseline
 
 The upstream CI runs Python 3.11 and both suites:
@@ -183,7 +199,8 @@ start as compatibility:
 This document completes the contract-capture stage only. The next implementation
 stage can be accepted when the Rust project has:
 
-1. a single executable entry point with the wire behavior above;
+1. a single executable entry point with the wire behavior above and the
+   copy-first migration subcommand;
 2. a schema/migration test fixture covering a fresh store and legacy stores;
 3. a machine-readable tool-schema parity check against the 80-name inventory;
 4. deterministic tests for the core fact/context round trips before optional
@@ -201,6 +218,18 @@ upgrade fixture, and an 80-name inventory gate. The generic entries returned by
 `tools/list` intentionally mark per-tool schema/handler parity as incremental;
 the pinned upstream descriptions and input schemas remain the acceptance source
 for the subsequent port stages.
+
+The deployment migration slice adds a copy-first SQLite migration command and
+two bounded launch checks. `scripts/memory-mcp-preflight.py` compares both
+servers' initialize identity, all 80 tool descriptors, launcher environment
+names, SQLite row counts, and disposable empty-argument routes. It treats
+missing required arguments as valid route evidence, but blocks unknown or
+unimplemented handlers. The current Rust branch is not eligible for live
+cutover until this preflight is green: the existing Python deployment still
+advertises optional provider flags and schemas that the staged Rust handlers do
+not yet implement identically. The Rust stdio entry point additionally refuses
+to start when the deployed legacy provider/pipeline variables are still set, so
+an operator cannot accidentally cut over to a silently degraded configuration.
 
 The second implementation slice adds SQLite-backed fact lifecycle operations
 (`forget_fact`, `restore_fact`, and `list_forgotten`) plus workspace lifecycle

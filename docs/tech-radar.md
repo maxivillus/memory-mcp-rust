@@ -19,6 +19,8 @@
 | Durable Redis operation ledger | Preserve committed/conflict operation metadata beyond the compatibility marker TTL without retaining request payloads. | `src/redis.rs`, `src/backend.rs` |
 | Revision watcher with backoff | Avoid full scans while idle, retry failures without a busy loop, and stop with the coordinator. | `src/backend.rs` |
 | Payload-free resource counters | Measure Redis commands/bytes and synchronization ticks/errors/duration without exposing memory contents. | `src/redis.rs`, `src/backend.rs`, `src/bin/memory-bench.rs` |
+| Copy-first SQLite migration | Preserve the Python rollback database while applying Rust schema migrations to a verified private copy; publish only after integrity, row-count, and typed fingerprint checks. | `src/migration.rs`, `src/main.rs`, `scripts/memory-mcp-migrate.sh` |
+| Legacy/Rust deployment preflight | Compare the exact MCP contract, launcher environment names, copied data counts, and all 80 disposable routes before a live cutover. | `scripts/memory-mcp-preflight.py`, `docs/deployment/memory-mcp-rust-rollout.md` |
 
 No new third-party dependency was introduced by the coordinator or its resource
 counters; the implementation uses existing dependencies and the Rust standard
@@ -38,7 +40,11 @@ library.
   and durable ledger primitives, and connection resource counters.
 - `src/tools.rs`: owns the advertised tool inventory and explicit mutation
   classification.
+- `src/migration.rs`: owns the read-only, consistent-snapshot SQLite migration
+  and no-overwrite publication gate.
 - `src/bin/memory-bench.rs`: runs the bounded SQLite/core-fact Redis timing
   workload and reports Redis command/byte counters when Redis is reachable.
 - `docs/`: current contract, ADR, performance caveats, and this architecture
   inventory.
+- `scripts/`: copy-first migration wrapper and the legacy/Rust deployment
+  preflight gate.
