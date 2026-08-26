@@ -249,3 +249,15 @@ Database management, local document ingestion, graph/decision/provenance
 tables, aggregate measurements, feedback, and the remaining fact retrieval
 tools are still separate parity slices. No Redis or embedding implementation
 is claimed.
+
+The fifth implementation slice exposes the existing fact metadata columns:
+
+- remember_fact retains source, project, domain, trust, strong, and bounded
+  importance metadata while preserving workspace-scoped content deduplication;
+- search_facts and list_facts accept deterministic equality filters for those
+  metadata fields, and the same metadata is returned by list_forgotten;
+- verify_facts recomputes SHA-256 over every visible workspace fact and reports
+  the checked count plus invalid ids without mutating data;
+- the protocol advertises schemas for the implemented metadata/filter tools,
+  and tests cover metadata round trips, deduplication, filter isolation, and
+  deliberate corruption detection.

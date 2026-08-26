@@ -103,6 +103,64 @@ pub fn advertised_tools() -> Vec<Value> {
 
 fn tool_contract(name: &str) -> (&'static str, Value) {
     match name {
+        "remember_fact" => (
+            "Store a deduplicated fact with optional provenance metadata.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "source": {"type": "string"},
+                    "project": {"type": "string"},
+                    "domain": {"type": "string"},
+                    "trust": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "strong": {"type": "boolean"},
+                    "importance": {"type": "number", "minimum": 0, "maximum": 1},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["text"]
+            }),
+        ),
+        "search_facts" => (
+            "Search active facts with optional provenance filters.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "source": {"type": "string"},
+                    "project": {"type": "string"},
+                    "domain": {"type": "string"},
+                    "trust": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "strong": {"type": "boolean"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["query"]
+            }),
+        ),
+        "list_facts" => (
+            "List active facts with optional provenance filters.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string"},
+                    "project": {"type": "string"},
+                    "domain": {"type": "string"},
+                    "trust": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "strong": {"type": "boolean"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                }
+            }),
+        ),
+        "verify_facts" => (
+            "Verify stored fact SHA-256 hashes in a workspace.",
+            workspace_schema(),
+        ),
+        "list_forgotten" => (
+            "List forgotten facts with provenance metadata.",
+            workspace_schema(),
+        ),
         "put_context" => (
             "Store an immutable workspace-scoped context.",
             json!({

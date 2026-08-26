@@ -37,13 +37,58 @@ impl From<rusqlite::Error> for StoreError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Fact {
     pub id: i64,
     pub text: String,
     pub sha256: String,
     pub workspace: String,
     pub lifecycle: String,
+    pub source: String,
+    pub project: String,
+    pub domain: String,
+    pub trust: String,
+    pub strong: bool,
+    pub importance: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FactMetadata {
+    pub source: String,
+    pub project: String,
+    pub domain: String,
+    pub trust: String,
+    pub strong: bool,
+    pub importance: f64,
+}
+
+impl Default for FactMetadata {
+    fn default() -> Self {
+        Self {
+            source: String::new(),
+            project: String::new(),
+            domain: String::new(),
+            trust: "medium".to_owned(),
+            strong: false,
+            importance: 0.5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FactFilters {
+    pub source: Option<String>,
+    pub project: Option<String>,
+    pub domain: Option<String>,
+    pub trust: Option<String>,
+    pub strong: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FactVerification {
+    pub checked: i64,
+    pub valid: bool,
+    pub invalid_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -432,15 +477,37 @@ impl Store {
     }
 
     pub fn remember_fact(&self, text: &str, workspace: &str) -> Result<Fact, StoreError> {
+        self.remember_fact_with_metadata(text, workspace, &FactMetadata::default())
+    }
+
+    pub fn remember_fact_with_metadata(
+        &self,
+        text: &str,
+        workspace: &str,
+        metadata: &FactMetadata,
+    ) -> Result<Fact, StoreError> {
         if text.trim().is_empty() {
             return Err(StoreError::Invalid(
                 "fact text must not be empty".to_owned(),
             ));
         }
+        validate_fact_metadata(metadata)?;
         let sha256 = sha256(text);
         self.connection.execute(
-            "INSERT OR IGNORE INTO facts (text, sha256, workspace_id) VALUES (?1, ?2, ?3)",
-            params![text, sha256, workspace],
+            "INSERT OR IGNORE INTO facts
+                (text, sha256, source, project, domain, trust, strong, importance, workspace_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                text,
+                sha256,
+                metadata.source.as_str(),
+                metadata.project.as_str(),
+                metadata.domain.as_str(),
+                metadata.trust.as_str(),
+                metadata.strong as i64,
+                metadata.importance,
+                workspace
+            ],
         )?;
         self.fact_by_hash(&sha256, workspace)?.ok_or_else(|| {
             StoreError::Invalid("fact insert did not produce a readable row".to_owned())
@@ -448,6 +515,16 @@ impl Store {
     }
 
     pub fn search_facts(&self, query: &str, workspace: &str) -> Result<Vec<Fact>, StoreError> {
+        self.search_facts_with_filters(query, workspace, &FactFilters::default())
+    }
+
+    pub fn search_facts_with_filters(
+        &self,
+        query: &str,
+        workspace: &str,
+        filters: &FactFilters,
+    ) -> Result<Vec<Fact>, StoreError> {
+        validate_fact_filters(filters)?;
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -457,16 +534,34 @@ impl Store {
             .collect::<Vec<_>>()
             .join(" AND ");
         let mut statement = self.connection.prepare(
-            "SELECT f.id, f.text, f.sha256, f.workspace_id, f.lifecycle
+            "SELECT f.id, f.text, f.sha256, f.workspace_id, f.lifecycle,
+                    f.source, f.project, f.domain, f.trust, f.strong, f.importance
              FROM facts_fts
              JOIN facts f ON f.id = facts_fts.rowid
              WHERE facts_fts MATCH ?1
                AND (f.workspace_id = '' OR f.workspace_id = ?2)
                AND f.lifecycle != 'forgotten'
+               AND (?3 IS NULL OR f.source = ?3)
+               AND (?4 IS NULL OR f.project = ?4)
+               AND (?5 IS NULL OR f.domain = ?5)
+               AND (?6 IS NULL OR f.trust = ?6)
+               AND (?7 IS NULL OR f.strong = ?7)
              ORDER BY f.id",
         )?;
+        let strong = filters.strong.map(|value| value as i64);
         let rows = statement
-            .query_map(params![fts_query, workspace], map_fact)?
+            .query_map(
+                params![
+                    fts_query,
+                    workspace,
+                    filters.source.as_deref(),
+                    filters.project.as_deref(),
+                    filters.domain.as_deref(),
+                    filters.trust.as_deref(),
+                    strong
+                ],
+                map_fact,
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         if !rows.is_empty() {
             return Ok(rows);
@@ -474,27 +569,72 @@ impl Store {
 
         let like = format!("%{}%", query);
         let mut fallback = self.connection.prepare(
-            "SELECT id, text, sha256, workspace_id, lifecycle FROM facts
+            "SELECT id, text, sha256, workspace_id, lifecycle,
+                    source, project, domain, trust, strong, importance
+             FROM facts
              WHERE text LIKE ?1
                AND (workspace_id = '' OR workspace_id = ?2)
                AND lifecycle != 'forgotten'
+               AND (?3 IS NULL OR source = ?3)
+               AND (?4 IS NULL OR project = ?4)
+               AND (?5 IS NULL OR domain = ?5)
+               AND (?6 IS NULL OR trust = ?6)
+               AND (?7 IS NULL OR strong = ?7)
              ORDER BY id",
         )?;
         let rows = fallback
-            .query_map(params![like, workspace], map_fact)?
+            .query_map(
+                params![
+                    like,
+                    workspace,
+                    filters.source.as_deref(),
+                    filters.project.as_deref(),
+                    filters.domain.as_deref(),
+                    filters.trust.as_deref(),
+                    strong
+                ],
+                map_fact,
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
     pub fn list_facts(&self, workspace: &str) -> Result<Vec<Fact>, StoreError> {
+        self.list_facts_with_filters(workspace, &FactFilters::default())
+    }
+
+    pub fn list_facts_with_filters(
+        &self,
+        workspace: &str,
+        filters: &FactFilters,
+    ) -> Result<Vec<Fact>, StoreError> {
+        validate_fact_filters(filters)?;
         let mut statement = self.connection.prepare(
-            "SELECT id, text, sha256, workspace_id, lifecycle FROM facts
+            "SELECT id, text, sha256, workspace_id, lifecycle,
+                    source, project, domain, trust, strong, importance
+             FROM facts
              WHERE (workspace_id = '' OR workspace_id = ?1)
                AND lifecycle != 'forgotten'
+               AND (?2 IS NULL OR source = ?2)
+               AND (?3 IS NULL OR project = ?3)
+               AND (?4 IS NULL OR domain = ?4)
+               AND (?5 IS NULL OR trust = ?5)
+               AND (?6 IS NULL OR strong = ?6)
              ORDER BY id",
         )?;
+        let strong = filters.strong.map(|value| value as i64);
         let rows = statement
-            .query_map(params![workspace], map_fact)?
+            .query_map(
+                params![
+                    workspace,
+                    filters.source.as_deref(),
+                    filters.project.as_deref(),
+                    filters.domain.as_deref(),
+                    filters.trust.as_deref(),
+                    strong
+                ],
+                map_fact,
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -1047,7 +1187,9 @@ impl Store {
 
     pub fn list_forgotten(&self, workspace: &str) -> Result<Vec<Fact>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, text, sha256, workspace_id, lifecycle FROM facts
+            "SELECT id, text, sha256, workspace_id, lifecycle,
+                    source, project, domain, trust, strong, importance
+             FROM facts
              WHERE (workspace_id = '' OR workspace_id = ?1)
                AND lifecycle = 'forgotten'
              ORDER BY id",
@@ -1056,6 +1198,36 @@ impl Store {
             .query_map(params![workspace], map_fact)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    pub fn verify_facts(&self, workspace: &str) -> Result<FactVerification, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, text, sha256
+             FROM facts
+             WHERE workspace_id = '' OR workspace_id = ?1
+             ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![workspace], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut checked = 0i64;
+        let mut invalid_ids = Vec::new();
+        for row in rows {
+            let (id, text, expected_hash) = row?;
+            checked += 1;
+            if sha256(&text) != expected_hash {
+                invalid_ids.push(id);
+            }
+        }
+        Ok(FactVerification {
+            checked,
+            valid: invalid_ids.is_empty(),
+            invalid_ids,
+        })
     }
 
     pub fn create_workspace(&self, id: &str) -> Result<Workspace, StoreError> {
@@ -1126,7 +1298,9 @@ impl Store {
     fn fact_by_hash(&self, hash: &str, workspace: &str) -> Result<Option<Fact>, StoreError> {
         self.connection
             .query_row(
-                "SELECT id, text, sha256, workspace_id, lifecycle FROM facts
+                "SELECT id, text, sha256, workspace_id, lifecycle,
+                        source, project, domain, trust, strong, importance
+                 FROM facts
                  WHERE sha256 = ?1 AND workspace_id = ?2",
                 params![hash, workspace],
                 map_fact,
@@ -1138,7 +1312,9 @@ impl Store {
     fn fact_by_id(&self, id: i64, workspace: &str) -> Result<Option<Fact>, StoreError> {
         self.connection
             .query_row(
-                "SELECT id, text, sha256, workspace_id, lifecycle FROM facts
+                "SELECT id, text, sha256, workspace_id, lifecycle,
+                        source, project, domain, trust, strong, importance
+                 FROM facts
                  WHERE id = ?1 AND (workspace_id = '' OR workspace_id = ?2)",
                 params![id, workspace],
                 map_fact,
@@ -1308,6 +1484,12 @@ fn map_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Fact> {
         sha256: row.get(2)?,
         workspace: row.get(3)?,
         lifecycle: row.get(4)?,
+        source: row.get(5)?,
+        project: row.get(6)?,
+        domain: row.get(7)?,
+        trust: row.get(8)?,
+        strong: row.get::<_, i64>(9)? != 0,
+        importance: row.get(10)?,
     })
 }
 
@@ -1383,6 +1565,31 @@ fn map_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<Handoff> {
         cancelled_by: row.get(13)?,
         created_at: row.get(14)?,
     })
+}
+
+fn validate_fact_metadata(metadata: &FactMetadata) -> Result<(), StoreError> {
+    if !matches!(metadata.trust.as_str(), "high" | "medium" | "low") {
+        return Err(StoreError::Invalid(
+            "fact trust must be high, medium, or low".to_owned(),
+        ));
+    }
+    if !metadata.importance.is_finite() || !(0.0..=1.0).contains(&metadata.importance) {
+        return Err(StoreError::Invalid(
+            "fact importance must be between 0 and 1".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_fact_filters(filters: &FactFilters) -> Result<(), StoreError> {
+    if let Some(trust) = filters.trust.as_deref() {
+        if !matches!(trust, "high" | "medium" | "low") {
+            return Err(StoreError::Invalid(
+                "fact trust filter must be high, medium, or low".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_event_spec(spec: &EventSpec) -> Result<(), StoreError> {
@@ -1734,6 +1941,86 @@ mod tests {
         assert!(store
             .accept_handoff("handoff-expired", "agent-b", "workspace-b")
             .is_err());
+    }
+
+    #[test]
+    fn fact_metadata_filters_and_hash_verification_are_deterministic() {
+        let store = Store::in_memory().expect("fresh store");
+        let important = store
+            .remember_fact_with_metadata(
+                "SQLite is the selected fallback",
+                "workspace-a",
+                &FactMetadata {
+                    source: "design".to_owned(),
+                    project: "memory".to_owned(),
+                    domain: "storage".to_owned(),
+                    trust: "high".to_owned(),
+                    strong: true,
+                    importance: 0.9,
+                },
+            )
+            .expect("rich fact");
+        let duplicate = store
+            .remember_fact_with_metadata(
+                "SQLite is the selected fallback",
+                "workspace-a",
+                &FactMetadata::default(),
+            )
+            .expect("deduplicated fact");
+        assert_eq!(duplicate, important);
+        store
+            .remember_fact_with_metadata(
+                "SQLite is also a test subject",
+                "workspace-a",
+                &FactMetadata {
+                    source: "test".to_owned(),
+                    ..FactMetadata::default()
+                },
+            )
+            .expect("second fact");
+
+        let filtered = store
+            .search_facts_with_filters(
+                "SQLite",
+                "workspace-a",
+                &FactFilters {
+                    source: Some("design".to_owned()),
+                    strong: Some(true),
+                    ..FactFilters::default()
+                },
+            )
+            .expect("filtered search");
+        assert_eq!(filtered, vec![important.clone()]);
+        assert_eq!(
+            store
+                .list_facts_with_filters(
+                    "workspace-a",
+                    &FactFilters {
+                        trust: Some("low".to_owned()),
+                        ..FactFilters::default()
+                    },
+                )
+                .unwrap(),
+            Vec::new()
+        );
+        assert_eq!(
+            store.verify_facts("workspace-a").unwrap(),
+            FactVerification {
+                checked: 2,
+                valid: true,
+                invalid_ids: Vec::new()
+            }
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE facts SET sha256 = 'corrupted' WHERE id = ?1",
+                params![important.id],
+            )
+            .expect("tamper fixture");
+        let verification = store.verify_facts("workspace-a").unwrap();
+        assert!(!verification.valid);
+        assert_eq!(verification.invalid_ids, vec![important.id]);
     }
 
     #[test]

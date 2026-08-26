@@ -1,4 +1,6 @@
-use crate::store::{ContextMetadata, EventSpec, HandoffSpec, Store, StoreError};
+use crate::store::{
+    ContextMetadata, EventSpec, FactFilters, FactMetadata, HandoffSpec, Store, StoreError,
+};
 use crate::tools;
 use serde_json::{json, Map, Value};
 
@@ -128,9 +130,25 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
                 .ok_or_else(|| {
                     CallError::InvalidParams("remember_fact requires text".to_owned())
                 })?;
+            let metadata = FactMetadata {
+                source: optional_string(arguments, "source")?
+                    .unwrap_or("")
+                    .to_owned(),
+                project: optional_string(arguments, "project")?
+                    .unwrap_or("")
+                    .to_owned(),
+                domain: optional_string(arguments, "domain")?
+                    .unwrap_or("")
+                    .to_owned(),
+                trust: optional_string(arguments, "trust")?
+                    .unwrap_or("medium")
+                    .to_owned(),
+                strong: optional_bool(arguments, &["strong"], false)?,
+                importance: optional_f64(arguments, "importance")?.unwrap_or(0.5),
+            };
             serde_json::to_value(
                 store
-                    .remember_fact(text, workspace)
+                    .remember_fact_with_metadata(text, workspace, &metadata)
                     .map_err(CallError::Execution)?,
             )
             .expect("Fact serializes")
@@ -142,16 +160,22 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
                 .ok_or_else(|| {
                     CallError::InvalidParams("search_facts requires query".to_owned())
                 })?;
+            let filters = fact_filters(arguments)?;
             serde_json::to_value(
                 store
-                    .search_facts(query, workspace)
+                    .search_facts_with_filters(query, workspace, &filters)
                     .map_err(CallError::Execution)?,
             )
             .expect("facts serialize")
         }
         "list_facts" => {
-            serde_json::to_value(store.list_facts(workspace).map_err(CallError::Execution)?)
-                .expect("facts serialize")
+            let filters = fact_filters(arguments)?;
+            serde_json::to_value(
+                store
+                    .list_facts_with_filters(workspace, &filters)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("facts serialize")
         }
         "forget_fact" => {
             let id =
@@ -179,6 +203,12 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
                 .map_err(CallError::Execution)?,
         )
         .expect("forgotten facts serialize"),
+        "verify_facts" => serde_json::to_value(
+            store
+                .verify_facts(workspace)
+                .map_err(CallError::Execution)?,
+        )
+        .expect("fact verification serializes"),
         "put_context" => {
             let reference = required_string(arguments, "ref")
                 .or_else(|_| required_string(arguments, "reference"))?;
@@ -528,6 +558,29 @@ fn optional_bool(
         .ok_or_else(|| CallError::InvalidParams(format!("tool argument {key} must be a boolean")))
 }
 
+fn optional_f64(arguments: &Map<String, Value>, key: &str) -> Result<Option<f64>, CallError> {
+    match arguments.get(key) {
+        None => Ok(None),
+        Some(value) => value.as_f64().map(Some).ok_or_else(|| {
+            CallError::InvalidParams(format!("tool argument {key} must be a number"))
+        }),
+    }
+}
+
+fn fact_filters(arguments: &Map<String, Value>) -> Result<FactFilters, CallError> {
+    Ok(FactFilters {
+        source: optional_string(arguments, "source")?.map(ToOwned::to_owned),
+        project: optional_string(arguments, "project")?.map(ToOwned::to_owned),
+        domain: optional_string(arguments, "domain")?.map(ToOwned::to_owned),
+        trust: optional_string(arguments, "trust")?.map(ToOwned::to_owned),
+        strong: if arguments.contains_key("strong") {
+            Some(optional_bool(arguments, &["strong"], false)?)
+        } else {
+            None
+        },
+    })
+}
+
 fn required_context_workspace(arguments: &Map<String, Value>) -> Result<&str, CallError> {
     let workspace = arguments
         .get("workspace")
@@ -762,5 +815,37 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("agent-b"));
+    }
+
+    #[test]
+    fn fact_metadata_filters_and_verification_are_reachable_through_stdio() {
+        let store = Store::in_memory().unwrap();
+        let remember = handle_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"remember_fact","arguments":{"text":"Important SQLite fact","source":"design","project":"memory","domain":"storage","trust":"high","strong":true,"importance":0.9,"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let remember_text = remember["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(remember_text.contains("\"trust\":\"high\""));
+
+        let search = handle_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_facts","arguments":{"query":"SQLite","source":"design","strong":true,"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(search["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Important SQLite fact"));
+
+        let verification = handle_line(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"verify_facts","arguments":{"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(verification["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"valid\":true"));
     }
 }
