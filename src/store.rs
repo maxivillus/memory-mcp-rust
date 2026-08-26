@@ -464,6 +464,13 @@ pub struct PreparedSummary {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct EmbeddingBackfill {
+    pub status: String,
+    pub updated: i64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Stats {
     pub facts: i64,
     pub contexts: i64,
@@ -704,6 +711,20 @@ impl Store {
                 workspace_id TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (fact_id) REFERENCES facts(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS fact_embeddings (
+                fact_id INTEGER PRIMARY KEY,
+                vector BLOB,
+                model TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (fact_id) REFERENCES facts(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS decision_embeddings (
+                decision_id INTEGER PRIMARY KEY,
+                vector BLOB,
+                model TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (decision_id) REFERENCES decisions(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS runs (
                 id INTEGER PRIMARY KEY,
@@ -1647,6 +1668,62 @@ impl Store {
         self.fact_by_id(id, workspace)
     }
 
+    pub fn sweep_freshness(
+        &self,
+        max_age_seconds: i64,
+        workspace: &str,
+    ) -> Result<Vec<Fact>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        if max_age_seconds < 0 {
+            return Err(StoreError::Invalid(
+                "freshness max_age_seconds must not be negative".to_owned(),
+            ));
+        }
+        let ids = {
+            let mut statement = self.connection.prepare(
+                "SELECT id
+                 FROM facts
+                 WHERE (workspace_id = '' OR workspace_id = ?1)
+                   AND lifecycle = 'active'
+                   AND validity = 'valid'
+                   AND created_at <> ''
+                   AND julianday(created_at) < julianday('now') - (?2 / 86400.0)
+                 ORDER BY id",
+            )?;
+            let rows = statement
+                .query_map(params![workspace, max_age_seconds], |row| {
+                    row.get::<_, i64>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        let mut degraded = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(fact) = self.update_fact_lifecycle(id, workspace, "degraded")? {
+                degraded.push(fact);
+            }
+        }
+        Ok(degraded)
+    }
+
+    pub fn decay_sweep(
+        &self,
+        max_age_seconds: i64,
+        workspace: &str,
+    ) -> Result<Vec<Fact>, StoreError> {
+        self.sweep_freshness(max_age_seconds, workspace)
+    }
+
+    pub fn embed_backfill(&self, workspace: &str) -> Result<EmbeddingBackfill, StoreError> {
+        validate_graph_workspace(workspace)?;
+        Ok(EmbeddingBackfill {
+            status: "disabled".to_owned(),
+            updated: 0,
+            reason: "no embedding provider is configured; SQLite lexical retrieval remains active"
+                .to_owned(),
+        })
+    }
+
     pub fn fact_history(&self, id: i64, workspace: &str) -> Result<Vec<FactHistory>, StoreError> {
         validate_graph_workspace(workspace)?;
         if id <= 0 {
@@ -2034,6 +2111,72 @@ impl Store {
             )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    pub fn ingest_document(
+        &self,
+        path: &str,
+        reference: Option<&str>,
+        name: Option<&str>,
+        max_bytes: usize,
+        workspace: &str,
+    ) -> Result<Context, StoreError> {
+        validate_context_workspace(workspace)?;
+        if path.trim().is_empty() {
+            return Err(StoreError::Invalid(
+                "document path must not be empty".to_owned(),
+            ));
+        }
+        if max_bytes == 0 {
+            return Err(StoreError::Invalid(
+                "document max_bytes must be positive".to_owned(),
+            ));
+        }
+        let source_path = Path::new(path);
+        if source_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(StoreError::Invalid(
+                "document path must not contain parent-directory components".to_owned(),
+            ));
+        }
+        let metadata = fs::metadata(source_path)?;
+        if !metadata.is_file() {
+            return Err(StoreError::Invalid(
+                "document path must reference a regular file".to_owned(),
+            ));
+        }
+        if metadata.len() > max_bytes as u64 {
+            return Err(StoreError::Invalid(format!(
+                "document exceeds max_bytes ({max_bytes})"
+            )));
+        }
+        let bytes = fs::read(source_path)?;
+        if bytes.len() > max_bytes {
+            return Err(StoreError::Invalid(format!(
+                "document exceeds max_bytes ({max_bytes})"
+            )));
+        }
+        let content = String::from_utf8(bytes)
+            .map_err(|_| StoreError::Invalid("document must be valid UTF-8".to_owned()))?;
+        let content_hash = sha256(&content);
+        let generated_reference = format!("document:{}:{content_hash}", sha256(workspace));
+        let generated_name = source_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("document");
+        self.put_context_with_metadata(
+            reference.unwrap_or(&generated_reference),
+            name.unwrap_or(generated_name),
+            &content,
+            &ContextMetadata {
+                schema: "text/plain".to_owned(),
+                source: path.to_owned(),
+                ..ContextMetadata::default()
+            },
+            workspace,
+        )
     }
 
     pub fn put_context(
@@ -4459,6 +4602,46 @@ mod tests {
             .expect("prepared summary");
         assert_eq!(prepared.summary, summary);
         assert_eq!(prepared.recall.facts, vec![session_fact]);
+    }
+
+    #[test]
+    fn document_ingestion_is_bounded_and_freshness_is_audited() {
+        let store = Store::in_memory().expect("fresh store");
+        let path = std::env::temp_dir().join(format!(
+            "memory-mcp-rust-document-{}.txt",
+            std::process::id()
+        ));
+        fs::write(&path, "Rust document").expect("document fixture");
+        let path_string = path.to_str().expect("UTF-8 temp path");
+        let context = store
+            .ingest_document(path_string, None, None, 1024, "workspace-a")
+            .expect("document context");
+        assert_eq!(context.content, "Rust document");
+        assert_eq!(
+            context.name,
+            format!("memory-mcp-rust-document-{}.txt", std::process::id())
+        );
+        assert!(store
+            .ingest_document(path_string, None, None, 4, "workspace-a")
+            .is_err());
+        let unsafe_path = format!("{path_string}/../document.txt");
+        assert!(store
+            .ingest_document(&unsafe_path, None, None, 1024, "workspace-a")
+            .is_err());
+        let _ = fs::remove_file(&path);
+
+        let fact = store
+            .remember_fact("freshness candidate", "workspace-a")
+            .expect("fact");
+        let degraded = store
+            .sweep_freshness(0, "workspace-a")
+            .expect("freshness sweep");
+        assert!(degraded.iter().any(|candidate| candidate.id == fact.id));
+        assert_eq!(degraded[0].lifecycle, "degraded");
+        assert_eq!(store.fact_history(fact.id, "workspace-a").unwrap().len(), 2);
+        let embeddings = store.embed_backfill("workspace-a").unwrap();
+        assert_eq!(embeddings.status, "disabled");
+        assert_eq!(embeddings.updated, 0);
     }
 
     #[test]

@@ -349,3 +349,19 @@ The tenth implementation slice adds review and abstention-facing helpers:
 Local document path ingestion, retention/decay policy, database selection and
 backups, and optional embedding or Redis adapters remain staged. No semantic
 provider is claimed by the SQLite fallback.
+
+The eleventh implementation slice adds local-document and freshness boundaries:
+
+- ingest_document admits only a regular, valid-UTF-8 file within the configured
+  byte bound, rejects parent-directory path components, and stores the content
+  as an immutable workspace context with a deterministic generated reference;
+- sweep_freshness and decay_sweep mark old valid active facts as `degraded` and
+  record each transition in fact_history; the age threshold is explicit and
+  negative thresholds are rejected;
+- embed_backfill has an explicit disabled-provider result (`updated: 0`) so
+  the SQLite lexical fallback is observable without claiming embeddings;
+- tests cover bounded document reads, path safety, freshness transitions,
+  history, and stdio reachability.
+
+Database selection and backups, richer retention policy, and optional embedding
+or Redis adapters remain staged. No provider or performance claim is made.

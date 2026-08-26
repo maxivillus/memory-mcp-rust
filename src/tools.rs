@@ -252,6 +252,24 @@ fn tool_contract(name: &str) -> (&'static str, Value) {
                 "required": ["workspace"]
             }),
         ),
+        "sweep_freshness" | "decay_sweep" => (
+            "Mark valid active facts older than a bounded age as degraded.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "max_age_seconds": {"type": "integer", "minimum": 0},
+                    "max_age": {"type": "integer", "minimum": 0},
+                    "ttl": {"type": "integer", "minimum": 0},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["workspace"]
+            }),
+        ),
+        "embed_backfill" => (
+            "Report the explicit disabled-provider embedding fallback.",
+            workspace_schema(),
+        ),
         "search_facts" => (
             "Search active facts with optional provenance filters.",
             json!({
@@ -658,6 +676,23 @@ fn tool_contract(name: &str) -> (&'static str, Value) {
                     "relation": {"type": "string"}
                 },
                 "required": ["ref", "name", "content", "workspace"]
+            }),
+        ),
+        "ingest_document" => (
+            "Read a bounded UTF-8 local document into an immutable context.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "ref": {"type": "string"},
+                    "reference": {"type": "string"},
+                    "name": {"type": "string"},
+                    "max_bytes": {"type": "integer", "minimum": 1},
+                    "limit": {"type": "integer", "minimum": 1},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["path", "workspace"]
             }),
         ),
         "list_context" => (

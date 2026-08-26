@@ -285,6 +285,25 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
             )
             .expect("prepared summary serializes")
         }
+        "sweep_freshness" | "decay_sweep" => {
+            let max_age_seconds =
+                optional_i64(arguments, &["max_age_seconds", "max_age", "ttl"])?.unwrap_or(86_400);
+            serde_json::to_value(
+                if name == "sweep_freshness" {
+                    store.sweep_freshness(max_age_seconds, workspace)
+                } else {
+                    store.decay_sweep(max_age_seconds, workspace)
+                }
+                .map_err(CallError::Execution)?,
+            )
+            .expect("freshness sweep serializes")
+        }
+        "embed_backfill" => serde_json::to_value(
+            store
+                .embed_backfill(workspace)
+                .map_err(CallError::Execution)?,
+        )
+        .expect("embedding backfill serializes"),
         "run_begin" => {
             let run_id = required_string(arguments, "run_id")
                 .or_else(|_| required_string(arguments, "id"))?;
@@ -520,6 +539,20 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
             }
             .map_err(CallError::Execution)?;
             serde_json::to_value(recall).expect("recall serializes")
+        }
+        "ingest_document" => {
+            let path = required_string(arguments, "path")?;
+            let reference =
+                optional_string(arguments, "ref")?.or(optional_string(arguments, "reference")?);
+            let name = optional_string(arguments, "name")?;
+            let max_bytes = optional_usize(arguments, &["max_bytes", "limit"], 1_048_576)?;
+            let workspace = required_context_workspace(arguments)?;
+            serde_json::to_value(
+                store
+                    .ingest_document(path, reference, name, max_bytes, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("document context serializes")
         }
         "put_context" => {
             let reference = required_string(arguments, "ref")
@@ -1567,6 +1600,61 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("\"recall\""));
+    }
+
+    #[test]
+    fn document_freshness_and_embedding_boundary_tools_are_reachable() {
+        let store = Store::in_memory().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "memory-mcp-rust-protocol-document-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, "protocol document").unwrap();
+        let ingest = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "ingest_document",
+                    "arguments": {
+                        "path": path.to_str().unwrap(),
+                        "workspace": "w"
+                    }
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        assert!(ingest["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("protocol document"));
+
+        handle_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"remember_fact","arguments":{"text":"old enough","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let sweep = handle_line(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"decay_sweep","arguments":{"max_age_seconds":0,"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(sweep["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("degraded"));
+        let embeddings = handle_line(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"embed_backfill","arguments":{"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(embeddings["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"status\":\"disabled\""));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
