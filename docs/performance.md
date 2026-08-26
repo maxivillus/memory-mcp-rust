@@ -20,6 +20,10 @@ connection and PING probe. If the URL is missing or unavailable, it reports
 selected_backend=sqlite and an explicit fallback reason.
 
 The JSON output separates migration/setup, writes, searches, and total time.
+When the Redis adapter is selected, it also reports payload-free
+`redis_commands`, `redis_request_bytes`, and `redis_response_bytes` counters;
+the SQLite row leaves those fields null. These counters make command and wire
+cost visible without logging memory contents.
 It is an observation for one environment, not a general speedup claim. A
 paired decision requires the same release build, host, iteration count,
 workspace/data shape, warm-up policy, Redis persistence settings, and repeated
@@ -53,3 +57,6 @@ and applies bounded batches with exponential backoff on errors. Resource
 measurements must report watcher CPU time, Redis commands/bytes, SQLite write
 bytes, standby lag, and reconciliation duration under idle, steady-write, and
 recovery workloads. A full-dataset scan on every health tick fails this gate.
+The coordinator status counters cover Redis commands/bytes and watcher
+ticks/errors/last duration; CPU time and SQLite write-byte accounting still
+require the real-service measurement harness.

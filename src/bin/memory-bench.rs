@@ -18,6 +18,9 @@ struct BackendMetrics {
     write_micros: u128,
     search_micros: u128,
     total_micros: u128,
+    redis_commands: Option<u64>,
+    redis_request_bytes: Option<u64>,
+    redis_response_bytes: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -125,6 +128,9 @@ fn measure_sqlite(iterations: usize) -> BackendMetrics {
         write_micros,
         search_micros,
         total_micros: total_start.elapsed().as_micros(),
+        redis_commands: None,
+        redis_request_bytes: None,
+        redis_response_bytes: None,
     }
 }
 
@@ -148,6 +154,7 @@ fn measure_redis(
             .len();
     }
     let search_micros = search_start.elapsed().as_micros();
+    let redis_metrics = adapter.metrics();
     Ok(BackendMetrics {
         backend: "redis",
         iterations,
@@ -157,5 +164,8 @@ fn measure_redis(
         write_micros,
         search_micros,
         total_micros: total_start.elapsed().as_micros(),
+        redis_commands: Some(redis_metrics.commands),
+        redis_request_bytes: Some(redis_metrics.request_bytes),
+        redis_response_bytes: Some(redis_metrics.response_bytes),
     })
 }

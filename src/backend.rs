@@ -1,5 +1,5 @@
 use crate::protocol::replay_tool;
-use crate::redis::{RedisAdapter, RedisError};
+use crate::redis::{RedisAdapter, RedisError, RedisMetrics};
 use crate::store::{Store, StoreError};
 use crate::tools;
 use hex::encode;
@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_WATCH_INTERVAL: Duration = Duration::from_secs(5);
 const MIN_WATCH_INTERVAL: Duration = Duration::from_millis(250);
@@ -42,6 +42,12 @@ pub struct BackendStatus {
     pub standby_revision: u64,
     pub standby_lag: Option<u64>,
     pub outbox_depth: usize,
+    pub redis_commands: u64,
+    pub redis_request_bytes: u64,
+    pub redis_response_bytes: u64,
+    pub sync_ticks: u64,
+    pub sync_errors: u64,
+    pub last_sync_micros: u64,
 }
 
 #[derive(Debug)]
@@ -202,6 +208,10 @@ struct CoordinatorInner {
     last_remote_revision: Option<u64>,
     outbox: Outbox,
     redis_configured: bool,
+    redis_totals: RedisMetrics,
+    sync_ticks: u64,
+    sync_errors: u64,
+    last_sync_micros: u64,
 }
 
 impl CoordinatorInner {
@@ -214,6 +224,10 @@ impl CoordinatorInner {
             last_remote_revision: None,
             outbox: Outbox::new(path),
             redis_configured,
+            redis_totals: RedisMetrics::default(),
+            sync_ticks: 0,
+            sync_errors: 0,
+            last_sync_micros: 0,
         })
     }
 
@@ -357,8 +371,22 @@ impl CoordinatorInner {
     }
 
     fn enter_sqlite_fallback(&mut self) {
-        self.redis = None;
+        if let Some(adapter) = self.redis.take() {
+            self.record_redis_metrics(adapter.metrics());
+        }
         self.mode = BackendKind::Sqlite;
+    }
+
+    fn record_redis_metrics(&mut self, metrics: RedisMetrics) {
+        self.redis_totals.commands = self.redis_totals.commands.saturating_add(metrics.commands);
+        self.redis_totals.request_bytes = self
+            .redis_totals
+            .request_bytes
+            .saturating_add(metrics.request_bytes);
+        self.redis_totals.response_bytes = self
+            .redis_totals
+            .response_bytes
+            .saturating_add(metrics.response_bytes);
     }
 
     fn try_reconnect(&mut self) -> Result<(), StoreError> {
@@ -466,6 +494,11 @@ impl BackendCoordinator {
         let redis_revision = redis_connected
             .then_some(inner.last_remote_revision)
             .flatten();
+        let current_metrics = inner
+            .redis
+            .as_ref()
+            .map(RedisAdapter::metrics)
+            .unwrap_or_default();
         Ok(BackendStatus {
             backend: inner.mode,
             redis_configured: inner.redis_configured,
@@ -474,6 +507,21 @@ impl BackendCoordinator {
             standby_revision: inner.revision,
             standby_lag: redis_revision.map(|remote| remote.saturating_sub(inner.revision)),
             outbox_depth,
+            redis_commands: inner
+                .redis_totals
+                .commands
+                .saturating_add(current_metrics.commands),
+            redis_request_bytes: inner
+                .redis_totals
+                .request_bytes
+                .saturating_add(current_metrics.request_bytes),
+            redis_response_bytes: inner
+                .redis_totals
+                .response_bytes
+                .saturating_add(current_metrics.response_bytes),
+            sync_ticks: inner.sync_ticks,
+            sync_errors: inner.sync_errors,
+            last_sync_micros: inner.last_sync_micros,
         })
     }
 
@@ -590,7 +638,17 @@ fn watcher_loop(
         let result = shared
             .lock()
             .map_err(|_| StoreError::Invalid("backend coordinator lock is poisoned".to_owned()))
-            .and_then(|mut inner| inner.tick());
+            .and_then(|mut inner| {
+                let started = Instant::now();
+                let result = inner.tick();
+                inner.sync_ticks = inner.sync_ticks.saturating_add(1);
+                inner.last_sync_micros =
+                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                if result.is_err() {
+                    inner.sync_errors = inner.sync_errors.saturating_add(1);
+                }
+                result
+            });
         if result.is_ok() {
             delay = interval;
         } else {
@@ -911,6 +969,9 @@ mod tests {
         assert_eq!(status.redis_revision, Some(2));
         assert_eq!(status.standby_lag, Some(0));
         assert_eq!(status.outbox_depth, 0);
+        assert!(status.redis_commands > 0);
+        assert!(status.redis_request_bytes > 0);
+        assert!(status.redis_response_bytes > 0);
         drop(coordinator);
         server.join().expect("Redis fixture");
         let _ = fs::remove_file(database.with_extension("outbox.jsonl"));
@@ -936,6 +997,67 @@ mod tests {
         });
         stop_tx.send(()).expect("stop watcher");
         watcher.join().expect("watcher stopped");
+        let _ = fs::remove_file(database.with_extension("outbox.jsonl"));
+        let _ = fs::remove_file(database.with_extension("reconciliation.jsonl"));
+        let _ = fs::remove_file(database.with_extension("db-wal"));
+        let _ = fs::remove_file(database.with_extension("db-shm"));
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
+    fn watcher_uses_one_revision_command_when_state_is_unchanged() {
+        let values = Arc::new(Mutex::new(HashMap::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server_values = Arc::clone(&values);
+        let server = thread::spawn(move || run_snapshot_redis(listener, server_values, None));
+        let adapter = RedisAdapter::connect(&format!("redis://{address}"), "watcher-metrics-test")
+            .expect("Redis adapter");
+        let database = test_database_path();
+        let mut inner = CoordinatorInner::new(&database, true).expect("coordinator state");
+        inner.attach_redis(adapter).expect("initial Redis state");
+        let baseline_commands = inner
+            .redis
+            .as_ref()
+            .expect("Redis connection")
+            .metrics()
+            .commands;
+        let shared = Arc::new(Mutex::new(inner));
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let watcher_shared = Arc::clone(&shared);
+        let watcher = thread::spawn(move || {
+            watcher_loop(
+                watcher_shared,
+                stop_rx,
+                Duration::from_millis(1),
+                Duration::from_millis(1),
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if shared.lock().expect("coordinator lock").sync_ticks > 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "watcher did not record a tick");
+            thread::yield_now();
+        }
+        stop_tx.send(()).expect("stop watcher");
+        watcher.join().expect("watcher stopped");
+
+        let state = shared.lock().expect("coordinator lock");
+        let ticks = state.sync_ticks;
+        let commands = state
+            .redis
+            .as_ref()
+            .expect("Redis connection")
+            .metrics()
+            .commands;
+        assert_eq!(state.sync_errors, 0);
+        assert_eq!(commands - baseline_commands, ticks);
+        drop(state);
+        drop(shared);
+        server.join().expect("Redis fixture");
         let _ = fs::remove_file(database.with_extension("outbox.jsonl"));
         let _ = fs::remove_file(database.with_extension("reconciliation.jsonl"));
         let _ = fs::remove_file(database.with_extension("db-wal"));
@@ -995,6 +1117,11 @@ mod tests {
             )
             .expect("SQLite fallback operation");
         assert_eq!(coordinator.backend(), BackendKind::Sqlite);
+        let fallback_status = coordinator.status().expect("fallback status");
+        assert!(!fallback_status.redis_connected);
+        assert!(fallback_status.redis_commands > 0);
+        assert!(fallback_status.redis_request_bytes > 0);
+        assert!(fallback_status.redis_response_bytes > 0);
         {
             let state = coordinator.shared.lock().expect("coordinator lock");
             assert_eq!(state.outbox.pending().unwrap().len(), 1);

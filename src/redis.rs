@@ -60,6 +60,14 @@ pub struct RedisAdapter {
     namespace: String,
 }
 
+/// Local, payload-free counters for the current Redis connection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RedisMetrics {
+    pub commands: u64,
+    pub request_bytes: u64,
+    pub response_bytes: u64,
+}
+
 impl RedisAdapter {
     pub fn configured() -> bool {
         std::env::var_os("MEMORY_MCP_REDIS_URL").is_some()
@@ -105,6 +113,10 @@ impl RedisAdapter {
 
     pub fn namespace(&self) -> &str {
         &self.namespace
+    }
+
+    pub fn metrics(&self) -> RedisMetrics {
+        self.connection.borrow().metrics()
     }
 
     /// Check the existing connection without fetching the replicated state.
@@ -578,6 +590,7 @@ fn hex_digit(value: u8) -> Result<u8, RedisError> {
 
 struct RedisConnection {
     stream: TcpStream,
+    metrics: RedisMetrics,
 }
 
 impl RedisConnection {
@@ -590,7 +603,10 @@ impl RedisConnection {
                 Ok(stream) => {
                     stream.set_read_timeout(Some(REDIS_TIMEOUT))?;
                     stream.set_write_timeout(Some(REDIS_TIMEOUT))?;
-                    let mut connection = Self { stream };
+                    let mut connection = Self {
+                        stream,
+                        metrics: RedisMetrics::default(),
+                    };
                     if let Some(command) = auth_command(endpoint) {
                         connection.command(command)?;
                     }
@@ -620,11 +636,45 @@ impl RedisConnection {
         }
         self.stream.write_all(&request)?;
         self.stream.flush()?;
-        let response = read_resp(&mut self.stream, 0)?;
+        self.metrics.commands = self.metrics.commands.saturating_add(1);
+        self.metrics.request_bytes = self
+            .metrics
+            .request_bytes
+            .saturating_add(u64::try_from(request.len()).unwrap_or(u64::MAX));
+        let mut response_bytes = 0;
+        let response = {
+            let mut reader = CountingReader {
+                stream: &mut self.stream,
+                bytes: &mut response_bytes,
+            };
+            read_resp(&mut reader, 0)
+        };
+        self.metrics.response_bytes = self
+            .metrics
+            .response_bytes
+            .saturating_add(u64::try_from(response_bytes).unwrap_or(u64::MAX));
+        let response = response?;
         if let RespValue::Error(message) = response {
             return Err(RedisError::Protocol(message));
         }
         Ok(response)
+    }
+
+    fn metrics(&self) -> RedisMetrics {
+        self.metrics
+    }
+}
+
+struct CountingReader<'a> {
+    stream: &'a mut TcpStream,
+    bytes: &'a mut usize,
+}
+
+impl Read for CountingReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.stream.read(buffer)?;
+        *self.bytes = self.bytes.saturating_add(read);
+        Ok(read)
     }
 }
 
@@ -686,7 +736,7 @@ impl RespValue {
     }
 }
 
-fn read_resp(stream: &mut TcpStream, depth: usize) -> Result<RespValue, RedisError> {
+fn read_resp<R: Read>(stream: &mut R, depth: usize) -> Result<RespValue, RedisError> {
     if depth > MAX_RESP_DEPTH {
         return Err(RedisError::Protocol("RESP nesting is too deep".to_owned()));
     }
@@ -754,7 +804,7 @@ fn read_resp(stream: &mut TcpStream, depth: usize) -> Result<RespValue, RedisErr
     }
 }
 
-fn read_resp_line(stream: &mut TcpStream) -> Result<Vec<u8>, RedisError> {
+fn read_resp_line<R: Read>(stream: &mut R) -> Result<Vec<u8>, RedisError> {
     let mut line = Vec::new();
     loop {
         let byte = read_exact_bytes(stream, 1)?[0];
@@ -772,7 +822,7 @@ fn read_resp_line(stream: &mut TcpStream) -> Result<Vec<u8>, RedisError> {
     }
 }
 
-fn read_exact_bytes(stream: &mut TcpStream, length: usize) -> Result<Vec<u8>, RedisError> {
+fn read_exact_bytes<R: Read>(stream: &mut R, length: usize) -> Result<Vec<u8>, RedisError> {
     let mut value = vec![0; length];
     stream.read_exact(&mut value)?;
     Ok(value)
@@ -980,6 +1030,10 @@ mod tests {
                 actual: 2
             })
         ));
+        let metrics = adapter.metrics();
+        assert!(metrics.commands > 0);
+        assert!(metrics.request_bytes > 0);
+        assert!(metrics.response_bytes > 0);
         drop(adapter);
         server.join().unwrap();
     }

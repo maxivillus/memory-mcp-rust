@@ -445,7 +445,8 @@ server through `BackendCoordinator`:
   fetches a snapshot only after a revision change, uses bounded backoff, and
   stops with the coordinator lifecycle;
 - `BackendCoordinator::status()` exposes only backend, connection, revision,
-  lag, and outbox counters.
+  lag, outbox, Redis command/byte, and synchronization tick/error/duration
+  counters; it never returns payloads or credentials.
 
 This is a correctness-first snapshot coordinator, not yet a claim of a native
 per-entity Redis schema or a performance win. The bounded marker protocol
