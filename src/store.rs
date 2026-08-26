@@ -646,6 +646,7 @@ impl Store {
             .and_then(|_| self.connection.restore(&path).map_err(StoreError::from));
         let _ = fs::remove_file(&path);
         result.and_then(|_| {
+            self.adopt_memory_catalog_if_present()?;
             if self.memory_database_name.borrow().is_some() {
                 self.initialize_memory_catalog()?;
                 self.refresh_memory_database_name()?;
@@ -674,6 +675,8 @@ impl Store {
         store.migrate()?;
         if store.memory_database_name.borrow().is_some() {
             store.initialize_memory_catalog()?;
+        } else {
+            store.adopt_memory_catalog_if_present()?;
         }
         Ok(store)
     }
@@ -1022,6 +1025,26 @@ impl Store {
             )
             .optional()?
             .unwrap_or_else(|| "memory".to_owned());
+        validate_database_name(&name)?;
+        *self.memory_database_name.borrow_mut() = Some(name);
+        Ok(())
+    }
+
+    fn adopt_memory_catalog_if_present(&self) -> Result<(), StoreError> {
+        if self.memory_database_name.borrow().is_some() {
+            return Ok(());
+        }
+        let Some(name) = self
+            .connection
+            .query_row(
+                "SELECT name FROM memory_database_state WHERE id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        else {
+            return Ok(());
+        };
         validate_database_name(&name)?;
         *self.memory_database_name.borrow_mut() = Some(name);
         Ok(())
@@ -6206,6 +6229,52 @@ mod tests {
             .delete_database("alpha")
             .expect("delete archived alpha"));
         let _ = fs::remove_file(backup_path);
+    }
+
+    #[test]
+    fn file_store_adopts_snapshot_backed_database_catalog_for_fallback() {
+        let path = std::env::temp_dir().join(format!(
+            "memory-mcp-rust-fallback-{}-{}.db",
+            std::process::id(),
+            SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_file(&path);
+        let active = Store::in_memory().expect("active memory store");
+        active
+            .remember_fact("main fallback fact", "workspace-a")
+            .expect("main fact");
+        active.create_database("alpha").expect("alpha database");
+        active.select_database("alpha").expect("select alpha");
+        active
+            .remember_fact("alpha fallback fact", "workspace-a")
+            .expect("alpha fact");
+        let snapshot = active.snapshot_bytes().expect("active snapshot");
+
+        let fallback = Store::open(&path).expect("file-backed fallback store");
+        fallback
+            .restore_snapshot_bytes(&snapshot)
+            .expect("restore active snapshot");
+        assert_eq!(
+            fallback.current_database().expect("current database").name,
+            "alpha"
+        );
+        assert_eq!(
+            fallback.list_databases().expect("database catalog").len(),
+            2
+        );
+        assert_eq!(
+            fallback
+                .list_facts("workspace-a")
+                .expect("alpha fallback facts")
+                .iter()
+                .map(|fact| fact.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha fallback fact"]
+        );
+        drop(fallback);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{}-wal", path.display()));
+        let _ = fs::remove_file(format!("{}-shm", path.display()));
     }
 
     #[test]
