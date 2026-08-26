@@ -7,7 +7,7 @@
 | Rust stdio JSON-RPC dispatcher | Keep the MCP process as one self-contained executable with bounded line-oriented I/O. | `src/main.rs`, `src/protocol.rs` |
 | `rusqlite` with bundled SQLite/FTS5 | Provide the complete local materialized store and avoid a host SQLite ABI dependency. | `src/store.rs`, `Cargo.toml` |
 | SQLite backup API snapshots | Copy a consistent bounded database image for standby refresh and recovery. | `src/store.rs` |
-| Redis RESP2 adapter | Provide the reachable Redis transport, authentication, revision key, and bounded snapshot state. | `src/redis.rs` |
+| Redis RESP2 adapter | Provide the reachable Redis transport, URL or Docker-style environment configuration, authentication, revision key, and bounded snapshot state. | `src/redis.rs` |
 | Redis-primary coordinator | Select Redis when reachable and route the full advertised tool set through one backend boundary. | `src/backend.rs`, `src/protocol.rs` |
 | Revision-checked `WATCH`/`MULTI`/`EXEC` publish | Prevent stale snapshot writes from silently overwriting a newer Redis state. | `src/redis.rs` |
 | Durable SQLite outbox | Preserve acknowledged fallback writes until Redis recovery reconciliation completes. | `src/backend.rs` |

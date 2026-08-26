@@ -70,8 +70,14 @@ pub struct RedisMetrics {
 
 impl RedisAdapter {
     pub fn configured() -> bool {
-        std::env::var_os("MEMORY_MCP_REDIS_URL").is_some()
-            || std::env::var_os("REDIS_URL").is_some()
+        [
+            "MEMORY_MCP_REDIS_URL",
+            "REDIS_URL",
+            "MEMORY_MCP_REDIS_HOST",
+            "REDIS_HOST",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
     }
 
     pub fn from_env() -> Result<Option<Self>, RedisError> {
@@ -79,14 +85,9 @@ impl RedisAdapter {
     }
 
     pub fn from_env_with_namespace_suffix(suffix: &str) -> Result<Option<Self>, RedisError> {
-        let Some(url) =
-            std::env::var_os("MEMORY_MCP_REDIS_URL").or_else(|| std::env::var_os("REDIS_URL"))
-        else {
+        let Some(endpoint) = endpoint_from_env()? else {
             return Ok(None);
         };
-        let url = url
-            .to_str()
-            .ok_or_else(|| RedisError::Invalid("Redis URL must be valid UTF-8".to_owned()))?;
         let namespace =
             std::env::var("MEMORY_MCP_REDIS_NAMESPACE").unwrap_or_else(|_| "memory-mcp".to_owned());
         let namespace = if suffix.is_empty() {
@@ -94,12 +95,16 @@ impl RedisAdapter {
         } else {
             format!("{namespace}:{suffix}")
         };
-        Self::connect(url, &namespace).map(Some)
+        Self::connect_endpoint(endpoint, &namespace).map(Some)
     }
 
     pub fn connect(url: &str, namespace: &str) -> Result<Self, RedisError> {
-        validate_namespace(namespace)?;
         let endpoint = RedisEndpoint::parse(url)?;
+        Self::connect_endpoint(endpoint, namespace)
+    }
+
+    fn connect_endpoint(endpoint: RedisEndpoint, namespace: &str) -> Result<Self, RedisError> {
+        validate_namespace(namespace)?;
         let mut connection = RedisConnection::connect(&endpoint)?;
         let pong = connection.command(vec![b"PING".to_vec()])?;
         if !matches!(pong, RespValue::Simple(value) if value == b"PONG") {
@@ -480,6 +485,34 @@ struct RedisEndpoint {
 }
 
 impl RedisEndpoint {
+    fn from_host_fields(
+        host: String,
+        port: Option<&str>,
+        database: Option<&str>,
+        username: Option<String>,
+        password: Option<String>,
+    ) -> Result<Self, RedisError> {
+        if host.is_empty() {
+            return Err(RedisError::Invalid(
+                "Redis host must not be empty".to_owned(),
+            ));
+        }
+        let port = port
+            .unwrap_or("6379")
+            .parse::<u16>()
+            .map_err(|_| RedisError::Invalid("Redis port must be a valid integer".to_owned()))?;
+        let database = database.unwrap_or("0").parse::<u32>().map_err(|_| {
+            RedisError::Invalid("Redis database must be a non-negative integer".to_owned())
+        })?;
+        Ok(Self {
+            host,
+            port,
+            database,
+            username: username.filter(|value| !value.is_empty()),
+            password: password.filter(|value| !value.is_empty()),
+        })
+    }
+
     fn parse(url: &str) -> Result<Self, RedisError> {
         let remainder = url.strip_prefix("redis://").ok_or_else(|| {
             RedisError::Invalid(
@@ -551,6 +584,56 @@ impl RedisEndpoint {
             password,
         })
     }
+}
+
+fn endpoint_from_env() -> Result<Option<RedisEndpoint>, RedisError> {
+    if let Some(url) = first_env_value(&["MEMORY_MCP_REDIS_URL", "REDIS_URL"])? {
+        return RedisEndpoint::parse(&url).map(Some);
+    }
+
+    let Some(host) = first_env_value(&["MEMORY_MCP_REDIS_HOST", "REDIS_HOST"])? else {
+        return Ok(None);
+    };
+    let port = first_env_value(&["MEMORY_MCP_REDIS_PORT", "REDIS_PORT"])?;
+    let database = first_env_value(&[
+        "MEMORY_MCP_REDIS_DATABASE",
+        "MEMORY_MCP_REDIS_DB",
+        "REDIS_DATABASE",
+        "REDIS_DB",
+    ])?;
+    let username = first_env_value(&[
+        "MEMORY_MCP_REDIS_USERNAME",
+        "MEMORY_MCP_REDIS_USER",
+        "REDIS_USERNAME",
+        "REDIS_USER",
+    ])?;
+    let password = first_env_value(&[
+        "MEMORY_MCP_REDIS_PASSWORD",
+        "MEMORY_MCP_REDIS_PASS",
+        "REDIS_PASSWORD",
+        "REDIS_PASS",
+    ])?;
+    RedisEndpoint::from_host_fields(
+        host,
+        port.as_deref(),
+        database.as_deref(),
+        username,
+        password,
+    )
+    .map(Some)
+}
+
+fn first_env_value(names: &[&str]) -> Result<Option<String>, RedisError> {
+    for name in names {
+        let Some(value) = std::env::var_os(name) else {
+            continue;
+        };
+        let value = value
+            .into_string()
+            .map_err(|_| RedisError::Invalid(format!("{name} must be valid UTF-8")))?;
+        return Ok(Some(value));
+    }
+    Ok(None)
 }
 
 fn percent_decode(value: &str) -> Result<String, RedisError> {
@@ -857,6 +940,45 @@ mod tests {
 
         assert!(RedisEndpoint::parse("https://localhost").is_err());
         assert!(RedisEndpoint::parse("redis://localhost/not-a-db").is_err());
+    }
+
+    #[test]
+    fn parses_host_based_redis_settings_without_exposing_credentials() {
+        let endpoint = RedisEndpoint::from_host_fields(
+            "redis".to_owned(),
+            Some("6380"),
+            Some("3"),
+            Some("default".to_owned()),
+            Some("fixture".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(endpoint.host, "redis");
+        assert_eq!(endpoint.port, 6380);
+        assert_eq!(endpoint.database, 3);
+        assert_eq!(endpoint.username.as_deref(), Some("default"));
+        assert!(endpoint.password.is_some());
+        assert_eq!(auth_command(&endpoint).as_ref().map(Vec::len), Some(3));
+
+        let defaults =
+            RedisEndpoint::from_host_fields("redis".to_owned(), None, None, None, None).unwrap();
+        assert_eq!(defaults.port, 6379);
+        assert_eq!(defaults.database, 0);
+        assert!(RedisEndpoint::from_host_fields(
+            "redis".to_owned(),
+            Some("not-a-port"),
+            None,
+            None,
+            None,
+        )
+        .is_err());
+        assert!(RedisEndpoint::from_host_fields(
+            "redis".to_owned(),
+            None,
+            Some("not-a-database"),
+            None,
+            None,
+        )
+        .is_err());
     }
 
     #[test]

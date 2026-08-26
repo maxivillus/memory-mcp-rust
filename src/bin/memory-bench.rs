@@ -56,9 +56,7 @@ fn main() {
     };
     let (selected_backend, fallback_reason) = if redis.is_some() {
         ("redis", None)
-    } else if std::env::var_os("MEMORY_MCP_REDIS_URL").is_some()
-        || std::env::var_os("REDIS_URL").is_some()
-    {
+    } else if RedisAdapter::configured() {
         ("sqlite", Some("redis_unavailable"))
     } else {
         ("sqlite", Some("redis_not_configured"))

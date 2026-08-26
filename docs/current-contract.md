@@ -497,8 +497,10 @@ policy above for the next implementation stages:
 - the full 80-tool route is an acceptance gate: every advertised tool and the
   `add_fact` alias must cross the same coordinator, with no direct dispatcher
   path that silently bypasses Redis, the standby, or the outbox;
-- credentials remain environment-only and are never emitted in logs, reports,
-  test fixtures, or protocol responses.
+- Redis may be configured with an explicit `MEMORY_MCP_REDIS_URL`/`REDIS_URL`
+  or with Docker-style host, port, database, user, and password variables;
+  explicit URLs take precedence, and credentials remain environment-only and
+  are never emitted in logs, reports, test fixtures, or protocol responses.
 
 The remaining production-acceptance work is a gated migration rather than a
 claim that the snapshot coordinator is already a native Redis backend:
