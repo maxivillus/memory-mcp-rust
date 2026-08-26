@@ -68,6 +68,11 @@ the authoritative schema for every parameter, default, enum, and bound.
 `current_database`, `reset_database`, `create_workspace`, `list_workspaces`,
 `reset_workspace`, `archive_workspace`, `backup_workspace`.
 
+The pinned upstream `TOOLS` map also advertises `decay_sweep`; it was omitted
+from the first contract-capture list. `add_fact` remains a handler alias and is
+not advertised. The corrected inventory therefore contains 80 advertised tool
+names.
+
 The inventory above intentionally describes groups, not a new API. Rust must
 preserve the exact upstream names and schemas, including aliases and bounded
 optional fields.
@@ -187,3 +192,12 @@ stage can be accepted when the Rust project has:
 No performance claim is made by this baseline. Benchmarking starts after the
 SQLite parity slice is working, and Redis remains an optional measured adapter
 with deterministic SQLite fallback.
+
+## Rust parity slice status
+
+The first implementation slice now provides one stdio executable, bundled
+SQLite/FTS5 initialization, a fresh-store round trip, a legacy `facts`-table
+upgrade fixture, and an 80-name inventory gate. The generic entries returned by
+`tools/list` intentionally mark per-tool schema/handler parity as incremental;
+the pinned upstream descriptions and input schemas remain the acceptance source
+for the subsequent port stages.
