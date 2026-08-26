@@ -9,15 +9,18 @@
 | SQLite backup API snapshots | Copy a consistent bounded database image for standby refresh and recovery. | `src/store.rs` |
 | Redis RESP2 adapter | Provide the reachable Redis transport, URL or Docker-style environment configuration, authentication, revision key, and bounded snapshot state. | `src/redis.rs` |
 | Redis-primary coordinator | Select Redis when reachable and route the full advertised tool set through one backend boundary. | `src/backend.rs`, `src/protocol.rs` |
-| Revision-checked `WATCH`/`MULTI`/`EXEC` publish | Prevent stale snapshot writes from silently overwriting a newer Redis state. | `src/redis.rs` |
+| Revision-checked `WATCH`/`MULTI`/`EXEC` publish | Prevent stale point updates or snapshot rebuilds from silently overwriting a newer Redis state. | `src/redis.rs` |
 | Durable SQLite outbox | Preserve acknowledged fallback writes until Redis recovery reconciliation completes. | `src/backend.rs` |
 | Bounded Redis operation markers | Detect a committed operation after a lost response without retaining operation payloads. | `src/redis.rs`, `src/backend.rs` |
 | Workspace-scoped native Redis entity projection | Store individually addressable bounded JSON records and a workspace index for the exported memory entities during the incremental Redis migration. | `src/redis.rs`, `src/backend.rs` |
-| Redis-owned in-memory execution state | Execute the complete tool surface from a private materialization restored from Redis; update SQLite only after the Redis revision commits. | `src/backend.rs`, `src/store.rs` |
+| Pointwise native delta publish | Send only changed/removed entity keys in the normal write path; retain full snapshots for attach, rebuild, and recovery control-plane work. | `src/redis.rs`, `src/backend.rs` |
+| Amortized compatibility snapshot checkpoint | Refresh the restart transport every 256 committed revisions, keeping full snapshots out of each ordinary write while bounding stale-snapshot recovery. | `src/backend.rs`, `src/redis.rs` |
+| Batched RESP transaction writes | Reduce network waits by writing `MULTI`, queued commands, and `EXEC` as one flushed request while preserving ordered replies. | `src/redis.rs` |
+| Redis-owned in-memory execution state | Execute the complete tool surface from a private materialization restored from Redis; mirror committed operations to SQLite pointwise through the background outbox. | `src/backend.rs`, `src/store.rs` |
 | Snapshot-backed virtual database catalog | Keep named database isolation, selection, backup, archive, reset, and deletion in the Redis-owned image without making the standby file the primary. | `src/store.rs` |
 | Native schema marker and rebuild | Detect version-1 snapshot-only namespaces and atomically rebuild system/workspace native keys at attach time. | `src/redis.rs`, `src/backend.rs` |
 | Durable Redis operation ledger | Preserve committed/conflict operation metadata beyond the compatibility marker TTL without retaining request payloads. | `src/redis.rs`, `src/backend.rs` |
-| Revision watcher with backoff | Avoid full scans while idle, retry failures without a busy loop, and stop with the coordinator. | `src/backend.rs` |
+| Revision watcher with backoff | Avoid full scans while idle, mirror bounded pointwise outbox batches, retry failures without a busy loop, and stop with the coordinator. | `src/backend.rs` |
 | Payload-free resource counters | Measure Redis commands/bytes and synchronization ticks/errors/duration without exposing memory contents. | `src/redis.rs`, `src/backend.rs`, `src/bin/memory-bench.rs` |
 | Copy-first SQLite migration | Preserve the Python rollback database while applying Rust schema migrations to a verified private copy; publish only after integrity, row-count, and typed fingerprint checks. | `src/migration.rs`, `src/main.rs`, `scripts/memory-mcp-migrate.sh` |
 | Legacy/Rust deployment preflight | Compare the exact MCP contract, launcher environment names, copied data counts, and all 80 disposable routes before a live cutover. | `scripts/memory-mcp-preflight.py`, `docs/deployment/memory-mcp-rust-rollout.md` |

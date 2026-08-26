@@ -4646,6 +4646,33 @@ impl Store {
         Ok(rows)
     }
 
+    /// Return every workspace identifier represented by the store, including
+    /// legacy/imported rows that predate a row in the `workspaces` catalog.
+    /// Native Redis projection and recovery must not omit those implicit
+    /// workspaces when rebuilding or checkpointing the compatibility image.
+    pub fn list_workspace_ids(&self) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM workspaces
+             UNION SELECT DISTINCT workspace_id FROM facts WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM contexts WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM lifecycle_events WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM handoffs WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM entities WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM relations WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM decisions WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM evidence WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM categories WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM runs WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM measurement_observations WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM memory_feedback WHERE workspace_id <> ''
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn archive_workspace(&self, id: &str) -> Result<Option<Workspace>, StoreError> {
         validate_workspace(id)?;
         self.connection.execute(
