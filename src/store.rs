@@ -53,6 +53,34 @@ pub struct Context {
     pub content: String,
     pub sha256: String,
     pub workspace: String,
+    pub schema: String,
+    pub source: String,
+    pub expires_at: Option<String>,
+    pub byte_size: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextMetadata {
+    pub schema: String,
+    pub source: String,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ContextChunk {
+    pub reference: String,
+    pub index: i64,
+    pub total: i64,
+    pub content: String,
+    pub byte_size: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ContextLineage {
+    pub parent_reference: String,
+    pub child_reference: String,
+    pub relation: String,
+    pub workspace: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -120,8 +148,12 @@ impl Store {
                 name TEXT NOT NULL,
                 content TEXT NOT NULL,
                 sha256 TEXT NOT NULL,
+                \"schema\" TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
                 workspace_id TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                expires_at TEXT,
+                byte_size INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS workspaces (
                 id TEXT PRIMARY KEY,
@@ -133,6 +165,23 @@ impl Store {
         )?;
 
         self.ensure_fact_columns()?;
+        self.ensure_context_columns()?;
+        self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS context_lineage (
+                parent_ref TEXT NOT NULL,
+                child_ref TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (parent_ref, child_ref, relation),
+                FOREIGN KEY (parent_ref) REFERENCES contexts(ref) ON DELETE CASCADE,
+                FOREIGN KEY (child_ref) REFERENCES contexts(ref) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS context_lineage_parent_idx
+                ON context_lineage (workspace_id, parent_ref);
+            CREATE INDEX IF NOT EXISTS context_lineage_child_idx
+                ON context_lineage (workspace_id, child_ref);",
+        )?;
         self.connection.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts
                 USING fts5(text, content='facts', content_rowid='id');
@@ -176,6 +225,38 @@ impl Store {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    fn ensure_context_columns(&self) -> Result<(), StoreError> {
+        let mut statement = self.connection.prepare("PRAGMA table_info(contexts)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let additions = [
+            ("schema", "TEXT NOT NULL DEFAULT ''"),
+            ("source", "TEXT NOT NULL DEFAULT ''"),
+            ("workspace_id", "TEXT NOT NULL DEFAULT ''"),
+            // SQLite requires a constant default for ALTER TABLE ADD COLUMN.
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+            ("expires_at", "TEXT"),
+            ("byte_size", "INTEGER NOT NULL DEFAULT 0"),
+        ];
+        for (name, definition) in additions {
+            if !columns.iter().any(|column| column == name) {
+                let column_name = if name == "schema" { "\"schema\"" } else { name };
+                self.connection.execute(
+                    &format!("ALTER TABLE contexts ADD COLUMN {column_name} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        self.connection.execute(
+            "UPDATE contexts
+             SET byte_size = length(CAST(content AS BLOB))
+             WHERE byte_size = 0 AND content <> ''",
+            [],
+        )?;
         Ok(())
     }
 
@@ -254,9 +335,33 @@ impl Store {
         content: &str,
         workspace: &str,
     ) -> Result<Context, StoreError> {
+        self.put_context_with_metadata(
+            reference,
+            name,
+            content,
+            &ContextMetadata::default(),
+            workspace,
+        )
+    }
+
+    pub fn put_context_with_metadata(
+        &self,
+        reference: &str,
+        name: &str,
+        content: &str,
+        metadata: &ContextMetadata,
+        workspace: &str,
+    ) -> Result<Context, StoreError> {
+        validate_context(reference, name, workspace, metadata.expires_at.as_deref())?;
         let sha256 = sha256(content);
-        if let Some(existing) = self.context(reference, workspace)? {
-            if existing.sha256 != sha256 {
+        let byte_size = content.len() as i64;
+        if let Some(existing) = self.context_raw(reference, workspace)? {
+            if existing.sha256 != sha256
+                || existing.name != name
+                || existing.schema != metadata.schema
+                || existing.source != metadata.source
+                || existing.expires_at != metadata.expires_at
+            {
                 return Err(StoreError::Invalid(format!(
                     "context ref is immutable: {reference}"
                 )));
@@ -264,20 +369,49 @@ impl Store {
             return Ok(existing);
         }
         self.connection.execute(
-            "INSERT INTO contexts (ref, name, content, sha256, workspace_id)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![reference, name, content, sha256, workspace],
+            "INSERT INTO contexts
+                (ref, name, content, sha256, \"schema\", source, workspace_id, expires_at, byte_size)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                reference,
+                name,
+                content,
+                sha256,
+                metadata.schema,
+                metadata.source,
+                workspace,
+                metadata.expires_at,
+                byte_size
+            ],
         )?;
-        self.context(reference, workspace)?.ok_or_else(|| {
+        self.context_raw(reference, workspace)?.ok_or_else(|| {
             StoreError::Invalid("context insert did not produce a readable row".to_owned())
         })
     }
 
     pub fn context(&self, reference: &str, workspace: &str) -> Result<Option<Context>, StoreError> {
+        validate_context_workspace(workspace)?;
         self.connection
             .query_row(
-                "SELECT ref, name, content, sha256, workspace_id FROM contexts
-                 WHERE ref = ?1 AND (workspace_id = '' OR workspace_id = ?2)",
+                "SELECT ref, name, content, sha256, workspace_id, \"schema\", source,
+                        expires_at, byte_size
+                 FROM contexts
+                 WHERE ref = ?1 AND workspace_id = ?2
+                   AND (expires_at IS NULL OR julianday(expires_at) > julianday('now'))",
+                params![reference, workspace],
+                map_context,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn context_raw(&self, reference: &str, workspace: &str) -> Result<Option<Context>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT ref, name, content, sha256, workspace_id, \"schema\", source,
+                        expires_at, byte_size
+                 FROM contexts
+                 WHERE ref = ?1 AND workspace_id = ?2",
                 params![reference, workspace],
                 map_context,
             )
@@ -286,14 +420,213 @@ impl Store {
     }
 
     pub fn list_contexts(&self, workspace: &str) -> Result<Vec<Context>, StoreError> {
+        validate_context_workspace(workspace)?;
         let mut statement = self.connection.prepare(
-            "SELECT ref, name, content, sha256, workspace_id FROM contexts
-             WHERE workspace_id = '' OR workspace_id = ?1 ORDER BY ref",
+            "SELECT ref, name, content, sha256, workspace_id, \"schema\", source,
+                    expires_at, byte_size
+             FROM contexts
+             WHERE workspace_id = ?1
+               AND (expires_at IS NULL OR julianday(expires_at) > julianday('now'))
+             ORDER BY ref",
         )?;
         let rows = statement
             .query_map(params![workspace], map_context)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    pub fn resolve_context(
+        &self,
+        query: &str,
+        workspace: &str,
+    ) -> Result<Option<Context>, StoreError> {
+        validate_context_workspace(workspace)?;
+        if query.trim().is_empty() {
+            return Ok(None);
+        }
+        if let Some(context) = self.context(query, workspace)? {
+            return Ok(Some(context));
+        }
+        self.connection
+            .query_row(
+                "SELECT ref, name, content, sha256, workspace_id, \"schema\", source,
+                        expires_at, byte_size
+                 FROM contexts
+                 WHERE name = ?1 AND workspace_id = ?2
+                   AND (expires_at IS NULL OR julianday(expires_at) > julianday('now'))
+                 ORDER BY ref LIMIT 1",
+                params![query, workspace],
+                map_context,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn search_contexts(
+        &self,
+        query: &str,
+        workspace: &str,
+    ) -> Result<Vec<Context>, StoreError> {
+        validate_context_workspace(workspace)?;
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT ref, name, content, sha256, workspace_id, \"schema\", source,
+                    expires_at, byte_size
+             FROM contexts
+             WHERE workspace_id = ?1
+               AND (expires_at IS NULL OR julianday(expires_at) > julianday('now'))
+               AND (instr(lower(ref), lower(?2)) > 0
+                    OR instr(lower(name), lower(?2)) > 0
+                    OR instr(lower(content), lower(?2)) > 0)
+             ORDER BY ref",
+        )?;
+        let rows = statement
+            .query_map(params![workspace, query], map_context)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn chunk_context(
+        &self,
+        reference: &str,
+        max_bytes: usize,
+        workspace: &str,
+    ) -> Result<Vec<ContextChunk>, StoreError> {
+        if max_bytes == 0 {
+            return Err(StoreError::Invalid(
+                "context chunk size must be positive".to_owned(),
+            ));
+        }
+        let context = self
+            .context(reference, workspace)?
+            .ok_or_else(|| StoreError::Invalid(format!("context not found: {reference}")))?;
+        let mut chunks = Vec::new();
+        let mut current = String::new();
+        let mut current_size = 0usize;
+        for character in context.content.chars() {
+            let character_size = character.len_utf8();
+            if character_size > max_bytes {
+                return Err(StoreError::Invalid(
+                    "context chunk size is smaller than one UTF-8 character".to_owned(),
+                ));
+            }
+            if current_size > 0 && current_size + character_size > max_bytes {
+                chunks.push(current);
+                current = String::new();
+                current_size = 0;
+            }
+            current.push(character);
+            current_size += character_size;
+        }
+        if !current.is_empty() || chunks.is_empty() {
+            chunks.push(current);
+        }
+        let total = chunks.len() as i64;
+        Ok(chunks
+            .into_iter()
+            .enumerate()
+            .map(|(index, content)| ContextChunk {
+                reference: reference.to_owned(),
+                index: index as i64,
+                total,
+                byte_size: content.len() as i64,
+                content,
+            })
+            .collect())
+    }
+
+    pub fn link_context(
+        &self,
+        parent_reference: &str,
+        child_reference: &str,
+        relation: &str,
+        workspace: &str,
+    ) -> Result<ContextLineage, StoreError> {
+        validate_context_workspace(workspace)?;
+        if parent_reference.trim().is_empty()
+            || child_reference.trim().is_empty()
+            || relation.trim().is_empty()
+        {
+            return Err(StoreError::Invalid(
+                "context lineage references and relation must not be empty".to_owned(),
+            ));
+        }
+        if self.context_raw(parent_reference, workspace)?.is_none()
+            || self.context_raw(child_reference, workspace)?.is_none()
+        {
+            return Err(StoreError::Invalid(
+                "context lineage references must belong to the workspace".to_owned(),
+            ));
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO context_lineage
+                (parent_ref, child_ref, relation, workspace_id)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![parent_reference, child_reference, relation, workspace],
+        )?;
+        self.connection
+            .query_row(
+                "SELECT parent_ref, child_ref, relation, workspace_id
+                 FROM context_lineage
+                 WHERE parent_ref = ?1 AND child_ref = ?2 AND relation = ?3
+                   AND workspace_id = ?4",
+                params![parent_reference, child_reference, relation, workspace],
+                map_context_lineage,
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub fn context_map(
+        &self,
+        reference: Option<&str>,
+        workspace: &str,
+    ) -> Result<Vec<ContextLineage>, StoreError> {
+        validate_context_workspace(workspace)?;
+        let mut statement = self.connection.prepare(
+            "SELECT parent_ref, child_ref, relation, workspace_id
+             FROM context_lineage
+             WHERE workspace_id = ?1
+               AND (?2 IS NULL OR parent_ref = ?2 OR child_ref = ?2)
+             ORDER BY parent_ref, child_ref, relation",
+        )?;
+        let rows = statement
+            .query_map(params![workspace, reference], map_context_lineage)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn reduce_context(
+        &self,
+        references: &[String],
+        output_reference: Option<&str>,
+        name: &str,
+        metadata: &ContextMetadata,
+        workspace: &str,
+    ) -> Result<Context, StoreError> {
+        validate_context_workspace(workspace)?;
+        if references.is_empty() {
+            return Err(StoreError::Invalid(
+                "reduce_context requires at least one reference".to_owned(),
+            ));
+        }
+        let mut contents = Vec::with_capacity(references.len());
+        for reference in references {
+            let context = self
+                .context(reference, workspace)?
+                .ok_or_else(|| StoreError::Invalid(format!("context not found: {reference}")))?;
+            contents.push(context.content);
+        }
+        let content = contents.join("\n\n");
+        let derived_reference = format!("reduced:{}", sha256(&content));
+        let reference = output_reference.unwrap_or(&derived_reference);
+        let reduced =
+            self.put_context_with_metadata(reference, name, &content, metadata, workspace)?;
+        for parent in references {
+            self.link_context(parent, reference, "reduced_from", workspace)?;
+        }
+        Ok(reduced)
     }
 
     pub fn stats(&self) -> Result<Stats, StoreError> {
@@ -471,7 +804,54 @@ fn map_context(row: &rusqlite::Row<'_>) -> rusqlite::Result<Context> {
         content: row.get(2)?,
         sha256: row.get(3)?,
         workspace: row.get(4)?,
+        schema: row.get(5)?,
+        source: row.get(6)?,
+        expires_at: row.get(7)?,
+        byte_size: row.get(8)?,
     })
+}
+
+fn map_context_lineage(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContextLineage> {
+    Ok(ContextLineage {
+        parent_reference: row.get(0)?,
+        child_reference: row.get(1)?,
+        relation: row.get(2)?,
+        workspace: row.get(3)?,
+    })
+}
+
+fn validate_context_workspace(workspace: &str) -> Result<(), StoreError> {
+    if workspace.trim().is_empty() {
+        return Err(StoreError::Invalid(
+            "context operations require a non-empty workspace".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_context(
+    reference: &str,
+    name: &str,
+    workspace: &str,
+    expires_at: Option<&str>,
+) -> Result<(), StoreError> {
+    validate_context_workspace(workspace)?;
+    if reference.trim().is_empty() {
+        return Err(StoreError::Invalid(
+            "context ref must not be empty".to_owned(),
+        ));
+    }
+    if name.trim().is_empty() {
+        return Err(StoreError::Invalid(
+            "context name must not be empty".to_owned(),
+        ));
+    }
+    if expires_at.is_some_and(|value| value.trim().is_empty()) {
+        return Err(StoreError::Invalid(
+            "context expiry must not be empty".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -570,6 +950,99 @@ mod tests {
     }
 
     #[test]
+    fn context_retrieval_chunking_expiry_and_lineage_are_deterministic() {
+        let store = Store::in_memory().expect("fresh store");
+        let metadata = ContextMetadata {
+            schema: "text/plain".to_owned(),
+            source: "design-note".to_owned(),
+            expires_at: Some("2999-01-01T00:00:00Z".to_owned()),
+        };
+        let first = store
+            .put_context_with_metadata(
+                "ctx-a",
+                "Architecture",
+                "Rust SQLite context",
+                &metadata,
+                "workspace-a",
+            )
+            .expect("first context");
+        let second = store
+            .put_context("ctx-b", "Operations", "Container runner", "workspace-a")
+            .expect("second context");
+        let expired = store
+            .put_context_with_metadata(
+                "ctx-expired",
+                "Expired",
+                "old content",
+                &ContextMetadata {
+                    expires_at: Some("2000-01-01T00:00:00Z".to_owned()),
+                    ..ContextMetadata::default()
+                },
+                "workspace-a",
+            )
+            .expect("expired context is stored");
+
+        let reduced_metadata = ContextMetadata {
+            schema: "text/plain".to_owned(),
+            source: "reducer".to_owned(),
+            ..ContextMetadata::default()
+        };
+
+        assert_eq!(first.byte_size, "Rust SQLite context".len() as i64);
+        assert_eq!(first.schema, "text/plain");
+        assert_eq!(first.source, "design-note");
+        assert_eq!(first.expires_at.as_deref(), Some("2999-01-01T00:00:00Z"));
+        assert_eq!(
+            store
+                .resolve_context("Architecture", "workspace-a")
+                .unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(store.context("ctx-a", "workspace-b").unwrap(), None);
+        assert_eq!(
+            store.search_contexts("runner", "workspace-a").unwrap(),
+            vec![second]
+        );
+        assert_eq!(store.context("ctx-expired", "workspace-a").unwrap(), None);
+        assert_eq!(store.list_contexts("workspace-a").unwrap().len(), 2);
+        assert_eq!(expired.content, "old content");
+
+        let chunks = store
+            .chunk_context("ctx-a", 5, "workspace-a")
+            .expect("UTF-8 chunks");
+        assert!(chunks.iter().all(|chunk| chunk.byte_size <= 5));
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.content.as_str())
+                .collect::<String>(),
+            first.content
+        );
+        assert!(chunks.iter().enumerate().all(
+            |(index, chunk)| chunk.index == index as i64 && chunk.total == chunks.len() as i64
+        ));
+
+        let reduced = store
+            .reduce_context(
+                &["ctx-a".to_owned(), "ctx-b".to_owned()],
+                Some("ctx-reduced"),
+                "Reduced",
+                &reduced_metadata,
+                "workspace-a",
+            )
+            .expect("reduced context");
+        assert_eq!(reduced.content, "Rust SQLite context\n\nContainer runner");
+        let lineage = store
+            .context_map(Some("ctx-reduced"), "workspace-a")
+            .unwrap();
+        assert_eq!(lineage.len(), 2);
+        assert!(lineage.iter().all(|entry| {
+            entry.child_reference == "ctx-reduced" && entry.relation == "reduced_from"
+        }));
+        assert_eq!(store.context_map(None, "workspace-b").unwrap(), Vec::new());
+    }
+
+    #[test]
     fn legacy_facts_table_is_upgraded_before_serving_calls() {
         let path =
             std::env::temp_dir().join(format!("memory-mcp-rust-legacy-{}.db", std::process::id()));
@@ -593,6 +1066,42 @@ mod tests {
             store.remember_fact("new fact", "").unwrap().text,
             "new fact"
         );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_context_table_receives_metadata_columns_without_data_loss() {
+        let path = std::env::temp_dir().join(format!(
+            "memory-mcp-rust-context-legacy-{}.db",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        {
+            let connection = Connection::open(&path).expect("legacy db");
+            connection
+                .execute_batch(
+                    "CREATE TABLE contexts (
+                        ref TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        sha256 TEXT NOT NULL,
+                        workspace_id TEXT NOT NULL
+                    );
+                    INSERT INTO contexts
+                        (ref, name, content, sha256, workspace_id)
+                    VALUES ('legacy-ctx', 'Legacy', 'old context', 'legacy-hash', 'legacy');",
+                )
+                .expect("legacy context schema");
+        }
+        let store = Store::open(&path).expect("migrated db");
+        let context = store
+            .context("legacy-ctx", "legacy")
+            .expect("read migrated context")
+            .expect("legacy context exists");
+        assert_eq!(context.content, "old context");
+        assert_eq!(context.schema, "");
+        assert_eq!(context.byte_size, "old context".len() as i64);
+        assert!(store.context_map(None, "legacy").unwrap().is_empty());
         let _ = fs::remove_file(path);
     }
 }

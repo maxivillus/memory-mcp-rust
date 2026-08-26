@@ -209,3 +209,23 @@ operations (`create_workspace`, `list_workspaces`, `archive_workspace`, and
 and reset deletes only the selected workspace's facts and contexts. Redis remains
 out of scope until the SQLite behavior is measured and the parity surface is
 complete enough for a meaningful adapter comparison.
+
+The third implementation slice adds the first context retrieval boundary:
+
+- context writes retain schema, source, expires_at, and UTF-8 byte size;
+  references are immutable and context reads require an explicit workspace;
+- resolve_context resolves an exact reference before an exact name, while
+  search_context performs deterministic workspace-scoped matching over the
+  reference, name, and content and omits expired contexts;
+- chunk_context returns ordered, UTF-8-safe byte-bounded chunks without
+  splitting a code point;
+- reduce_context creates an immutable derived context and records each input
+  reference in context_lineage; context_map reads that lineage with optional
+  reference, parent, and child filters;
+- additive migration upgrades legacy contexts tables with the new metadata
+  columns and creates the lineage indexes without replacing existing rows.
+
+This slice deliberately keeps local document ingestion, lifecycle events,
+typed handoffs, graph/decision tables, and database management for later
+parity slices. Redis and embedding adapters remain out of scope until the
+SQLite behavior has a broader deterministic test baseline.

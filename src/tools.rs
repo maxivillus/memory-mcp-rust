@@ -91,16 +91,149 @@ pub fn advertised_tools() -> Vec<Value> {
     TOOL_NAMES
         .iter()
         .map(|name| {
+            let (description, input_schema) = tool_contract(name);
             json!({
                 "name": name,
-                "description": "Compatibility inventory entry; handler and schema parity is ported incrementally.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
+                "description": description,
+                "inputSchema": input_schema
             })
         })
         .collect()
+}
+
+fn tool_contract(name: &str) -> (&'static str, Value) {
+    match name {
+        "put_context" => (
+            "Store an immutable workspace-scoped context.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "ref": {"type": "string"},
+                    "name": {"type": "string"},
+                    "content": {"type": "string"},
+                    "schema": {"type": "string"},
+                    "source": {"type": "string"},
+                    "expires_at": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"},
+                    "parent_ref": {"type": "string"},
+                    "relation": {"type": "string"}
+                },
+                "required": ["ref", "name", "content", "workspace"]
+            }),
+        ),
+        "list_context" => (
+            "List non-expired contexts in a workspace.",
+            workspace_schema(),
+        ),
+        "read_context" => (
+            "Read one non-expired context by reference.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "ref": {"type": "string"},
+                    "reference": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["ref", "workspace"]
+            }),
+        ),
+        "resolve_context" => (
+            "Resolve a context by exact reference or name.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "ref": {"type": "string"},
+                    "reference": {"type": "string"},
+                    "name": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["query", "workspace"]
+            }),
+        ),
+        "search_context" => (
+            "Search non-expired context references, names, and content.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["query", "workspace"]
+            }),
+        ),
+        "chunk_context" => (
+            "Return ordered UTF-8-safe byte-bounded context chunks.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "ref": {"type": "string"},
+                    "reference": {"type": "string"},
+                    "max_bytes": {"type": "integer", "minimum": 1},
+                    "chunk_size": {"type": "integer", "minimum": 1},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["ref", "workspace"]
+            }),
+        ),
+        "reduce_context" => (
+            "Create an immutable context from ordered context references.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "references": {"type": "array", "items": {"type": "string"}},
+                    "refs": {"type": "array", "items": {"type": "string"}},
+                    "ref": {"type": "string"},
+                    "reference": {"type": "string"},
+                    "name": {"type": "string"},
+                    "schema": {"type": "string"},
+                    "source": {"type": "string"},
+                    "expires_at": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["references", "workspace"]
+            }),
+        ),
+        "context_map" => (
+            "Read context lineage links in a workspace.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "ref": {"type": "string"},
+                    "reference": {"type": "string"},
+                    "parent_ref": {"type": "string"},
+                    "child_ref": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["workspace"]
+            }),
+        ),
+        _ => (
+            "Compatibility inventory entry; handler and schema parity is ported incrementally.",
+            json!({
+                "type": "object",
+                "properties": {}
+            }),
+        ),
+    }
+}
+
+fn workspace_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "workspace": {"type": "string"},
+            "workspace_id": {"type": "string"}
+        },
+        "required": ["workspace"]
+    })
 }
 
 pub fn is_advertised(name: &str) -> bool {
@@ -117,5 +250,13 @@ mod tests {
         assert!(!is_advertised("add_fact"));
         assert!(is_advertised("decay_sweep"));
         assert_eq!(advertised_tools().len(), 80);
+        let put_context = advertised_tools()
+            .into_iter()
+            .find(|tool| tool["name"] == "put_context")
+            .expect("put_context schema");
+        assert_eq!(
+            put_context["inputSchema"]["required"],
+            json!(["ref", "name", "content", "workspace"])
+        );
     }
 }
