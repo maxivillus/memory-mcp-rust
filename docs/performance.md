@@ -32,5 +32,7 @@ requires all advertised tools to use Redis when its probe succeeds and the
 complete SQLite implementation only when Redis is unavailable. The server must
 not enable a partial mode that sends facts to Redis while contexts, lifecycle
 records, graph data, provenance, telemetry, or backups continue on SQLite.
-Full-backend performance claims therefore wait for the parity and failover
-gates described in `current-contract.md`.
+Full-backend performance claims therefore wait for the parity, replication,
+and failover gates described in `current-contract.md`. Standby lag,
+reconciliation duration, and recovery success are separate reliability
+measurements; they must not be folded into a Redis speedup percentage.

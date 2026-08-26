@@ -20,45 +20,51 @@ workspace lifecycle.
 
 ## Decision proposal
 
-Introduce one backend contract consumed by the protocol dispatcher. At process
-startup, the runtime probes the configured Redis endpoint (including auth and
-database selection). A successful probe selects the complete Redis backend;
-missing or unreachable Redis selects the complete SQLite backend. Selection is
+Introduce one backend coordinator consumed by the protocol dispatcher. At
+process startup, it probes the configured Redis endpoint (including auth and
+database selection). A successful probe selects the Redis-primary state;
+missing or unreachable Redis selects the complete SQLite state. Selection is
 reported only as a backend name and a safe reason, never as a URL or credential.
 
-The Redis implementation must provide workspace/database isolation, stable ids,
-atomic idempotency, lifecycle transitions, bounded payloads, deterministic
-queries, and export/backup behavior equivalent to the SQLite contract. The
-existing SQLite store remains the fallback implementation and is not used for a
-request while Redis is selected.
+While Redis is primary, a bounded background replicator advances a cursor over
+confirmed Redis revisions and applies them transactionally to a SQLite hot
+standby. The standby stores the last confirmed Redis revision, so failover can
+serve a known point rather than an arbitrary local cache. Every stateful MCP
+operation, including database/workspace lifecycle operations, belongs to the
+same revision and idempotency protocol.
+
+On a Redis connection loss, the coordinator atomically enters `sqlite_failover`
+and serves the standby. Degraded-mode writes are committed to SQLite and a
+durable outbox before acknowledgement. Each outbox item carries an operation
+idempotency key and the Redis revision on which it was based; credentials and
+free-form secret-bearing payloads are excluded from diagnostics.
+
+When Redis returns, the coordinator enters `reconciling`: it first applies all
+Redis revisions after the standby cursor, then replays only non-conflicting
+outbox items using their idempotency keys. If the same logical record changed
+in both stores, Redis wins as requested; the rejected local item remains in the
+reconciliation audit until it is explicitly handled. The coordinator refreshes
+SQLite from the resulting Redis state and switches normal traffic back to Redis
+only after the Redis revision and standby cursor are durable.
 
 The implementation is staged behind a coverage gate:
 
-1. define and test the backend interface and dispatcher routing;
-2. define the Redis key/schema model and atomic write/idempotency primitives;
+1. define and test one backend interface and coordinator state machine;
+2. define Redis revisions, key/schema model, atomic idempotency primitives,
+   replication cursor, and SQLite outbox;
 3. port each Store operation group and add Redis integration tests;
-4. add startup fallback and controlled connection-loss tests, including the
-   no-divergent-acknowledged-write invariant;
+4. add startup fallback, standby lag, forced connection-loss, offline-write,
+   replay, conflict, and safe switch-back tests;
 5. run the complete formatter, test, lint, AppSec, artifact, QA, and PM gates.
-
-## Runtime-loss policy to resolve
-
-The startup choice is deterministic. A connection loss after a Redis-backed
-write has been acknowledged must not silently switch to SQLite, because the two
-stores may diverge. The implementation must either reconnect and complete the
-operation against Redis or return a safe backend-unavailable error until a
-controlled resynchronization is possible. PM/TechLead should confirm whether
-the product additionally requires automatic live failover after such a loss; if
-yes, that path needs an explicit resynchronization and acknowledgement protocol.
 
 ## Consequences
 
 This avoids a misleading partial Redis mode and keeps the current SQLite parity
-behavior intact while the Redis backend is built. It requires more work than
+behavior intact while the coordinator is built. It requires more work than
 adding an environment variable: every protocol operation and every stateful
-database/workspace transition needs a Redis implementation and an isolation/
-idempotency test. The benchmark adapter cannot be used as acceptance evidence
-for the full backend.
+database/workspace transition needs a Redis revision, standby application,
+outbox/replay behavior, and an isolation/idempotency test. The benchmark
+adapter cannot be used as acceptance evidence for the full backend.
 
 ## Acceptance evidence
 
@@ -67,6 +73,9 @@ for the full backend.
 - reachable Redis integration exercises every operation group and verifies
   workspace/database isolation and replay behavior;
 - unavailable Redis selects SQLite and preserves the existing SQLite tests;
-- connection-loss behavior has no silently acknowledged divergent writes;
+- connection-loss behavior serves the last confirmed standby revision, records
+  degraded writes durably, and does not silently discard outbox entries;
+- recovery applies Redis-priority reconciliation and switches back only after
+  both Redis and the SQLite standby are durable;
 - no credentials appear in logs, reports, fixtures, or protocol responses;
 - QA and AppSec are green before PM acceptance.

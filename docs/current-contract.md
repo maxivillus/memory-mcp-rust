@@ -434,12 +434,23 @@ policy above for the next implementation stages:
   including database and workspace lifecycle operations, is routed through
   that backend;
 - when Redis is not configured or cannot be reached, the complete operation
-  surface uses the existing SQLite backend as the fallback;
+  surface starts on the existing SQLite backend as the fallback;
+- while Redis is primary, a background coordinator keeps a SQLite hot standby
+  current from confirmed Redis revisions;
+- if the active Redis connection is lost, the coordinator serves the last
+  confirmed SQLite revision and records every degraded-mode write in a durable,
+  idempotent outbox;
+- after Redis recovers, the coordinator applies Redis revisions first, replays
+  non-conflicting outbox entries by idempotency key, gives Redis priority for
+  conflicts, refreshes the SQLite standby, and switches normal traffic back to
+  Redis only after the recovered state is durable;
 - a partial Redis route is not an acceptable intermediate claim: an operation
   must not silently use SQLite while Redis is the selected backend;
-- acknowledged writes must remain durable before a Redis-backed response is
-  returned; reconnect/failover behavior must not create divergent acknowledged
-  writes;
+- an acknowledged Redis write must be present in the Redis revision stream
+  before the response is returned; an acknowledged degraded-mode write must be
+  present in the SQLite database and outbox before the response is returned;
+- the coordinator must expose standby lag and reconciliation state without
+  exposing payloads or credentials;
 - credentials remain environment-only and are never emitted in logs, reports,
   test fixtures, or protocol responses.
 
@@ -454,12 +465,16 @@ that the existing adapter is already a full backend:
    lifecycle, indexing, export, and backup semantics for every Store entity;
 3. implement the Redis backend operation group by operation group, with a
    coverage test that maps all 80 advertised tools plus the `add_fact` alias;
-4. add reachable-Redis integration tests, unavailable-Redis SQLite fallback
-   tests, migration/isolation tests, and controlled connection-loss tests;
-5. update the runtime selection, documentation, benchmark interpretation, and
-   delivery gates only after the complete route is covered.
+4. add the background replication cursor, SQLite outbox, controlled failover,
+   recovery reconciliation, Redis-priority conflict handling, and bounded
+   health/lag state;
+5. add reachable-Redis, unavailable-Redis, forced-connection-loss, offline
+   write, replay, conflict, migration, and isolation tests;
+6. update the runtime selection, documentation, benchmark interpretation, and
+   delivery gates only after the complete route and recovery protocol are
+   covered.
 
-The proposed architecture and the runtime-loss policy are recorded in
+The proposed architecture and recovery protocol are recorded in
 `docs/decisions/ADR-0001-redis-primary-with-sqlite-fallback.md`. Until the
 full route and its gates pass, the server intentionally remains on SQLite so
 that a reachable Redis endpoint cannot produce a misleading partial mode.
