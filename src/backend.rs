@@ -2015,10 +2015,10 @@ mod tests {
         let first_address = first_listener.local_addr().expect("first address");
         let first_values = Arc::clone(&values);
         let first_server = thread::spawn(move || {
-            // The first native projection publish must commit before the
-            // fixture drops the connection; the next operation then exercises
-            // the real client-side loss path.
-            run_snapshot_redis(first_listener, first_values, Some(38));
+            // The initial empty-state attach is transaction one. Drop the
+            // connection after transaction two, once the first operation has
+            // committed, so the next operation exercises the loss path.
+            run_snapshot_redis(first_listener, first_values, Some(2));
         });
         let adapter = RedisAdapter::connect(
             &format!("redis://{first_address}"),
@@ -2144,22 +2144,18 @@ mod tests {
     fn run_snapshot_redis(
         listener: TcpListener,
         shared_values: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
-        close_after: Option<usize>,
+        close_after_transaction: Option<usize>,
     ) {
         let (mut stream, _) = listener.accept().expect("Redis client");
         let mut transaction: Option<Vec<Vec<Vec<u8>>>> = None;
         let mut sets = HashMap::<Vec<u8>, BTreeSet<Vec<u8>>>::new();
-        let mut command_count = 0;
+        let mut transaction_count = 0;
         while let Some(arguments) = read_request(&mut stream) {
-            command_count += 1;
             let command = arguments[0].as_slice();
             if let Some(queue) = transaction.as_mut() {
                 if command != b"EXEC" {
                     queue.push(arguments);
                     write_simple(&mut stream, b"QUEUED");
-                    if close_after == Some(command_count) {
-                        return;
-                    }
                     continue;
                 }
             }
@@ -2223,6 +2219,10 @@ mod tests {
                     for _ in 2..result_count {
                         write_simple(&mut stream, b"OK");
                     }
+                    transaction_count += 1;
+                    if close_after_transaction == Some(transaction_count) {
+                        return;
+                    }
                 }
                 b"GET" => {
                     let values = shared_values.lock().expect("Redis values");
@@ -2284,9 +2284,6 @@ mod tests {
                     write_integer(&mut stream, i64::from(deleted));
                 }
                 _ => write_error(&mut stream, b"unsupported test command"),
-            }
-            if close_after == Some(command_count) {
-                return;
             }
         }
     }
