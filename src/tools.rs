@@ -161,6 +161,110 @@ fn tool_contract(name: &str) -> (&'static str, Value) {
             "List forgotten facts with provenance metadata.",
             workspace_schema(),
         ),
+        "remember_entity" => (
+            "Store a workspace-scoped graph entity.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "type": {"type": "string"},
+                    "entity_type": {"type": "string"},
+                    "aliases": {"type": "array", "items": {"type": "string"}},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["name"]
+            }),
+        ),
+        "remember_relation" => (
+            "Store a deduplicated graph relation between two entities.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "subject": {"type": "string"},
+                    "predicate": {"type": "string"},
+                    "object": {"type": "string"},
+                    "source_fact_id": {"type": "integer"},
+                    "fact_id": {"type": "integer"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["subject", "predicate", "object"]
+            }),
+        ),
+        "search_graph" => (
+            "Search graph entities and relations.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["query"]
+            }),
+        ),
+        "record_decision" => (
+            "Record a decision with optional parent and code anchors.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string"},
+                    "subject": {"type": "string"},
+                    "scenario": {"type": "string"},
+                    "reasoning": {"type": "string"},
+                    "outcome": {"type": "string"},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "decision_maker": {"type": "string"},
+                    "maker": {"type": "string"},
+                    "issue_ref": {"type": "string"},
+                    "path": {"type": "string"},
+                    "symbol": {"type": "string"},
+                    "parent_id": {"type": "integer"},
+                    "parent": {"type": "integer"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["subject", "scenario", "outcome"]
+            }),
+        ),
+        "query_decisions" | "find_precedents" => (
+            "Search recorded decisions.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["query"]
+            }),
+        ),
+        "get_causal_chain" => (
+            "Read a decision parent chain from root to decision.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "decision_id": {"type": "integer"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["id"]
+            }),
+        ),
+        "detect_conflicts" => (
+            "Find distinct outcomes for the same decision subject and scenario.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["query"]
+            }),
+        ),
         "put_context" => (
             "Store an immutable workspace-scoped context.",
             json!({

@@ -92,6 +92,89 @@ pub struct FactVerification {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Entity {
+    pub id: i64,
+    pub name: String,
+    pub canonical_name: String,
+    pub entity_type: String,
+    pub aliases: Vec<String>,
+    pub workspace: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntitySpec {
+    pub name: String,
+    pub entity_type: String,
+    pub aliases: Vec<String>,
+    pub workspace: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationSpec {
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    pub source_fact_id: Option<i64>,
+    pub workspace: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Relation {
+    pub id: i64,
+    pub subject_id: i64,
+    pub predicate: String,
+    pub object_id: i64,
+    pub source_fact_id: Option<i64>,
+    pub workspace: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecisionSpec {
+    pub category: String,
+    pub subject: String,
+    pub scenario: String,
+    pub reasoning: String,
+    pub outcome: String,
+    pub confidence: Option<f64>,
+    pub decision_maker: String,
+    pub issue_ref: String,
+    pub path: String,
+    pub symbol: String,
+    pub parent_id: Option<i64>,
+    pub workspace: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Decision {
+    pub id: i64,
+    pub category: String,
+    pub subject: String,
+    pub scenario: String,
+    pub reasoning: String,
+    pub outcome: String,
+    pub confidence: Option<f64>,
+    pub decision_maker: String,
+    pub issue_ref: String,
+    pub path: String,
+    pub symbol: String,
+    pub parent_id: Option<i64>,
+    pub workspace: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GraphSearch {
+    pub entities: Vec<Entity>,
+    pub relations: Vec<Relation>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DecisionConflict {
+    pub subject: String,
+    pub scenario: String,
+    pub outcomes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Context {
     pub reference: String,
     pub name: String,
@@ -338,6 +421,83 @@ impl Store {
                 ON handoffs (workspace_id, state);",
         )?;
         self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS entities (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                canonical_name TEXT NOT NULL,
+                entity_type TEXT NOT NULL DEFAULT '',
+                aliases TEXT NOT NULL DEFAULT '[]',
+                workspace_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (name, workspace_id)
+            );
+            CREATE TABLE IF NOT EXISTS relations (
+                id INTEGER PRIMARY KEY,
+                subject_id INTEGER NOT NULL,
+                predicate TEXT NOT NULL,
+                object_id INTEGER NOT NULL,
+                source_fact_id INTEGER,
+                workspace_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (workspace_id, subject_id, predicate, object_id),
+                FOREIGN KEY (subject_id) REFERENCES entities(id) ON DELETE CASCADE,
+                FOREIGN KEY (object_id) REFERENCES entities(id) ON DELETE CASCADE,
+                FOREIGN KEY (source_fact_id) REFERENCES facts(id) ON DELETE SET NULL
+            );
+            CREATE TABLE IF NOT EXISTS decisions (
+                id INTEGER PRIMARY KEY,
+                category TEXT NOT NULL DEFAULT '',
+                subject TEXT NOT NULL,
+                scenario TEXT NOT NULL,
+                reasoning TEXT NOT NULL DEFAULT '',
+                outcome TEXT NOT NULL,
+                confidence REAL,
+                decision_maker TEXT NOT NULL DEFAULT '',
+                issue_ref TEXT NOT NULL DEFAULT '',
+                path TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                parent_id INTEGER,
+                workspace_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (parent_id) REFERENCES decisions(id) ON DELETE SET NULL
+            );
+            ",
+        )?;
+        self.ensure_entity_columns()?;
+        self.ensure_relation_columns()?;
+        self.ensure_decision_columns()?;
+        self.connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS entities_canonical_idx
+                ON entities (workspace_id, canonical_name);
+             CREATE INDEX IF NOT EXISTS relations_subject_idx
+                ON relations (workspace_id, subject_id);
+             CREATE INDEX IF NOT EXISTS relations_object_idx
+                ON relations (workspace_id, object_id);
+             CREATE INDEX IF NOT EXISTS decisions_subject_idx
+                ON decisions (workspace_id, subject);",
+        )?;
+        self.connection.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS decisions_fts
+                USING fts5(category, scenario, reasoning,
+                           content='decisions', content_rowid='id');
+            CREATE TRIGGER IF NOT EXISTS decisions_ai AFTER INSERT ON decisions BEGIN
+                INSERT INTO decisions_fts(rowid, category, scenario, reasoning)
+                VALUES (new.id, new.category, new.scenario, new.reasoning);
+            END;
+            CREATE TRIGGER IF NOT EXISTS decisions_ad AFTER DELETE ON decisions BEGIN
+                INSERT INTO decisions_fts(decisions_fts, rowid, category, scenario, reasoning)
+                VALUES ('delete', old.id, old.category, old.scenario, old.reasoning);
+            END;
+            CREATE TRIGGER IF NOT EXISTS decisions_au
+                AFTER UPDATE OF category, scenario, reasoning ON decisions BEGIN
+                INSERT INTO decisions_fts(decisions_fts, rowid, category, scenario, reasoning)
+                VALUES ('delete', old.id, old.category, old.scenario, old.reasoning);
+                INSERT INTO decisions_fts(rowid, category, scenario, reasoning)
+                VALUES (new.id, new.category, new.scenario, new.reasoning);
+            END;
+            INSERT INTO decisions_fts(decisions_fts) VALUES ('rebuild');",
+        )?;
+        self.connection.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts
                 USING fts5(text, content='facts', content_rowid='id');
              CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
@@ -469,6 +629,91 @@ impl Store {
             if !columns.iter().any(|column| column == name) {
                 self.connection.execute(
                     &format!("ALTER TABLE handoffs ADD COLUMN {name} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_entity_columns(&self) -> Result<(), StoreError> {
+        let mut statement = self.connection.prepare("PRAGMA table_info(entities)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let additions = [
+            ("name", "TEXT NOT NULL DEFAULT ''"),
+            ("canonical_name", "TEXT NOT NULL DEFAULT ''"),
+            ("entity_type", "TEXT NOT NULL DEFAULT ''"),
+            ("aliases", "TEXT NOT NULL DEFAULT '[]'"),
+            ("workspace_id", "TEXT NOT NULL DEFAULT ''"),
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+        ];
+        for (name, definition) in additions {
+            if !columns.iter().any(|column| column == name) {
+                self.connection.execute(
+                    &format!("ALTER TABLE entities ADD COLUMN {name} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        self.connection.execute(
+            "UPDATE entities
+             SET canonical_name = lower(trim(name))
+             WHERE canonical_name = '' AND name <> ''",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn ensure_relation_columns(&self) -> Result<(), StoreError> {
+        let mut statement = self.connection.prepare("PRAGMA table_info(relations)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let additions = [
+            ("subject_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("predicate", "TEXT NOT NULL DEFAULT ''"),
+            ("object_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("source_fact_id", "INTEGER"),
+            ("workspace_id", "TEXT NOT NULL DEFAULT ''"),
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+        ];
+        for (name, definition) in additions {
+            if !columns.iter().any(|column| column == name) {
+                self.connection.execute(
+                    &format!("ALTER TABLE relations ADD COLUMN {name} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_decision_columns(&self) -> Result<(), StoreError> {
+        let mut statement = self.connection.prepare("PRAGMA table_info(decisions)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let additions = [
+            ("category", "TEXT NOT NULL DEFAULT ''"),
+            ("subject", "TEXT NOT NULL DEFAULT ''"),
+            ("scenario", "TEXT NOT NULL DEFAULT ''"),
+            ("reasoning", "TEXT NOT NULL DEFAULT ''"),
+            ("outcome", "TEXT NOT NULL DEFAULT ''"),
+            ("confidence", "REAL"),
+            ("decision_maker", "TEXT NOT NULL DEFAULT ''"),
+            ("issue_ref", "TEXT NOT NULL DEFAULT ''"),
+            ("path", "TEXT NOT NULL DEFAULT ''"),
+            ("symbol", "TEXT NOT NULL DEFAULT ''"),
+            ("parent_id", "INTEGER"),
+            ("workspace_id", "TEXT NOT NULL DEFAULT ''"),
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+        ];
+        for (name, definition) in additions {
+            if !columns.iter().any(|column| column == name) {
+                self.connection.execute(
+                    &format!("ALTER TABLE decisions ADD COLUMN {name} {definition}"),
                     [],
                 )?;
             }
@@ -1167,6 +1412,270 @@ impl Store {
         self.handoff_by_key(idempotency_key, workspace)
     }
 
+    pub fn remember_entity(&self, spec: &EntitySpec) -> Result<Entity, StoreError> {
+        validate_entity_spec(spec)?;
+        let canonical_name = canonical_name(&spec.name);
+        let aliases = serde_json::to_string(&spec.aliases)
+            .map_err(|error| StoreError::Invalid(error.to_string()))?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO entities
+                (name, canonical_name, entity_type, aliases, workspace_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                spec.name,
+                canonical_name,
+                spec.entity_type,
+                aliases,
+                spec.workspace
+            ],
+        )?;
+        self.entity_by_name(&spec.name, &spec.workspace)?
+            .ok_or_else(|| {
+                StoreError::Invalid("entity insert did not produce a readable row".to_owned())
+            })
+    }
+
+    pub fn remember_relation(&self, spec: &RelationSpec) -> Result<Relation, StoreError> {
+        validate_relation_spec(spec)?;
+        let subject_id = self
+            .entity_id_for_reference(&spec.subject, &spec.workspace)?
+            .ok_or_else(|| {
+                StoreError::Invalid(format!("subject entity not found: {}", spec.subject))
+            })?;
+        let object_id = self
+            .entity_id_for_reference(&spec.object, &spec.workspace)?
+            .ok_or_else(|| {
+                StoreError::Invalid(format!("object entity not found: {}", spec.object))
+            })?;
+        if let Some(fact_id) = spec.source_fact_id {
+            if self.fact_by_id(fact_id, &spec.workspace)?.is_none() {
+                return Err(StoreError::Invalid(format!(
+                    "source fact not found: {fact_id}"
+                )));
+            }
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO relations
+                (subject_id, predicate, object_id, source_fact_id, workspace_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                subject_id,
+                spec.predicate,
+                object_id,
+                spec.source_fact_id,
+                spec.workspace
+            ],
+        )?;
+        self.relation_by_key(subject_id, &spec.predicate, object_id, &spec.workspace)?
+            .ok_or_else(|| {
+                StoreError::Invalid("relation insert did not produce a readable row".to_owned())
+            })
+    }
+
+    pub fn search_graph(&self, query: &str, workspace: &str) -> Result<GraphSearch, StoreError> {
+        validate_graph_workspace(workspace)?;
+        if query.trim().is_empty() {
+            return Ok(GraphSearch {
+                entities: Vec::new(),
+                relations: Vec::new(),
+            });
+        }
+        let mut entities_statement = self.connection.prepare(
+            "SELECT id, name, canonical_name, entity_type, aliases, workspace_id
+             FROM entities
+             WHERE workspace_id = ?1
+               AND (instr(lower(name), lower(?2)) > 0
+                    OR instr(lower(canonical_name), lower(?2)) > 0
+                    OR instr(lower(aliases), lower(?2)) > 0)
+             ORDER BY id",
+        )?;
+        let entities = entities_statement
+            .query_map(params![workspace, query], map_entity)?
+            .collect::<Result<Vec<_>, _>>()?;
+        let entity_ids = entities.iter().map(|entity| entity.id).collect::<Vec<_>>();
+
+        let mut relations_statement = self.connection.prepare(
+            "SELECT id, subject_id, predicate, object_id, source_fact_id, workspace_id
+             FROM relations
+             WHERE workspace_id = ?1
+               AND (instr(lower(predicate), lower(?2)) > 0
+                    OR subject_id IN (
+                        SELECT id FROM entities
+                        WHERE workspace_id = ?1
+                          AND (instr(lower(name), lower(?2)) > 0
+                               OR instr(lower(canonical_name), lower(?2)) > 0)
+                    )
+                    OR object_id IN (
+                        SELECT id FROM entities
+                        WHERE workspace_id = ?1
+                          AND (instr(lower(name), lower(?2)) > 0
+                               OR instr(lower(canonical_name), lower(?2)) > 0)
+                    ))
+             ORDER BY id",
+        )?;
+        let relations = relations_statement
+            .query_map(params![workspace, query], map_relation)?
+            .collect::<Result<Vec<_>, _>>()?;
+        let relations = if entity_ids.is_empty() {
+            relations
+        } else {
+            relations
+                .into_iter()
+                .filter(|relation| {
+                    relation
+                        .predicate
+                        .to_lowercase()
+                        .contains(&query.to_lowercase())
+                        || entity_ids.contains(&relation.subject_id)
+                        || entity_ids.contains(&relation.object_id)
+                })
+                .collect()
+        };
+        Ok(GraphSearch {
+            entities,
+            relations,
+        })
+    }
+
+    pub fn record_decision(&self, spec: &DecisionSpec) -> Result<Decision, StoreError> {
+        validate_decision_spec(spec)?;
+        if let Some(parent_id) = spec.parent_id {
+            if self.decision_by_id(parent_id, &spec.workspace)?.is_none() {
+                return Err(StoreError::Invalid(format!(
+                    "parent decision not found: {parent_id}"
+                )));
+            }
+        }
+        self.connection.execute(
+            "INSERT INTO decisions
+                (category, subject, scenario, reasoning, outcome, confidence,
+                 decision_maker, issue_ref, path, symbol, parent_id, workspace_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                spec.category,
+                spec.subject,
+                spec.scenario,
+                spec.reasoning,
+                spec.outcome,
+                spec.confidence,
+                spec.decision_maker,
+                spec.issue_ref,
+                spec.path,
+                spec.symbol,
+                spec.parent_id,
+                spec.workspace
+            ],
+        )?;
+        let id = self.connection.last_insert_rowid();
+        self.decision_by_id(id, &spec.workspace)?.ok_or_else(|| {
+            StoreError::Invalid("decision insert did not produce a readable row".to_owned())
+        })
+    }
+
+    pub fn query_decisions(
+        &self,
+        query: &str,
+        workspace: &str,
+    ) -> Result<Vec<Decision>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let fts_query = query
+            .split_whitespace()
+            .map(|term| format!("\"{}\"", term.replace('"', "")))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let mut statement = self.connection.prepare(
+            "SELECT d.id, d.category, d.subject, d.scenario, d.reasoning,
+                    d.outcome, d.confidence, d.decision_maker, d.issue_ref,
+                    d.path, d.symbol, d.parent_id, d.workspace_id
+             FROM decisions_fts
+             JOIN decisions d ON d.id = decisions_fts.rowid
+             WHERE decisions_fts MATCH ?1 AND d.workspace_id = ?2
+             ORDER BY d.id",
+        )?;
+        let rows = statement
+            .query_map(params![fts_query, workspace], map_decision)?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !rows.is_empty() {
+            return Ok(rows);
+        }
+        let like = format!("%{}%", query);
+        let mut fallback = self.connection.prepare(
+            "SELECT id, category, subject, scenario, reasoning,
+                    outcome, confidence, decision_maker, issue_ref,
+                    path, symbol, parent_id, workspace_id
+             FROM decisions
+             WHERE workspace_id = ?1
+               AND (category LIKE ?2 OR subject LIKE ?2 OR scenario LIKE ?2
+                    OR reasoning LIKE ?2 OR outcome LIKE ?2)
+             ORDER BY id",
+        )?;
+        let rows = fallback
+            .query_map(params![workspace, like], map_decision)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)?;
+        Ok(rows)
+    }
+
+    pub fn find_precedents(
+        &self,
+        query: &str,
+        workspace: &str,
+    ) -> Result<Vec<Decision>, StoreError> {
+        self.query_decisions(query, workspace)
+    }
+
+    pub fn causal_chain(&self, id: i64, workspace: &str) -> Result<Vec<Decision>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        let mut chain = Vec::new();
+        let mut current_id = Some(id);
+        let mut seen = Vec::new();
+        while let Some(decision_id) = current_id {
+            if seen.contains(&decision_id) {
+                return Err(StoreError::Invalid(
+                    "decision parent chain contains a cycle".to_owned(),
+                ));
+            }
+            seen.push(decision_id);
+            let decision = self
+                .decision_by_id(decision_id, workspace)?
+                .ok_or_else(|| StoreError::Invalid(format!("decision not found: {decision_id}")))?;
+            current_id = decision.parent_id;
+            chain.push(decision);
+        }
+        chain.reverse();
+        Ok(chain)
+    }
+
+    pub fn detect_conflicts(
+        &self,
+        query: &str,
+        workspace: &str,
+    ) -> Result<Vec<DecisionConflict>, StoreError> {
+        let decisions = self.query_decisions(query, workspace)?;
+        let mut grouped = std::collections::BTreeMap::<(String, String), Vec<String>>::new();
+        for decision in decisions {
+            let outcomes = grouped
+                .entry((decision.subject, decision.scenario))
+                .or_default();
+            if !outcomes.contains(&decision.outcome) {
+                outcomes.push(decision.outcome);
+            }
+        }
+        Ok(grouped
+            .into_iter()
+            .filter_map(|((subject, scenario), outcomes)| {
+                (outcomes.len() > 1).then_some(DecisionConflict {
+                    subject,
+                    scenario,
+                    outcomes,
+                })
+            })
+            .collect())
+    }
+
     pub fn stats(&self) -> Result<Stats, StoreError> {
         let facts = self
             .connection
@@ -1334,6 +1843,92 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    fn entity_by_name(&self, name: &str, workspace: &str) -> Result<Option<Entity>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, name, canonical_name, entity_type, aliases, workspace_id
+                 FROM entities
+                 WHERE name = ?1 AND workspace_id = ?2",
+                params![name, workspace],
+                map_entity,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn entity_by_id(&self, id: i64, workspace: &str) -> Result<Option<Entity>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, name, canonical_name, entity_type, aliases, workspace_id
+                 FROM entities
+                 WHERE id = ?1 AND workspace_id = ?2",
+                params![id, workspace],
+                map_entity,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn entity_id_for_reference(
+        &self,
+        reference: &str,
+        workspace: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        if let Ok(id) = reference.parse::<i64>() {
+            if let Some(entity) = self.entity_by_id(id, workspace)? {
+                return Ok(Some(entity.id));
+            }
+        }
+        if let Some(entity) = self.entity_by_name(reference, workspace)? {
+            return Ok(Some(entity.id));
+        }
+        self.connection
+            .query_row(
+                "SELECT id
+                 FROM entities
+                 WHERE canonical_name = ?1 AND workspace_id = ?2",
+                params![canonical_name(reference), workspace],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn relation_by_key(
+        &self,
+        subject_id: i64,
+        predicate: &str,
+        object_id: i64,
+        workspace: &str,
+    ) -> Result<Option<Relation>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, subject_id, predicate, object_id, source_fact_id, workspace_id
+                 FROM relations
+                 WHERE subject_id = ?1 AND predicate = ?2 AND object_id = ?3
+                   AND workspace_id = ?4",
+                params![subject_id, predicate, object_id, workspace],
+                map_relation,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn decision_by_id(&self, id: i64, workspace: &str) -> Result<Option<Decision>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, category, subject, scenario, reasoning,
+                        outcome, confidence, decision_maker, issue_ref,
+                        path, symbol, parent_id, workspace_id
+                 FROM decisions
+                 WHERE id = ?1 AND workspace_id = ?2",
+                params![id, workspace],
+                map_decision,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     fn validate_timestamp(&self, value: &str, label: &str) -> Result<(), StoreError> {
         let parsed: Option<f64> =
             self.connection
@@ -1493,6 +2088,47 @@ fn map_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Fact> {
     })
 }
 
+fn map_entity(row: &rusqlite::Row<'_>) -> rusqlite::Result<Entity> {
+    let aliases_json: String = row.get(4)?;
+    Ok(Entity {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        canonical_name: row.get(2)?,
+        entity_type: row.get(3)?,
+        aliases: serde_json::from_str(&aliases_json).unwrap_or_default(),
+        workspace: row.get(5)?,
+    })
+}
+
+fn map_relation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Relation> {
+    Ok(Relation {
+        id: row.get(0)?,
+        subject_id: row.get(1)?,
+        predicate: row.get(2)?,
+        object_id: row.get(3)?,
+        source_fact_id: row.get(4)?,
+        workspace: row.get(5)?,
+    })
+}
+
+fn map_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<Decision> {
+    Ok(Decision {
+        id: row.get(0)?,
+        category: row.get(1)?,
+        subject: row.get(2)?,
+        scenario: row.get(3)?,
+        reasoning: row.get(4)?,
+        outcome: row.get(5)?,
+        confidence: row.get(6)?,
+        decision_maker: row.get(7)?,
+        issue_ref: row.get(8)?,
+        path: row.get(9)?,
+        symbol: row.get(10)?,
+        parent_id: row.get(11)?,
+        workspace: row.get(12)?,
+    })
+}
+
 fn map_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspace> {
     Ok(Workspace {
         id: row.get(0)?,
@@ -1504,6 +2140,15 @@ fn validate_workspace(id: &str) -> Result<(), StoreError> {
     if id.trim().is_empty() {
         return Err(StoreError::Invalid(
             "workspace id must not be empty".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_graph_workspace(workspace: &str) -> Result<(), StoreError> {
+    if workspace.trim() != workspace {
+        return Err(StoreError::Invalid(
+            "graph workspace must not have surrounding whitespace".to_owned(),
         ));
     }
     Ok(())
@@ -1590,6 +2235,64 @@ fn validate_fact_filters(filters: &FactFilters) -> Result<(), StoreError> {
         }
     }
     Ok(())
+}
+
+fn validate_entity_spec(spec: &EntitySpec) -> Result<(), StoreError> {
+    validate_graph_workspace(&spec.workspace)?;
+    if spec.name.trim().is_empty() {
+        return Err(StoreError::Invalid(
+            "entity name must not be empty".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_relation_spec(spec: &RelationSpec) -> Result<(), StoreError> {
+    validate_graph_workspace(&spec.workspace)?;
+    for (value, label) in [
+        (&spec.subject, "relation subject"),
+        (&spec.predicate, "relation predicate"),
+        (&spec.object, "relation object"),
+    ] {
+        if value.trim().is_empty() {
+            return Err(StoreError::Invalid(format!("{label} must not be empty")));
+        }
+    }
+    if spec.source_fact_id.is_some_and(|id| id <= 0) {
+        return Err(StoreError::Invalid(
+            "relation source fact id must be positive".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_decision_spec(spec: &DecisionSpec) -> Result<(), StoreError> {
+    validate_graph_workspace(&spec.workspace)?;
+    for (value, label) in [
+        (&spec.subject, "decision subject"),
+        (&spec.scenario, "decision scenario"),
+        (&spec.outcome, "decision outcome"),
+    ] {
+        if value.trim().is_empty() {
+            return Err(StoreError::Invalid(format!("{label} must not be empty")));
+        }
+    }
+    if spec
+        .confidence
+        .is_some_and(|confidence| !confidence.is_finite() || !(0.0..=1.0).contains(&confidence))
+    {
+        return Err(StoreError::Invalid(
+            "decision confidence must be between 0 and 1".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_name(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 fn validate_event_spec(spec: &EventSpec) -> Result<(), StoreError> {
@@ -2024,6 +2727,125 @@ mod tests {
     }
 
     #[test]
+    fn graph_and_decision_queries_preserve_workspace_scope_and_parentage() {
+        let store = Store::in_memory().expect("fresh store");
+        let fact = store
+            .remember_fact("Graph source fact", "workspace-a")
+            .expect("source fact");
+        let rust = store
+            .remember_entity(&EntitySpec {
+                name: "Rust".to_owned(),
+                entity_type: "language".to_owned(),
+                aliases: vec!["rust-lang".to_owned()],
+                workspace: "workspace-a".to_owned(),
+            })
+            .expect("rust entity");
+        let sqlite = store
+            .remember_entity(&EntitySpec {
+                name: "SQLite".to_owned(),
+                entity_type: "database".to_owned(),
+                aliases: Vec::new(),
+                workspace: "workspace-a".to_owned(),
+            })
+            .expect("sqlite entity");
+        assert_eq!(
+            store
+                .remember_entity(&EntitySpec {
+                    name: "Rust".to_owned(),
+                    entity_type: "different".to_owned(),
+                    aliases: Vec::new(),
+                    workspace: "workspace-a".to_owned(),
+                })
+                .unwrap(),
+            rust
+        );
+        let relation = store
+            .remember_relation(&RelationSpec {
+                subject: "Rust".to_owned(),
+                predicate: "uses".to_owned(),
+                object: "SQLite".to_owned(),
+                source_fact_id: Some(fact.id),
+                workspace: "workspace-a".to_owned(),
+            })
+            .expect("relation");
+        assert_eq!(relation.subject_id, rust.id);
+        assert_eq!(relation.object_id, sqlite.id);
+        let graph = store.search_graph("rust", "workspace-a").unwrap();
+        assert_eq!(graph.entities.len(), 1);
+        assert_eq!(graph.relations, vec![relation]);
+        assert!(store
+            .search_graph("rust", "workspace-b")
+            .unwrap()
+            .entities
+            .is_empty());
+
+        let root = store
+            .record_decision(&DecisionSpec {
+                category: "storage".to_owned(),
+                subject: "memory".to_owned(),
+                scenario: "fallback".to_owned(),
+                reasoning: "avoid external dependency".to_owned(),
+                outcome: "SQLite".to_owned(),
+                confidence: Some(0.9),
+                decision_maker: "agent".to_owned(),
+                issue_ref: "NTL-722".to_owned(),
+                path: "src/store.rs".to_owned(),
+                symbol: "Store".to_owned(),
+                parent_id: None,
+                workspace: "workspace-a".to_owned(),
+            })
+            .expect("root decision");
+        let child = store
+            .record_decision(&DecisionSpec {
+                category: "storage".to_owned(),
+                subject: "memory".to_owned(),
+                scenario: "fallback".to_owned(),
+                reasoning: "follow-up".to_owned(),
+                outcome: "SQLite with FTS5".to_owned(),
+                confidence: Some(0.8),
+                decision_maker: "agent".to_owned(),
+                issue_ref: "NTL-722".to_owned(),
+                path: String::new(),
+                symbol: String::new(),
+                parent_id: Some(root.id),
+                workspace: "workspace-a".to_owned(),
+            })
+            .expect("child decision");
+        store
+            .record_decision(&DecisionSpec {
+                category: "storage".to_owned(),
+                subject: "memory".to_owned(),
+                scenario: "fallback".to_owned(),
+                reasoning: "alternative".to_owned(),
+                outcome: "Redis".to_owned(),
+                confidence: Some(0.2),
+                decision_maker: "reviewer".to_owned(),
+                issue_ref: String::new(),
+                path: String::new(),
+                symbol: String::new(),
+                parent_id: None,
+                workspace: "workspace-a".to_owned(),
+            })
+            .expect("conflicting decision");
+        assert_eq!(
+            store.causal_chain(child.id, "workspace-a").unwrap().len(),
+            2
+        );
+        let conflicts = store
+            .detect_conflicts("fallback", "workspace-a")
+            .expect("conflict query");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(
+            conflicts[0].outcomes,
+            vec!["SQLite", "SQLite with FTS5", "Redis"]
+        );
+        assert!(store
+            .query_decisions("fallback", "workspace-b")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn legacy_facts_table_is_upgraded_before_serving_calls() {
         let path =
             std::env::temp_dir().join(format!("memory-mcp-rust-legacy-{}.db", std::process::id()));
@@ -2071,6 +2893,33 @@ mod tests {
                     INSERT INTO contexts
                         (ref, name, content, sha256, workspace_id)
                     VALUES ('legacy-ctx', 'Legacy', 'old context', 'legacy-hash', 'legacy');
+                    CREATE TABLE entities (
+                        id INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        workspace_id TEXT NOT NULL
+                    );
+                    INSERT INTO entities (name, workspace_id)
+                    VALUES ('Legacy Entity', 'legacy');
+                    CREATE TABLE relations (
+                        id INTEGER PRIMARY KEY,
+                        subject_id INTEGER NOT NULL,
+                        predicate TEXT NOT NULL,
+                        object_id INTEGER NOT NULL,
+                        workspace_id TEXT NOT NULL
+                    );
+                    INSERT INTO relations
+                        (subject_id, predicate, object_id, workspace_id)
+                    VALUES (1, 'references', 1, 'legacy');
+                    CREATE TABLE decisions (
+                        id INTEGER PRIMARY KEY,
+                        subject TEXT NOT NULL,
+                        scenario TEXT NOT NULL,
+                        outcome TEXT NOT NULL,
+                        workspace_id TEXT NOT NULL
+                    );
+                    INSERT INTO decisions
+                        (subject, scenario, outcome, workspace_id)
+                    VALUES ('legacy subject', 'legacy scenario', 'legacy outcome', 'legacy');
                     CREATE TABLE lifecycle_events (
                         id INTEGER PRIMARY KEY,
                         idempotency_key TEXT NOT NULL,
@@ -2105,6 +2954,15 @@ mod tests {
         assert!(store.context_map(None, "legacy").unwrap().is_empty());
         assert_eq!(store.list_events("legacy").unwrap().len(), 1);
         assert_eq!(store.list_handoffs("legacy").unwrap().len(), 1);
+        assert_eq!(
+            store
+                .search_graph("legacy", "legacy")
+                .unwrap()
+                .entities
+                .len(),
+            1
+        );
+        assert_eq!(store.query_decisions("legacy", "legacy").unwrap().len(), 1);
         let _ = fs::remove_file(path);
     }
 }

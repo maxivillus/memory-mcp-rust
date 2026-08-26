@@ -261,3 +261,20 @@ The fifth implementation slice exposes the existing fact metadata columns:
 - the protocol advertises schemas for the implemented metadata/filter tools,
   and tests cover metadata round trips, deduplication, filter isolation, and
   deliberate corruption detection.
+
+The sixth implementation slice adds workspace-scoped graph and decision
+storage:
+
+- remember_entity canonicalizes names and preserves aliases;
+- remember_relation resolves entity references, deduplicates edges, and can
+  retain a source fact id;
+- search_graph returns matching entities and their matching relations;
+- record_decision retains category, reasoning, confidence, issue/code anchors,
+  and an optional parent decision;
+- query_decisions and find_precedents use the SQLite FTS5 index with a
+  deterministic fallback, get_causal_chain walks parentage, and
+  detect_conflicts groups distinct outcomes for the same subject/scenario.
+
+The remaining provenance/evidence attachment, export, database management,
+measurement, feedback, and advanced retrieval tools remain staged. No Redis
+or embedding implementation is claimed.

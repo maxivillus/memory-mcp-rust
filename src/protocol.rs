@@ -1,5 +1,6 @@
 use crate::store::{
-    ContextMetadata, EventSpec, FactFilters, FactMetadata, HandoffSpec, Store, StoreError,
+    ContextMetadata, DecisionSpec, EntitySpec, EventSpec, FactFilters, FactMetadata, HandoffSpec,
+    RelationSpec, Store, StoreError,
 };
 use crate::tools;
 use serde_json::{json, Map, Value};
@@ -428,6 +429,107 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
             )
             .expect("cancelled handoff serializes")
         }
+        "remember_entity" => {
+            let name = required_string(arguments, "name")?;
+            let entity_type = optional_string(arguments, "type")?
+                .or(optional_string(arguments, "entity_type")?)
+                .unwrap_or("");
+            let aliases = optional_string_array(arguments, "aliases")?.unwrap_or_default();
+            let spec = EntitySpec {
+                name: name.to_owned(),
+                entity_type: entity_type.to_owned(),
+                aliases,
+                workspace: workspace.to_owned(),
+            };
+            serde_json::to_value(store.remember_entity(&spec).map_err(CallError::Execution)?)
+                .expect("entity serializes")
+        }
+        "remember_relation" => {
+            let subject = required_string(arguments, "subject")?;
+            let predicate = required_string(arguments, "predicate")?;
+            let object = required_string(arguments, "object")?;
+            let source_fact_id = optional_i64(arguments, &["source_fact_id", "fact_id"])?;
+            let spec = RelationSpec {
+                subject: subject.to_owned(),
+                predicate: predicate.to_owned(),
+                object: object.to_owned(),
+                source_fact_id,
+                workspace: workspace.to_owned(),
+            };
+            serde_json::to_value(
+                store
+                    .remember_relation(&spec)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("relation serializes")
+        }
+        "search_graph" => {
+            let query = required_string(arguments, "query")?;
+            serde_json::to_value(
+                store
+                    .search_graph(query, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("graph search serializes")
+        }
+        "record_decision" => {
+            let spec = DecisionSpec {
+                category: optional_string(arguments, "category")?
+                    .unwrap_or("")
+                    .to_owned(),
+                subject: required_string(arguments, "subject")?.to_owned(),
+                scenario: required_string(arguments, "scenario")?.to_owned(),
+                reasoning: optional_string(arguments, "reasoning")?
+                    .unwrap_or("")
+                    .to_owned(),
+                outcome: required_string(arguments, "outcome")?.to_owned(),
+                confidence: optional_f64(arguments, "confidence")?,
+                decision_maker: optional_string(arguments, "decision_maker")?
+                    .or(optional_string(arguments, "maker")?)
+                    .unwrap_or("")
+                    .to_owned(),
+                issue_ref: optional_string(arguments, "issue_ref")?
+                    .unwrap_or("")
+                    .to_owned(),
+                path: optional_string(arguments, "path")?.unwrap_or("").to_owned(),
+                symbol: optional_string(arguments, "symbol")?
+                    .unwrap_or("")
+                    .to_owned(),
+                parent_id: optional_i64(arguments, &["parent_id", "parent"])?,
+                workspace: workspace.to_owned(),
+            };
+            serde_json::to_value(store.record_decision(&spec).map_err(CallError::Execution)?)
+                .expect("decision serializes")
+        }
+        "query_decisions" | "find_precedents" => {
+            let query = required_string(arguments, "query")?;
+            let decisions = if name == "query_decisions" {
+                store.query_decisions(query, workspace)
+            } else {
+                store.find_precedents(query, workspace)
+            }
+            .map_err(CallError::Execution)?;
+            serde_json::to_value(decisions).expect("decisions serialize")
+        }
+        "get_causal_chain" => {
+            let id = required_i64(arguments, "id")
+                .or_else(|_| required_i64(arguments, "decision_id"))?;
+            serde_json::to_value(
+                store
+                    .causal_chain(id, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("causal chain serializes")
+        }
+        "detect_conflicts" => {
+            let query = required_string(arguments, "query")?;
+            serde_json::to_value(
+                store
+                    .detect_conflicts(query, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("decision conflicts serialize")
+        }
         "create_workspace" => {
             let id = workspace_argument(arguments)?;
             serde_json::to_value(store.create_workspace(id).map_err(CallError::Execution)?)
@@ -478,6 +580,27 @@ fn optional_string<'a>(
             CallError::InvalidParams(format!("tool argument {key} must be a string"))
         }),
     }
+}
+
+fn optional_string_array(
+    arguments: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<Vec<String>>, CallError> {
+    let Some(value) = arguments.get(key) else {
+        return Ok(None);
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| CallError::InvalidParams(format!("tool argument {key} must be an array")))?;
+    values
+        .iter()
+        .map(|value| {
+            value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                CallError::InvalidParams(format!("tool argument {key} must contain strings"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 fn required_string_array(
@@ -847,5 +970,48 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("\"valid\":true"));
+    }
+
+    #[test]
+    fn graph_and_decision_tools_are_reachable_through_stdio_dispatch() {
+        let store = Store::in_memory().unwrap();
+        for request in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"remember_entity","arguments":{"name":"Rust","type":"language","workspace":"w"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"remember_entity","arguments":{"name":"SQLite","type":"database","workspace":"w"}}}"#,
+        ] {
+            let response = handle_line(request, &store).unwrap();
+            assert!(!response["result"]["isError"].as_bool().unwrap());
+        }
+        let relation = handle_line(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"remember_relation","arguments":{"subject":"Rust","predicate":"uses","object":"SQLite","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(!relation["result"]["isError"].as_bool().unwrap());
+        let graph = handle_line(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"search_graph","arguments":{"query":"rust","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(graph["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"uses\""));
+
+        let root = handle_line(
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"record_decision","arguments":{"subject":"memory","scenario":"fallback","outcome":"SQLite","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(!root["result"]["isError"].as_bool().unwrap());
+        let query = handle_line(
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"query_decisions","arguments":{"query":"fallback","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(query["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"outcome\":\"SQLite\""));
     }
 }
