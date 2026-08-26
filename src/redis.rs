@@ -282,8 +282,9 @@ impl RedisEndpoint {
             None => (None, None),
             Some(credentials) => {
                 let (username, password) = credentials.split_once(':').unwrap_or(("", credentials));
+                let username = percent_decode(username)?;
                 (
-                    Some(percent_decode(username)?),
+                    (!username.is_empty()).then_some(username),
                     Some(percent_decode(password)?),
                 )
             }
@@ -375,12 +376,7 @@ impl RedisConnection {
                     stream.set_read_timeout(Some(REDIS_TIMEOUT))?;
                     stream.set_write_timeout(Some(REDIS_TIMEOUT))?;
                     let mut connection = Self { stream };
-                    if let Some(password) = endpoint.password.as_deref() {
-                        let mut command = vec![b"AUTH".to_vec()];
-                        if let Some(username) = endpoint.username.as_deref() {
-                            command.push(username.as_bytes().to_vec());
-                        }
-                        command.push(password.as_bytes().to_vec());
+                    if let Some(command) = auth_command(endpoint) {
                         connection.command(command)?;
                     }
                     if endpoint.database != 0 {
@@ -415,6 +411,17 @@ impl RedisConnection {
         }
         Ok(response)
     }
+}
+
+fn auth_command(endpoint: &RedisEndpoint) -> Option<Vec<Vec<u8>>> {
+    endpoint.password.as_ref().map(|password| {
+        let mut command = vec![b"AUTH".to_vec()];
+        if let Some(username) = endpoint.username.as_deref() {
+            command.push(username.as_bytes().to_vec());
+        }
+        command.push(password.as_bytes().to_vec());
+        command
+    })
 }
 
 enum RespValue {
@@ -559,6 +566,21 @@ mod tests {
         assert_eq!(endpoint.database, 3);
         assert_eq!(endpoint.username.as_deref(), Some("user"));
         assert_eq!(endpoint.password.as_deref(), Some("p@ss"));
+
+        let password_only = RedisEndpoint::parse("redis://:secret@localhost:6379/0").unwrap();
+        assert_eq!(password_only.username, None);
+        assert_eq!(password_only.password.as_deref(), Some("secret"));
+        assert_eq!(
+            auth_command(&password_only),
+            Some(vec![b"AUTH".to_vec(), b"secret".to_vec()])
+        );
+
+        let named = RedisEndpoint::parse("redis://user:secret@localhost").unwrap();
+        assert_eq!(
+            auth_command(&named),
+            Some(vec![b"AUTH".to_vec(), b"user".to_vec(), b"secret".to_vec()])
+        );
+
         assert!(RedisEndpoint::parse("https://localhost").is_err());
         assert!(RedisEndpoint::parse("redis://localhost/not-a-db").is_err());
     }

@@ -408,9 +408,10 @@ optional Redis core-fact adapter:
 - memory-bench measures the same persistent-connection workload against
   SQLite, and can run the corresponding namespaced fact workload against a
   configured Redis endpoint;
-- the Redis adapter uses a persistent RESP2 connection, optional AUTH/database
-  selection, hashed workspace/fact keys, SET-NX deduplication, and deterministic
-  list/search/reset operations;
+- the Redis adapter uses a persistent RESP2 connection, supports password-only
+  and username/password AUTH plus optional database selection, hashed
+  workspace/fact keys, SET-NX deduplication, and deterministic list/search/reset
+  operations;
 - Redis configuration is optional: no URL, an invalid endpoint, or an
   unavailable service selects the SQLite fallback without exposing connection
   credentials;
