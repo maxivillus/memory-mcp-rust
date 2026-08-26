@@ -153,6 +153,32 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
             serde_json::to_value(store.list_facts(workspace).map_err(CallError::Execution)?)
                 .expect("facts serialize")
         }
+        "forget_fact" => {
+            let id =
+                required_i64(arguments, "id").or_else(|_| required_i64(arguments, "fact_id"))?;
+            serde_json::to_value(
+                store
+                    .forget_fact(id, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("forgotten fact serializes")
+        }
+        "restore_fact" => {
+            let id =
+                required_i64(arguments, "id").or_else(|_| required_i64(arguments, "fact_id"))?;
+            serde_json::to_value(
+                store
+                    .restore_fact(id, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("restored fact serializes")
+        }
+        "list_forgotten" => serde_json::to_value(
+            store
+                .list_forgotten(workspace)
+                .map_err(CallError::Execution)?,
+        )
+        .expect("forgotten facts serialize"),
         "put_context" => {
             let reference = required_string(arguments, "ref")
                 .or_else(|_| required_string(arguments, "reference"))?;
@@ -181,6 +207,25 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
                 .map_err(CallError::Execution)?,
         )
         .expect("contexts serialize"),
+        "create_workspace" => {
+            let id = workspace_argument(arguments)?;
+            serde_json::to_value(store.create_workspace(id).map_err(CallError::Execution)?)
+                .expect("workspace serializes")
+        }
+        "list_workspaces" => {
+            serde_json::to_value(store.list_workspaces().map_err(CallError::Execution)?)
+                .expect("workspaces serialize")
+        }
+        "archive_workspace" => {
+            let id = workspace_argument(arguments)?;
+            serde_json::to_value(store.archive_workspace(id).map_err(CallError::Execution)?)
+                .expect("workspace serializes")
+        }
+        "reset_workspace" => {
+            let id = workspace_argument(arguments)?;
+            serde_json::to_value(store.reset_workspace(id).map_err(CallError::Execution)?)
+                .expect("workspace serializes")
+        }
         "stats" => serde_json::to_value(store.stats().map_err(CallError::Execution)?)
             .expect("stats serialize"),
         _ => {
@@ -200,6 +245,24 @@ fn required_string<'a>(arguments: &'a Map<String, Value>, key: &str) -> Result<&
         .get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| CallError::InvalidParams(format!("tool argument {key} must be a string")))
+}
+
+fn required_i64(arguments: &Map<String, Value>, key: &str) -> Result<i64, CallError> {
+    arguments
+        .get(key)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| CallError::InvalidParams(format!("tool argument {key} must be an integer")))
+}
+
+fn workspace_argument(arguments: &Map<String, Value>) -> Result<&str, CallError> {
+    ["workspace_id", "workspace", "name"]
+        .into_iter()
+        .find_map(|key| arguments.get(key).and_then(Value::as_str))
+        .ok_or_else(|| {
+            CallError::InvalidParams(
+                "workspace tool requires workspace_id, workspace, or name".to_owned(),
+            )
+        })
 }
 
 fn result_response(id: Value, result: Value) -> Value {
@@ -264,5 +327,44 @@ mod tests {
             -32601
         );
         assert!(handle_line(r#"{"jsonrpc":"2.0","method":"tools/list"}"#, &store).is_none());
+    }
+
+    #[test]
+    fn lifecycle_tools_are_reachable_through_stdio_dispatch() {
+        let store = Store::in_memory().unwrap();
+        let workspace = handle_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_workspace","arguments":{"workspace_id":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(workspace["result"]["isError"], false);
+
+        let remember = handle_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"remember_fact","arguments":{"text":"retained","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let id = serde_json::from_str::<Value>(
+            remember["result"]["content"][0]["text"].as_str().unwrap(),
+        )
+        .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"forget_fact","arguments":{{"id":{id},"workspace":"w"}}}}}}"#
+        );
+        let forgotten = handle_line(&request, &store).unwrap();
+        let forgotten_text = forgotten["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(forgotten_text.contains("forgotten"));
+
+        let listed = handle_line(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_forgotten","arguments":{"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(listed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("forgotten"));
     }
 }

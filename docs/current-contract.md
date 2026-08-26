@@ -201,3 +201,11 @@ upgrade fixture, and an 80-name inventory gate. The generic entries returned by
 `tools/list` intentionally mark per-tool schema/handler parity as incremental;
 the pinned upstream descriptions and input schemas remain the acceptance source
 for the subsequent port stages.
+
+The second implementation slice adds SQLite-backed fact lifecycle operations
+(`forget_fact`, `restore_fact`, and `list_forgotten`) plus workspace lifecycle
+operations (`create_workspace`, `list_workspaces`, `archive_workspace`, and
+`reset_workspace`). Forgotten facts are excluded from normal list/search results,
+and reset deletes only the selected workspace's facts and contexts. Redis remains
+out of scope until the SQLite behavior is measured and the parity surface is
+complete enough for a meaningful adapter comparison.

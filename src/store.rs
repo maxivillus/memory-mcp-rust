@@ -43,6 +43,7 @@ pub struct Fact {
     pub text: String,
     pub sha256: String,
     pub workspace: String,
+    pub lifecycle: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -58,6 +59,12 @@ pub struct Context {
 pub struct Stats {
     pub facts: i64,
     pub contexts: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Workspace {
+    pub id: String,
+    pub status: String,
 }
 
 pub struct Store {
@@ -115,6 +122,13 @@ impl Store {
                 sha256 TEXT NOT NULL,
                 workspace_id TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS workspaces (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'active'
+                    CHECK (status IN ('active', 'archived', 'reset')),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );",
         )?;
 
@@ -191,10 +205,12 @@ impl Store {
             .collect::<Vec<_>>()
             .join(" AND ");
         let mut statement = self.connection.prepare(
-            "SELECT f.id, f.text, f.sha256, f.workspace_id
+            "SELECT f.id, f.text, f.sha256, f.workspace_id, f.lifecycle
              FROM facts_fts
              JOIN facts f ON f.id = facts_fts.rowid
-             WHERE facts_fts MATCH ?1 AND (f.workspace_id = '' OR f.workspace_id = ?2)
+             WHERE facts_fts MATCH ?1
+               AND (f.workspace_id = '' OR f.workspace_id = ?2)
+               AND f.lifecycle != 'forgotten'
              ORDER BY f.id",
         )?;
         let rows = statement
@@ -206,8 +222,10 @@ impl Store {
 
         let like = format!("%{}%", query);
         let mut fallback = self.connection.prepare(
-            "SELECT id, text, sha256, workspace_id FROM facts
-             WHERE text LIKE ?1 AND (workspace_id = '' OR workspace_id = ?2)
+            "SELECT id, text, sha256, workspace_id, lifecycle FROM facts
+             WHERE text LIKE ?1
+               AND (workspace_id = '' OR workspace_id = ?2)
+               AND lifecycle != 'forgotten'
              ORDER BY id",
         )?;
         let rows = fallback
@@ -218,8 +236,10 @@ impl Store {
 
     pub fn list_facts(&self, workspace: &str) -> Result<Vec<Fact>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, text, sha256, workspace_id FROM facts
-             WHERE workspace_id = '' OR workspace_id = ?1 ORDER BY id",
+            "SELECT id, text, sha256, workspace_id, lifecycle FROM facts
+             WHERE (workspace_id = '' OR workspace_id = ?1)
+               AND lifecycle != 'forgotten'
+             ORDER BY id",
         )?;
         let rows = statement
             .query_map(params![workspace], map_fact)?
@@ -286,13 +306,122 @@ impl Store {
         Ok(Stats { facts, contexts })
     }
 
+    pub fn forget_fact(&self, id: i64, workspace: &str) -> Result<Option<Fact>, StoreError> {
+        self.update_fact_lifecycle(id, workspace, "forgotten")
+    }
+
+    pub fn restore_fact(&self, id: i64, workspace: &str) -> Result<Option<Fact>, StoreError> {
+        self.update_fact_lifecycle(id, workspace, "active")
+    }
+
+    pub fn list_forgotten(&self, workspace: &str) -> Result<Vec<Fact>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, text, sha256, workspace_id, lifecycle FROM facts
+             WHERE (workspace_id = '' OR workspace_id = ?1)
+               AND lifecycle = 'forgotten'
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![workspace], map_fact)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn create_workspace(&self, id: &str) -> Result<Workspace, StoreError> {
+        validate_workspace(id)?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO workspaces (id) VALUES (?1)",
+            params![id],
+        )?;
+        self.workspace_by_id(id)?.ok_or_else(|| {
+            StoreError::Invalid("workspace insert did not produce a readable row".to_owned())
+        })
+    }
+
+    pub fn list_workspaces(&self) -> Result<Vec<Workspace>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, status FROM workspaces ORDER BY id")?;
+        let rows = statement
+            .query_map([], map_workspace)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn archive_workspace(&self, id: &str) -> Result<Option<Workspace>, StoreError> {
+        validate_workspace(id)?;
+        self.connection.execute(
+            "UPDATE workspaces
+             SET status = 'archived', updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1",
+            params![id],
+        )?;
+        self.workspace_by_id(id)
+    }
+
+    pub fn reset_workspace(&self, id: &str) -> Result<Workspace, StoreError> {
+        validate_workspace(id)?;
+        self.connection
+            .execute("DELETE FROM facts WHERE workspace_id = ?1", params![id])?;
+        self.connection
+            .execute("DELETE FROM contexts WHERE workspace_id = ?1", params![id])?;
+        self.connection.execute(
+            "INSERT INTO workspaces (id, status, updated_at) VALUES (?1, 'reset', CURRENT_TIMESTAMP)
+             ON CONFLICT(id) DO UPDATE SET status = 'reset', updated_at = CURRENT_TIMESTAMP",
+            params![id],
+        )?;
+        self.workspace_by_id(id)?.ok_or_else(|| {
+            StoreError::Invalid("workspace reset did not produce a readable row".to_owned())
+        })
+    }
+
+    fn update_fact_lifecycle(
+        &self,
+        id: i64,
+        workspace: &str,
+        lifecycle: &str,
+    ) -> Result<Option<Fact>, StoreError> {
+        if id <= 0 {
+            return Err(StoreError::Invalid("fact id must be positive".to_owned()));
+        }
+        self.connection.execute(
+            "UPDATE facts SET lifecycle = ?1
+             WHERE id = ?2 AND (workspace_id = '' OR workspace_id = ?3)",
+            params![lifecycle, id, workspace],
+        )?;
+        self.fact_by_id(id, workspace)
+    }
+
     fn fact_by_hash(&self, hash: &str, workspace: &str) -> Result<Option<Fact>, StoreError> {
         self.connection
             .query_row(
-                "SELECT id, text, sha256, workspace_id FROM facts
+                "SELECT id, text, sha256, workspace_id, lifecycle FROM facts
                  WHERE sha256 = ?1 AND workspace_id = ?2",
                 params![hash, workspace],
                 map_fact,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn fact_by_id(&self, id: i64, workspace: &str) -> Result<Option<Fact>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, text, sha256, workspace_id, lifecycle FROM facts
+                 WHERE id = ?1 AND (workspace_id = '' OR workspace_id = ?2)",
+                params![id, workspace],
+                map_fact,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn workspace_by_id(&self, id: &str) -> Result<Option<Workspace>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, status FROM workspaces WHERE id = ?1",
+                params![id],
+                map_workspace,
             )
             .optional()
             .map_err(StoreError::from)
@@ -315,7 +444,24 @@ fn map_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Fact> {
         text: row.get(1)?,
         sha256: row.get(2)?,
         workspace: row.get(3)?,
+        lifecycle: row.get(4)?,
     })
+}
+
+fn map_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspace> {
+    Ok(Workspace {
+        id: row.get(0)?,
+        status: row.get(1)?,
+    })
+}
+
+fn validate_workspace(id: &str) -> Result<(), StoreError> {
+    if id.trim().is_empty() {
+        return Err(StoreError::Invalid(
+            "workspace id must not be empty".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn map_context(row: &rusqlite::Row<'_>) -> rusqlite::Result<Context> {
@@ -364,6 +510,63 @@ mod tests {
                 contexts: 1
             }
         );
+    }
+
+    #[test]
+    fn fact_and_workspace_lifecycle_preserve_isolation() {
+        let store = Store::in_memory().expect("fresh store");
+        assert_eq!(
+            store.create_workspace("workspace-a").unwrap(),
+            Workspace {
+                id: "workspace-a".to_owned(),
+                status: "active".to_owned()
+            }
+        );
+        store.create_workspace("workspace-b").unwrap();
+        let fact_a = store.remember_fact("fact in a", "workspace-a").unwrap();
+        let fact_b = store.remember_fact("fact in b", "workspace-b").unwrap();
+
+        let forgotten = store
+            .forget_fact(fact_a.id, "workspace-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(forgotten.lifecycle, "forgotten");
+        assert!(store
+            .search_facts("fact", "workspace-a")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.list_forgotten("workspace-a").unwrap(),
+            vec![forgotten]
+        );
+        assert_eq!(
+            store.list_facts("workspace-b").unwrap(),
+            vec![fact_b.clone()]
+        );
+
+        let restored = store
+            .restore_fact(fact_a.id, "workspace-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.lifecycle, "active");
+        assert_eq!(store.list_facts("workspace-a").unwrap(), vec![restored]);
+
+        assert_eq!(
+            store.archive_workspace("workspace-a").unwrap(),
+            Some(Workspace {
+                id: "workspace-a".to_owned(),
+                status: "archived".to_owned()
+            })
+        );
+        store
+            .put_context("ctx-a", "A", "workspace a", "workspace-a")
+            .unwrap();
+        let reset = store.reset_workspace("workspace-a").unwrap();
+        assert_eq!(reset.status, "reset");
+        assert!(store.list_facts("workspace-a").unwrap().is_empty());
+        assert!(store.list_contexts("workspace-a").unwrap().is_empty());
+        assert_eq!(store.list_facts("workspace-b").unwrap(), vec![fact_b]);
+        assert_eq!(store.list_workspaces().unwrap().len(), 2);
     }
 
     #[test]
