@@ -283,13 +283,14 @@ impl CoordinatorInner {
         result
     }
 
-    fn publish_local_state(&mut self) -> Result<(), RedisError> {
+    fn publish_local_state(&mut self, idempotency_keys: &[&str]) -> Result<(), RedisError> {
         let snapshot = self.store.snapshot_bytes().map_err(store_redis_error)?;
         let adapter = self
             .redis
             .as_ref()
             .ok_or_else(|| RedisError::Protocol("Redis connection is not available".to_owned()))?;
-        self.revision = adapter.publish_state(self.revision, &snapshot)?;
+        self.revision =
+            adapter.publish_state_with_operations(self.revision, &snapshot, idempotency_keys)?;
         self.last_remote_revision = Some(self.revision);
         Ok(())
     }
@@ -302,6 +303,16 @@ impl CoordinatorInner {
         let mut applied = Vec::new();
         let mut rejected: Vec<(OutboxEntry, &'static str)> = Vec::new();
         for entry in pending.iter().take(MAX_REPLAY_BATCH) {
+            let already_applied = self
+                .redis
+                .as_ref()
+                .ok_or_else(|| StoreError::Invalid("Redis connection is not available".to_owned()))?
+                .operation_applied(&entry.idempotency_key)
+                .map_err(redis_store_error)?;
+            if already_applied {
+                rejected.push((entry.clone(), "already_committed_in_redis"));
+                continue;
+            }
             let Some(arguments) = entry.arguments.as_object() else {
                 rejected.push((entry.clone(), "invalid_arguments"));
                 continue;
@@ -316,7 +327,11 @@ impl CoordinatorInner {
         }
 
         if !applied.is_empty() {
-            match self.publish_local_state() {
+            let operation_keys = applied
+                .iter()
+                .map(|entry| entry.idempotency_key.as_str())
+                .collect::<Vec<_>>();
+            match self.publish_local_state(&operation_keys) {
                 Ok(()) => {}
                 Err(RedisError::Conflict { .. }) => {
                     self.sync_from_redis_current()?;
@@ -495,11 +510,11 @@ impl BackendCoordinator {
         match result {
             Ok(value) => {
                 if tools::is_state_mutating(name) && inner.mode == BackendKind::Redis {
-                    match inner.publish_local_state() {
+                    let key = outbox_key
+                        .as_deref()
+                        .expect("state mutation has an outbox key");
+                    match inner.publish_local_state(&[key]) {
                         Ok(()) => {
-                            let key = outbox_key
-                                .as_deref()
-                                .expect("state mutation has an outbox key");
                             inner
                                 .outbox
                                 .complete(key)
@@ -758,6 +773,62 @@ mod tests {
     }
 
     #[test]
+    fn recovery_skips_outbox_entry_when_redis_marker_already_exists() {
+        let database = test_database_path();
+        let source = Store::open(&database).expect("source store");
+        source
+            .remember_fact("already committed", "w")
+            .expect("source fact");
+        let snapshot = source.snapshot_bytes().expect("source snapshot");
+        drop(source);
+
+        let arguments = json!({"text": "already committed", "workspace": "w"});
+        let idempotency_key =
+            operation_key("remember_fact", arguments.as_object().unwrap()).expect("operation key");
+        let values = Arc::new(Mutex::new(HashMap::from([
+            (
+                b"coordinator-marker-test:state:revision".to_vec(),
+                b"1".to_vec(),
+            ),
+            (b"coordinator-marker-test:state:snapshot".to_vec(), snapshot),
+            (
+                format!("coordinator-marker-test:operation:{idempotency_key}").into_bytes(),
+                b"1".to_vec(),
+            ),
+        ])));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server_values = Arc::clone(&values);
+        let server = thread::spawn(move || run_snapshot_redis(listener, server_values, None));
+        let adapter =
+            RedisAdapter::connect(&format!("redis://{address}"), "coordinator-marker-test")
+                .expect("Redis adapter");
+        let mut inner = CoordinatorInner::new(&database, true).expect("coordinator state");
+        inner
+            .outbox
+            .append_pending(OutboxEntry {
+                idempotency_key,
+                name: "remember_fact".to_owned(),
+                arguments,
+            })
+            .expect("pending outbox entry");
+
+        inner.attach_redis(adapter).expect("reconcile marked entry");
+        assert!(inner.outbox.pending().expect("pending entries").is_empty());
+        let audit = fs::read_to_string(&inner.outbox.audit_path).expect("reconciliation audit");
+        assert!(audit.contains("already_committed_in_redis"));
+        assert!(!audit.contains("already committed"));
+
+        drop(inner);
+        server.join().expect("Redis fixture");
+        let _ = fs::remove_file(database.with_extension("outbox.jsonl"));
+        let _ = fs::remove_file(database.with_extension("reconciliation.jsonl"));
+        let _ = fs::remove_file(database.with_extension("db-wal"));
+        let _ = fs::remove_file(database.with_extension("db-shm"));
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
     fn sqlite_coordinator_routes_mutations_through_durable_store() {
         let database = test_database_path();
         let coordinator = BackendCoordinator {
@@ -879,7 +950,7 @@ mod tests {
         let first_address = first_listener.local_addr().expect("first address");
         let first_values = Arc::clone(&values);
         let first_server = thread::spawn(move || {
-            run_snapshot_redis(first_listener, first_values, Some(17));
+            run_snapshot_redis(first_listener, first_values, Some(18));
         });
         let adapter = RedisAdapter::connect(
             &format!("redis://{first_address}"),
@@ -997,6 +1068,7 @@ mod tests {
                 }
                 b"EXEC" => {
                     let queued = transaction.take().unwrap_or_default();
+                    let result_count = queued.len();
                     let mut revision = 0;
                     for command in queued {
                         match command[0].as_slice() {
@@ -1025,8 +1097,11 @@ mod tests {
                         }
                     }
                     stream
-                        .write_all(format!("*2\r\n+OK\r\n:{revision}\r\n").as_bytes())
+                        .write_all(format!("*{result_count}\r\n+OK\r\n:{revision}\r\n").as_bytes())
                         .expect("EXEC response");
+                    for _ in 2..result_count {
+                        write_simple(&mut stream, b"OK");
+                    }
                 }
                 b"GET" => {
                     let values = shared_values.lock().expect("Redis values");

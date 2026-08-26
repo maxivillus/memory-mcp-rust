@@ -13,6 +13,7 @@ const MAX_RESP_LINE_BYTES: usize = 64 * 1024;
 const MAX_RESP_BULK_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RESP_DEPTH: usize = 16;
 const MAX_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
+const IDEMPOTENCY_MARKER_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Debug)]
 pub enum RedisError {
@@ -153,6 +154,20 @@ impl RedisAdapter {
         Ok(Some(value))
     }
 
+    /// Check whether a stateful operation was already committed by Redis.
+    /// Markers are hashes rather than caller payloads and expire after the
+    /// bounded duplicate-replay detection window.
+    pub fn operation_applied(&self, idempotency_key: &str) -> Result<bool, RedisError> {
+        validate_operation_key(idempotency_key)?;
+        Ok(self
+            .command(vec![
+                b"GET".to_vec(),
+                self.operation_marker_key(idempotency_key).into_bytes(),
+            ])?
+            .into_bulk("GET")?
+            .is_some())
+    }
+
     /// Publish one complete state image after checking the last observed
     /// revision. Redis WATCH/MULTI/EXEC makes the check and write atomic with
     /// respect to other coordinators.
@@ -160,6 +175,18 @@ impl RedisAdapter {
         &self,
         expected_revision: u64,
         snapshot: &[u8],
+    ) -> Result<u64, RedisError> {
+        self.publish_state_with_operations(expected_revision, snapshot, &[])
+    }
+
+    /// Publish a state image and the operation markers that produced it in one
+    /// transaction. The marker TTL bounds Redis memory while covering the
+    /// intended short recovery window.
+    pub fn publish_state_with_operations(
+        &self,
+        expected_revision: u64,
+        snapshot: &[u8],
+        idempotency_keys: &[&str],
     ) -> Result<u64, RedisError> {
         if snapshot.is_empty() {
             return Err(RedisError::Invalid(
@@ -170,6 +197,9 @@ impl RedisAdapter {
             return Err(RedisError::Invalid(
                 "state snapshot exceeds the configured size limit".to_owned(),
             ));
+        }
+        for idempotency_key in idempotency_keys {
+            validate_operation_key(idempotency_key)?;
         }
         let watched = self.command(vec![
             b"WATCH".to_vec(),
@@ -212,6 +242,20 @@ impl RedisAdapter {
                 )));
             }
         }
+        for idempotency_key in idempotency_keys {
+            let queued = self.command(vec![
+                b"SET".to_vec(),
+                self.operation_marker_key(idempotency_key).into_bytes(),
+                b"1".to_vec(),
+                b"EX".to_vec(),
+                IDEMPOTENCY_MARKER_TTL_SECONDS.to_string().into_bytes(),
+            ])?;
+            if !matches!(queued, RespValue::Simple(value) if value == b"QUEUED") {
+                return Err(RedisError::Protocol(
+                    "idempotency marker was not queued in the Redis transaction".to_owned(),
+                ));
+            }
+        }
         let result = self.command(vec![b"EXEC".to_vec()])?;
         let mut values = match result {
             RespValue::Array(Some(values)) => values,
@@ -228,13 +272,16 @@ impl RedisAdapter {
                 ))
             }
         };
-        if values.len() != 2 {
+        if values.len() != 2 + idempotency_keys.len() {
             return Err(RedisError::Protocol(
                 "EXEC returned an unexpected result count".to_owned(),
             ));
         }
         let _stored = values.remove(0).into_simple("SET")?;
         let revision = values.remove(0).into_integer("INCR")?;
+        for _ in idempotency_keys {
+            values.remove(0).into_simple("idempotency marker SET")?;
+        }
         u64::try_from(revision)
             .map_err(|_| RedisError::Protocol("state revision overflowed".to_owned()))
     }
@@ -376,6 +423,10 @@ impl RedisAdapter {
         self.key("state:revision")
     }
 
+    fn operation_marker_key(&self, idempotency_key: &str) -> String {
+        self.key(&format!("operation:{idempotency_key}"))
+    }
+
     fn fact_key(&self, text: &str, workspace: &str) -> String {
         self.key(&format!("fact:{}:{}", digest(workspace), digest(text)))
     }
@@ -389,6 +440,16 @@ fn validate_namespace(namespace: &str) -> Result<(), RedisError> {
     {
         return Err(RedisError::Invalid(
             "namespace may contain only ASCII letters, digits, '.', '_', '-' or ':'".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_operation_key(idempotency_key: &str) -> Result<(), RedisError> {
+    if idempotency_key.len() != 64 || !idempotency_key.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(RedisError::Invalid(
+            "operation idempotency key must be a SHA-256 hex digest".to_owned(),
         ));
     }
     Ok(())
@@ -796,10 +857,18 @@ mod tests {
                     }
                     "EXEC" => {
                         let queued = transaction.take().unwrap_or_default();
+                        let result_count = queued.len();
                         let mut revision = None;
                         for arguments in queued {
                             match arguments[0].as_slice() {
                                 b"SET" => {
+                                    if arguments.len() == 5 {
+                                        assert_eq!(arguments[3], b"EX");
+                                        assert_eq!(
+                                            arguments[4],
+                                            IDEMPOTENCY_MARKER_TTL_SECONDS.to_string().into_bytes()
+                                        );
+                                    }
                                     values.insert(arguments[1].clone(), arguments[2].clone());
                                 }
                                 b"INCR" => {
@@ -819,7 +888,7 @@ mod tests {
                                 _ => {}
                             }
                         }
-                        write_exec_results(&mut stream, revision.unwrap_or(0));
+                        write_exec_results(&mut stream, revision.unwrap_or(0), result_count);
                     }
                     "GET" => write_bulk(&mut stream, values.get(&arguments[1])),
                     "INCR" => {
@@ -891,11 +960,24 @@ mod tests {
             adapter.state_snapshot().unwrap(),
             Some(b"sqlite-image".to_vec())
         );
+        let idempotency_key = "a".repeat(64);
+        assert!(!adapter.operation_applied(&idempotency_key).unwrap());
+        assert_eq!(
+            adapter
+                .publish_state_with_operations(1, b"next-image", &[&idempotency_key])
+                .unwrap(),
+            2
+        );
+        assert!(adapter.operation_applied(&idempotency_key).unwrap());
+        assert!(matches!(
+            adapter.operation_applied("not-a-digest"),
+            Err(RedisError::Invalid(_))
+        ));
         assert!(matches!(
             adapter.publish_state(0, b"new-image"),
             Err(RedisError::Conflict {
                 expected: 0,
-                actual: 1
+                actual: 2
             })
         ));
         drop(adapter);
@@ -942,10 +1024,12 @@ mod tests {
         }
     }
 
-    fn write_exec_results(stream: &mut TcpStream, revision: i64) {
-        stream.write_all(b"*2\r\n+OK\r\n").unwrap();
+    fn write_exec_results(stream: &mut TcpStream, revision: i64, result_count: usize) {
         stream
-            .write_all(format!(":{revision}\r\n").as_bytes())
+            .write_all(format!("*{result_count}\r\n+OK\r\n:{revision}\r\n").as_bytes())
             .unwrap();
+        for _ in 2..result_count {
+            write_simple(stream, b"OK");
+        }
     }
 }

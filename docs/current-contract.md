@@ -437,6 +437,10 @@ server through `BackendCoordinator`:
 - the coordinator selects Redis when its probe succeeds, otherwise serves the
   complete SQLite implementation, records degraded writes in a durable,
   idempotent JSONL outbox, and reconciles back with Redis priority;
+- each stateful Redis publish can atomically record the SHA-256 idempotency
+  marker(s) that produced the revision; recovery checks those markers before
+  replay and keeps them for a bounded seven-day duplicate-replay detection
+  window;
 - the watcher reads only the small revision key while the state is unchanged,
   fetches a snapshot only after a revision change, uses bounded backoff, and
   stops with the coordinator lifecycle;
@@ -444,10 +448,13 @@ server through `BackendCoordinator`:
   lag, and outbox counters.
 
 This is a correctness-first snapshot coordinator, not yet a claim of a native
-per-entity Redis schema or a performance win. The compatibility `Store` is
-deliberately retained as the materialized state needed for the full route;
-the direct `handle_line` API remains a SQLite fixture path, while the shipped
-stdio binary uses `handle_line_with_coordinator`.
+per-entity Redis schema or a performance win. The bounded marker protocol
+protects recovery from replaying a transaction whose response was lost, but it
+is not yet a complete per-entity operation ledger or conflict record. The
+compatibility `Store` is deliberately retained as the materialized state
+needed for the full route; the direct `handle_line` API remains a SQLite
+fixture path, while the shipped stdio binary uses
+`handle_line_with_coordinator`.
 
 ## Redis-first backend contract
 
@@ -469,6 +476,10 @@ policy above for the next implementation stages:
   non-conflicting outbox entries by idempotency key, gives Redis priority for
   conflicts, refreshes the SQLite standby, and switches normal traffic back to
   Redis only after the recovered state is durable;
+- the state publish and its operation marker(s) are one Redis transaction;
+  recovery treats an existing marker as already committed and removes the
+  corresponding outbox item without applying it a second time; markers expire
+  after seven days, so duplicate-replay protection is intentionally bounded;
 - a partial Redis route is not an acceptable intermediate claim: an operation
   must not silently use SQLite while Redis is the selected backend;
 - an acknowledged Redis write must be present in the Redis revision stream
@@ -493,8 +504,9 @@ claim that the snapshot coordinator is already a native Redis backend:
 
 1. replace the bounded snapshot transport with a workspace/database-isolated
    per-entity Redis schema while preserving the complete Store semantics;
-2. make Redis-side idempotency markers and conflict records durable across
-   reconnects, including the remaining operation groups and backup semantics;
+2. replace the bounded marker window with a durable per-entity operation ledger
+   and conflict records across reconnects, including backup semantics and
+   explicit handling after marker expiry;
 3. add migration, isolation, conflict, lag, backoff, clean-stop, and resource
    measurements against a real Redis service, not only the bounded RESP fixture;
 4. complete the formatter, test, lint, AppSec, artifact, QA, and PM gates and

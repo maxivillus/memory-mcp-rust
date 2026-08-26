@@ -40,9 +40,12 @@ measurements; they must not be folded into a Redis speedup percentage.
 The current coordinator implementation is a correctness-first Redis-primary
 snapshot path. A stateful operation serializes the complete bounded SQLite
 image into the namespaced Redis state key, so its network and Redis write cost
-must be measured separately from the existing core-fact benchmark. The local
-SQLite store is the materialized full-route engine and standby; this design
-does not provide evidence of native Redis per-entity performance.
+must be measured separately from the existing core-fact benchmark. It also
+queues one small idempotency-marker `SET ... EX` per stateful operation in the
+same transaction; the seven-day TTL bounds marker retention but does not remove
+the snapshot cost. The local SQLite store is the materialized full-route engine
+and standby; this design does not provide evidence of native Redis per-entity
+performance.
 
 The replication budget is part of the acceptance contract. The watcher uses a
 small revision/health read, fetches a state batch only after a revision change,

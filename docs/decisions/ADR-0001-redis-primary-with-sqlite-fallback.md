@@ -65,14 +65,17 @@ the local `Store` is the materialized execution engine and SQLite hot standby.
 Stateful calls append to a durable JSONL outbox before execution, publish a
 revision-checked snapshot with `WATCH`/`MULTI`/`EXEC` while Redis is primary,
 and replay bounded offline writes with Redis priority after recovery. The
-watcher reads the revision key only while state is unchanged and uses bounded
-backoff.
+publish transaction also writes a SHA-256 operation marker with a seven-day
+TTL. Recovery checks that marker before replay, which closes the response-loss
+window without retaining operation payloads. The watcher reads the revision key
+only while state is unchanged and uses bounded backoff.
 
 This checkpoint is intentionally correctness-first. It proves the route,
-snapshot durability, fallback, recovery, and bounded watcher behavior, but it
-does not claim a native per-entity Redis schema, complete Redis-side
-idempotency records, or production performance. Those remain acceptance work;
-the ADR status stays Proposed until PM/TechLead review.
+snapshot durability, fallback, recovery, bounded watcher behavior, and a
+bounded Redis marker for response-loss recovery, but it does not claim a native
+per-entity Redis schema, a complete operation ledger/conflict history, or
+production performance. Those remain acceptance work; the ADR status stays
+Proposed until PM/TechLead review.
 
 The implementation is staged behind a coverage gate:
 
