@@ -210,34 +210,40 @@ No performance claim is made by this baseline. Benchmarking starts after the
 SQLite parity slice is working, and Redis remains an optional measured adapter
 with deterministic SQLite fallback.
 
-## Rust parity slice status
+## Rust parity implementation status
 
-The first implementation slice now provides one stdio executable, bundled
-SQLite/FTS5 initialization, a fresh-store round trip, a legacy `facts`-table
-upgrade fixture, and an 80-name inventory gate. The generic entries returned by
-`tools/list` intentionally mark per-tool schema/handler parity as incremental;
-the pinned upstream descriptions and input schemas remain the acceptance source
-for the subsequent port stages.
+The current implementation provides one stdio executable, bundled SQLite/FTS5
+initialization, additive legacy-store upgrades, the pinned 80-tool descriptors,
+and concrete compatibility handlers for the full advertised contract. The
+provider/pipeline layer preserves the Python deployment's feature switches for
+extraction, embeddings, recall, verification, categorization, and LLM-backed
+operations; deterministic test providers are available for isolated checks.
 
 The deployment migration slice adds a copy-first SQLite migration command and
 two bounded launch checks. `scripts/memory-mcp-preflight.py` compares both
 servers' initialize identity, all 80 tool descriptors, launcher environment
 names, SQLite row counts, and disposable empty-argument routes. It treats
 missing required arguments as valid route evidence, but blocks unknown or
-unimplemented handlers. The current Rust branch is not eligible for live
-cutover until this preflight is green: the existing Python deployment still
-advertises optional provider flags and schemas that the staged Rust handlers do
-not yet implement identically. The Rust stdio entry point additionally refuses
-to start when the deployed legacy provider/pipeline variables are still set, so
-an operator cannot accidentally cut over to a silently degraded configuration.
+unimplemented handlers. The actual legacy-Python-versus-Rust preflight remains
+a release gate: it must be run with the deployed Python command, its migrated
+database copy, and the complete set of environment names that affect provider
+and pipeline behavior. The Rust entry point accepts those names and routes the
+corresponding operations through the compatibility layer; removing them to make
+the comparison green would invalidate the parity check.
+
+The slice descriptions below record historical implementation milestones. The
+Redis-first coordinator and the completed provider/pipeline compatibility
+surface described later are the current behavior and supersede earlier
+"staged" or "out of scope" notes.
 
 The second implementation slice adds SQLite-backed fact lifecycle operations
 (`forget_fact`, `restore_fact`, and `list_forgotten`) plus workspace lifecycle
 operations (`create_workspace`, `list_workspaces`, `archive_workspace`, and
 `reset_workspace`). Forgotten facts are excluded from normal list/search results,
-and reset deletes only the selected workspace's facts and contexts. Redis remains
-out of scope until the SQLite behavior is measured and the parity surface is
-complete enough for a meaningful adapter comparison.
+and reset deletes only the selected workspace's facts and contexts. Those
+operations were initially implemented on SQLite; the current coordinator routes
+the complete surface through Redis when it is reachable and retains the SQLite
+implementation as the standby/fallback path.
 
 The third implementation slice adds the first context retrieval boundary:
 
@@ -448,10 +454,10 @@ optional Redis core-fact adapter:
   performance efficacy explicitly not claimed until a paired workload and
   environment review is available.
 
-This adapter is an experimental core-fact comparison surface, not a claim that
-Redis already replaces every SQLite-backed MCP table. The full MCP contract
-continues to use the SQLite store unless a later parity gate explicitly wires
-the Redis adapter into the server backend.
+This was the initial experimental core-fact comparison surface. The subsequent
+coordinator implementation below supersedes it: Redis now owns the canonical
+state for the full MCP contract when reachable, while SQLite remains the
+standby/fallback image.
 
 ## Current coordinator implementation
 

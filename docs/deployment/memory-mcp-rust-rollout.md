@@ -83,11 +83,13 @@ The gate is green only when all of the following are true:
 - launcher environment names match, including the Redis configuration and
 every legacy feature/limit variable that still affects behavior.
 
-The Rust server also fails closed when one of the currently deployed legacy
-provider/pipeline variables is present. This prevents an accidental switch
-from silently disabling embeddings, extraction, recall, verification, or the
-LLM-backed paths. Remove those variables only as part of a reviewed parity
-change, not as a way to make the preflight appear green.
+The Rust server accepts the deployed legacy provider/pipeline variable names and
+routes those paths through its compatibility layer. Keep the names in the
+preflight even when a provider endpoint is unavailable: provider failures must
+be reported by the operation, not hidden by removing configuration or by making
+the comparison appear green. The deterministic test providers are for isolated
+verification only and are not a substitute for the real legacy-versus-Rust
+preflight.
 
 The route probe intentionally uses disposable databases. Errors caused only by
 missing required arguments are valid route evidence; unknown or unimplemented

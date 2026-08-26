@@ -5,20 +5,6 @@ use memory_mcp_rust::store::default_path;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-const UNSUPPORTED_LEGACY_ENV: &[&str] = &[
-    "MEMORY_MCP_EMBEDDINGS",
-    "MEMORY_MCP_EMBED_PROVIDER",
-    "MEMORY_MCP_EMBED_URL",
-    "MEMORY_MCP_EXTRACT",
-    "MEMORY_MCP_RECALL",
-    "MEMORY_MCP_VERIFY",
-    "MEMORY_MCP_CATEGORIZE",
-    "MEMORY_MCP_LLM_PROVIDER",
-    "MEMORY_MCP_LLM_URL",
-    "MEMORY_MCP_LLM_MODEL",
-    "MEMORY_MCP_LLM_TIMEOUT",
-];
-
 fn main() {
     if let Some(command) = std::env::args().nth(1) {
         if command == "migrate" {
@@ -30,16 +16,6 @@ fn main() {
         }
         eprintln!("unknown command: {command}");
         std::process::exit(2);
-    }
-
-    if let Some(name) = UNSUPPORTED_LEGACY_ENV
-        .iter()
-        .find(|name| std::env::var_os(name).is_some())
-    {
-        eprintln!(
-            "memory-mcp-rust refuses legacy configuration {name}; complete contract parity before cutover"
-        );
-        std::process::exit(78);
     }
 
     let coordinator = match BackendCoordinator::open(default_path()) {
