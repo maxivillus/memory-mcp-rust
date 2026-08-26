@@ -310,3 +310,24 @@ The eighth implementation slice adds bounded lexical ingestion and retrieval:
 Database selection/backup, aggregate measurement, feedback, and the remaining
 advanced retrieval and document-ingestion tools remain staged. No Redis or
 embedding implementation is claimed.
+
+The ninth implementation slice adds bounded observability and classification:
+
+- run_begin, run_end, link_run, and query_run persist idempotent workspace-scoped
+  run/issue/PR/session/Git references with bounded files, diff, and summary
+  fields; the server never shells out to Git;
+- record_measurement and query_measurement persist aggregate numeric
+  observations keyed by workspace, measurement, sample, and variant, with
+  deterministic conflict detection for duplicate keys;
+- record_feedback and query_feedback persist only bounded item metadata and
+  one of the contract signals (`helpful`, `not_helpful`, `stale`, `irrelevant`,
+  or `unsafe`), with idempotent feedback ids;
+- list_categories and categorize_pending create workspace categories and assign
+  them to matching unclassified active facts without crossing workspace
+  boundaries;
+- fresh-store migrations, JSON-RPC handlers, schemas, export fields, and tests
+  cover the new tables and replay/isolation behavior.
+
+Database selection/backup, local document path ingestion, retention/review
+flows, and the remaining advanced retrieval tools remain staged. No Redis or
+embedding implementation is claimed.

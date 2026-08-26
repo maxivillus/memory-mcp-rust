@@ -1,6 +1,6 @@
 use crate::store::{
     ContextMetadata, DecisionSpec, EntitySpec, EventSpec, EvidenceSpec, FactFilters, FactMetadata,
-    HandoffSpec, RelationSpec, Store, StoreError,
+    FeedbackSpec, HandoffSpec, MeasurementSpec, RelationSpec, RunSpec, Store, StoreError,
 };
 use crate::tools;
 use serde_json::{json, Map, Value};
@@ -112,7 +112,7 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
             "tools/call arguments must be an object".to_owned(),
         ));
     }
-    if !tools::is_advertised(name) {
+    if !tools::is_advertised(name) && name != "add_fact" {
         return Err(CallError::Execution(StoreError::Invalid(format!(
             "unknown tool: {name}"
         ))));
@@ -124,7 +124,7 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
         .and_then(Value::as_str)
         .unwrap_or("");
     let result = match name {
-        "remember_fact" => {
+        "remember_fact" | "add_fact" => {
             let text = arguments
                 .get("text")
                 .and_then(Value::as_str)
@@ -172,6 +172,155 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
                     .map_err(CallError::Execution)?,
             )
             .expect("ingested fact serializes")
+        }
+        "run_begin" => {
+            let run_id = required_string(arguments, "run_id")
+                .or_else(|_| required_string(arguments, "id"))?;
+            let spec = RunSpec {
+                run_id: run_id.to_owned(),
+                issue_ref: optional_string(arguments, "issue_ref")?
+                    .or(optional_string(arguments, "issue")?)
+                    .unwrap_or("")
+                    .to_owned(),
+                pr_ref: optional_string(arguments, "pr_ref")?
+                    .or(optional_string(arguments, "pr")?)
+                    .unwrap_or("")
+                    .to_owned(),
+                session: optional_string(arguments, "session")?
+                    .unwrap_or("")
+                    .to_owned(),
+                git_ref: optional_string(arguments, "git_ref")?
+                    .or(optional_string(arguments, "ref")?)
+                    .or(optional_string(arguments, "commit")?)
+                    .unwrap_or("")
+                    .to_owned(),
+                files: optional_text_or_json(arguments, &["files", "changed_files"])?,
+                diff: optional_text_or_json(arguments, &["diff"])?,
+                workspace: workspace.to_owned(),
+            };
+            serde_json::to_value(store.begin_run(&spec).map_err(CallError::Execution)?)
+                .expect("run serializes")
+        }
+        "run_end" => {
+            let run_id = required_string(arguments, "run_id")
+                .or_else(|_| required_string(arguments, "id"))?;
+            let summary = optional_string(arguments, "summary")?
+                .or(optional_string(arguments, "result")?)
+                .unwrap_or("");
+            serde_json::to_value(
+                store
+                    .end_run(run_id, summary, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("ended run serializes")
+        }
+        "link_run" => {
+            let run_id = required_string(arguments, "run_id")
+                .or_else(|_| required_string(arguments, "id"))?;
+            let issue_ref =
+                optional_string(arguments, "issue_ref")?.or(optional_string(arguments, "issue")?);
+            let pr_ref =
+                optional_string(arguments, "pr_ref")?.or(optional_string(arguments, "pr")?);
+            let session = optional_string(arguments, "session")?;
+            let git_ref = optional_string(arguments, "git_ref")?
+                .or(optional_string(arguments, "ref")?)
+                .or(optional_string(arguments, "commit")?);
+            serde_json::to_value(
+                store
+                    .link_run(run_id, issue_ref, pr_ref, session, git_ref, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("linked run serializes")
+        }
+        "query_run" => {
+            let query = optional_string(arguments, "query")?.unwrap_or("");
+            serde_json::to_value(
+                store
+                    .query_runs(query, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("runs serialize")
+        }
+        "record_measurement" => {
+            let measurement = required_string(arguments, "measurement")
+                .or_else(|_| required_string(arguments, "name"))?;
+            let sample = required_string(arguments, "sample")
+                .or_else(|_| required_string(arguments, "sample_id"))?;
+            let variant = optional_string(arguments, "variant")?.unwrap_or("");
+            let value = required_f64(arguments, "value")?;
+            let baseline = optional_bool(arguments, &["baseline", "is_baseline"], false)?;
+            let spec = MeasurementSpec {
+                measurement: measurement.to_owned(),
+                sample: sample.to_owned(),
+                variant: variant.to_owned(),
+                value,
+                baseline,
+                workspace: workspace.to_owned(),
+            };
+            serde_json::to_value(
+                store
+                    .record_measurement(&spec)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("measurement serializes")
+        }
+        "query_measurement" => {
+            let query = optional_string(arguments, "query")?.unwrap_or("");
+            serde_json::to_value(
+                store
+                    .query_measurements(query, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("measurements serialize")
+        }
+        "record_feedback" => {
+            let feedback_id = required_string(arguments, "feedback_id")
+                .or_else(|_| required_string(arguments, "id"))?;
+            let item_type = required_string(arguments, "item_type")
+                .or_else(|_| required_string(arguments, "type"))?;
+            let item_ref = required_string(arguments, "item_ref")
+                .or_else(|_| required_string(arguments, "ref"))?;
+            let signal = required_string(arguments, "signal")?;
+            let spec = FeedbackSpec {
+                feedback_id: feedback_id.to_owned(),
+                site: optional_string(arguments, "site")?.unwrap_or("").to_owned(),
+                item_type: item_type.to_owned(),
+                item_ref: item_ref.to_owned(),
+                signal: signal.to_owned(),
+                query_hash: optional_string(arguments, "query_hash")?
+                    .unwrap_or("")
+                    .to_owned(),
+                workspace: workspace.to_owned(),
+            };
+            serde_json::to_value(store.record_feedback(&spec).map_err(CallError::Execution)?)
+                .expect("feedback serializes")
+        }
+        "query_feedback" => {
+            let query = optional_string(arguments, "query")?.unwrap_or("");
+            serde_json::to_value(
+                store
+                    .query_feedback(query, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("feedback serialize")
+        }
+        "list_categories" => serde_json::to_value(
+            store
+                .list_categories(workspace)
+                .map_err(CallError::Execution)?,
+        )
+        .expect("categories serialize"),
+        "categorize_pending" => {
+            let category = required_string(arguments, "category")
+                .or_else(|_| required_string(arguments, "category_name"))?;
+            let query = optional_string(arguments, "query")?.unwrap_or("");
+            let limit = optional_usize(arguments, &["limit", "max_results"], 100)?;
+            serde_json::to_value(
+                store
+                    .categorize_pending(category, query, workspace, limit)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("categorized facts serialize")
         }
         "search_facts" => {
             let query = arguments
@@ -761,6 +910,24 @@ fn string_array_or_single(
     ))
 }
 
+fn optional_text_or_json(
+    arguments: &Map<String, Value>,
+    keys: &[&str],
+) -> Result<String, CallError> {
+    let Some((key, value)) = keys
+        .iter()
+        .find_map(|key| arguments.get(*key).map(|value| (*key, value)))
+    else {
+        return Ok(String::new());
+    };
+    if let Some(text) = value.as_str() {
+        return Ok(text.to_owned());
+    }
+    serde_json::to_string(value).map_err(|_| {
+        CallError::InvalidParams(format!("tool argument {key} must be serializable JSON"))
+    })
+}
+
 fn optional_usize(
     arguments: &Map<String, Value>,
     keys: &[&str],
@@ -820,6 +987,13 @@ fn optional_f64(arguments: &Map<String, Value>, key: &str) -> Result<Option<f64>
             CallError::InvalidParams(format!("tool argument {key} must be a number"))
         }),
     }
+}
+
+fn required_f64(arguments: &Map<String, Value>, key: &str) -> Result<f64, CallError> {
+    arguments
+        .get(key)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| CallError::InvalidParams(format!("tool argument {key} must be a number")))
 }
 
 fn fact_filters(arguments: &Map<String, Value>) -> Result<FactFilters, CallError> {
@@ -1092,6 +1266,107 @@ mod tests {
             .as_str()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn run_measurement_feedback_and_category_tools_are_reachable() {
+        let store = Store::in_memory().unwrap();
+        let fact = handle_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"remember_fact","arguments":{"text":"classify me","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let fact_text = fact["result"]["content"][0]["text"].as_str().unwrap();
+        let fact_value: Value = serde_json::from_str(fact_text).unwrap();
+        let fact_id = fact_value["id"].as_i64().unwrap();
+
+        let categorized = handle_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"categorize_pending","arguments":{"category":"review","query":"classify","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(categorized["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(&fact_id.to_string()));
+        let categories = handle_line(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_categories","arguments":{"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(categories["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("review"));
+
+        let run = handle_line(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run_begin","arguments":{"run_id":"r-1","issue_ref":"NTL-722","files":["src/store.rs"],"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(!run["result"]["isError"].as_bool().unwrap());
+        let link = handle_line(
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"link_run","arguments":{"run_id":"r-1","pr_ref":"1","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(link["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"pr_ref\":\"1\""));
+        let end = handle_line(
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"run_end","arguments":{"run_id":"r-1","summary":"ok","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(end["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"state\":\"closed\""));
+        let runs = handle_line(
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"query_run","arguments":{"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(runs["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("r-1"));
+
+        let measurement = handle_line(
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"record_measurement","arguments":{"measurement":"quality","sample":"s-1","value":0.8,"baseline":true,"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(measurement["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"baseline\":true"));
+        let measurements = handle_line(
+            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"query_measurement","arguments":{"query":"quality","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(measurements["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("quality"));
+
+        let feedback = handle_line(
+            r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"record_feedback","arguments":{"feedback_id":"fb-1","item_type":"fact","item_ref":"1","signal":"helpful","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(!feedback["result"]["isError"].as_bool().unwrap());
+        let feedback_query = handle_line(
+            r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"query_feedback","arguments":{"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(feedback_query["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("fb-1"));
     }
 
     #[test]

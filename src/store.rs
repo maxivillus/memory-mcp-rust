@@ -50,6 +50,7 @@ pub struct Fact {
     pub trust: String,
     pub strong: bool,
     pub importance: f64,
+    pub category_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -239,6 +240,10 @@ pub struct MemoryExport {
     pub relations: Vec<Relation>,
     pub decisions: Vec<Decision>,
     pub evidence: Vec<Evidence>,
+    pub categories: Vec<Category>,
+    pub runs: Vec<Run>,
+    pub measurements: Vec<Measurement>,
+    pub feedback: Vec<Feedback>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -334,6 +339,89 @@ pub struct Handoff {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSpec {
+    pub run_id: String,
+    pub issue_ref: String,
+    pub pr_ref: String,
+    pub session: String,
+    pub git_ref: String,
+    pub files: String,
+    pub diff: String,
+    pub workspace: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Run {
+    pub id: i64,
+    pub run_id: String,
+    pub issue_ref: String,
+    pub pr_ref: String,
+    pub session: String,
+    pub git_ref: String,
+    pub files: String,
+    pub diff: String,
+    pub summary: String,
+    pub state: String,
+    pub workspace: String,
+    pub created_at: String,
+    pub ended_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeasurementSpec {
+    pub measurement: String,
+    pub sample: String,
+    pub variant: String,
+    pub value: f64,
+    pub baseline: bool,
+    pub workspace: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Measurement {
+    pub id: i64,
+    pub measurement: String,
+    pub sample: String,
+    pub variant: String,
+    pub value: f64,
+    pub baseline: bool,
+    pub workspace: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedbackSpec {
+    pub feedback_id: String,
+    pub site: String,
+    pub item_type: String,
+    pub item_ref: String,
+    pub signal: String,
+    pub query_hash: String,
+    pub workspace: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Feedback {
+    pub id: i64,
+    pub feedback_id: String,
+    pub site: String,
+    pub item_type: String,
+    pub item_ref: String,
+    pub signal: String,
+    pub query_hash: String,
+    pub workspace: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Category {
+    pub id: i64,
+    pub name: String,
+    pub workspace: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Stats {
     pub facts: i64,
@@ -347,6 +435,8 @@ pub struct Workspace {
 }
 
 const MAX_EVENT_PAYLOAD_BYTES: usize = 16 * 1024;
+const MAX_RUN_FILES_BYTES: usize = 64 * 1024;
+const MAX_RUN_DIFF_BYTES: usize = 128 * 1024;
 
 pub struct Store {
     connection: Connection,
@@ -556,6 +646,59 @@ impl Store {
         self.ensure_decision_columns()?;
         self.ensure_evidence_columns()?;
         self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS categories (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                workspace_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (name, workspace_id)
+            );
+            CREATE TABLE IF NOT EXISTS runs (
+                id INTEGER PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                issue_ref TEXT NOT NULL DEFAULT '',
+                pr_ref TEXT NOT NULL DEFAULT '',
+                session TEXT NOT NULL DEFAULT '',
+                git_ref TEXT NOT NULL DEFAULT '',
+                files TEXT NOT NULL DEFAULT '',
+                diff TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL DEFAULT 'open'
+                    CHECK (state IN ('open', 'closed')),
+                workspace_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                ended_at TEXT,
+                UNIQUE (workspace_id, run_id)
+            );
+            CREATE TABLE IF NOT EXISTS measurement_observations (
+                id INTEGER PRIMARY KEY,
+                measurement TEXT NOT NULL,
+                sample TEXT NOT NULL,
+                variant TEXT NOT NULL DEFAULT '',
+                value REAL NOT NULL,
+                baseline INTEGER NOT NULL DEFAULT 0 CHECK (baseline IN (0, 1)),
+                workspace_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (workspace_id, measurement, sample, variant)
+            );
+            CREATE TABLE IF NOT EXISTS memory_feedback (
+                id INTEGER PRIMARY KEY,
+                feedback_id TEXT NOT NULL,
+                site TEXT NOT NULL DEFAULT '',
+                item_type TEXT NOT NULL DEFAULT '',
+                item_ref TEXT NOT NULL DEFAULT '',
+                signal TEXT NOT NULL,
+                query_hash TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (workspace_id, feedback_id)
+            );",
+        )?;
+        self.ensure_category_columns()?;
+        self.ensure_run_columns()?;
+        self.ensure_measurement_columns()?;
+        self.ensure_feedback_columns()?;
+        self.connection.execute_batch(
             "CREATE INDEX IF NOT EXISTS entities_canonical_idx
                 ON entities (workspace_id, canonical_name);
              CREATE INDEX IF NOT EXISTS relations_subject_idx
@@ -565,7 +708,15 @@ impl Store {
              CREATE INDEX IF NOT EXISTS decisions_subject_idx
                 ON decisions (workspace_id, subject);
              CREATE INDEX IF NOT EXISTS evidence_fact_idx
-                ON evidence (workspace_id, fact_id);",
+                ON evidence (workspace_id, fact_id);
+             CREATE INDEX IF NOT EXISTS categories_workspace_idx
+                ON categories (workspace_id, name);
+             CREATE INDEX IF NOT EXISTS runs_workspace_state_idx
+                ON runs (workspace_id, state, id);
+             CREATE INDEX IF NOT EXISTS measurements_workspace_idx
+                ON measurement_observations (workspace_id, measurement, sample);
+             CREATE INDEX IF NOT EXISTS feedback_workspace_item_idx
+                ON memory_feedback (workspace_id, item_type, item_ref);",
         )?;
         self.connection.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS decisions_fts
@@ -618,6 +769,7 @@ impl Store {
             ("trust", "TEXT NOT NULL DEFAULT 'medium'"),
             ("strong", "INTEGER NOT NULL DEFAULT 0"),
             ("importance", "REAL NOT NULL DEFAULT 0.5"),
+            ("category_id", "INTEGER"),
             ("lifecycle", "TEXT NOT NULL DEFAULT 'active'"),
             ("workspace_id", "TEXT NOT NULL DEFAULT ''"),
             // SQLite requires a constant default for ALTER TABLE ADD COLUMN.
@@ -846,6 +998,112 @@ impl Store {
         Ok(())
     }
 
+    fn ensure_category_columns(&self) -> Result<(), StoreError> {
+        let mut statement = self.connection.prepare("PRAGMA table_info(categories)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let additions = [
+            ("name", "TEXT NOT NULL DEFAULT ''"),
+            ("workspace_id", "TEXT NOT NULL DEFAULT ''"),
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+        ];
+        for (name, definition) in additions {
+            if !columns.iter().any(|column| column == name) {
+                self.connection.execute(
+                    &format!("ALTER TABLE categories ADD COLUMN {name} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_run_columns(&self) -> Result<(), StoreError> {
+        let mut statement = self.connection.prepare("PRAGMA table_info(runs)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let additions = [
+            ("run_id", "TEXT NOT NULL DEFAULT ''"),
+            ("issue_ref", "TEXT NOT NULL DEFAULT ''"),
+            ("pr_ref", "TEXT NOT NULL DEFAULT ''"),
+            ("session", "TEXT NOT NULL DEFAULT ''"),
+            ("git_ref", "TEXT NOT NULL DEFAULT ''"),
+            ("files", "TEXT NOT NULL DEFAULT ''"),
+            ("diff", "TEXT NOT NULL DEFAULT ''"),
+            ("summary", "TEXT NOT NULL DEFAULT ''"),
+            ("state", "TEXT NOT NULL DEFAULT 'open'"),
+            ("workspace_id", "TEXT NOT NULL DEFAULT ''"),
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+            ("ended_at", "TEXT"),
+        ];
+        for (name, definition) in additions {
+            if !columns.iter().any(|column| column == name) {
+                self.connection.execute(
+                    &format!("ALTER TABLE runs ADD COLUMN {name} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_measurement_columns(&self) -> Result<(), StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("PRAGMA table_info(measurement_observations)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let additions = [
+            ("measurement", "TEXT NOT NULL DEFAULT ''"),
+            ("sample", "TEXT NOT NULL DEFAULT ''"),
+            ("variant", "TEXT NOT NULL DEFAULT ''"),
+            ("value", "REAL NOT NULL DEFAULT 0"),
+            ("baseline", "INTEGER NOT NULL DEFAULT 0"),
+            ("workspace_id", "TEXT NOT NULL DEFAULT ''"),
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+        ];
+        for (name, definition) in additions {
+            if !columns.iter().any(|column| column == name) {
+                self.connection.execute(
+                    &format!("ALTER TABLE measurement_observations ADD COLUMN {name} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_feedback_columns(&self) -> Result<(), StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("PRAGMA table_info(memory_feedback)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let additions = [
+            ("feedback_id", "TEXT NOT NULL DEFAULT ''"),
+            ("site", "TEXT NOT NULL DEFAULT ''"),
+            ("item_type", "TEXT NOT NULL DEFAULT ''"),
+            ("item_ref", "TEXT NOT NULL DEFAULT ''"),
+            ("signal", "TEXT NOT NULL DEFAULT ''"),
+            ("query_hash", "TEXT NOT NULL DEFAULT ''"),
+            ("workspace_id", "TEXT NOT NULL DEFAULT ''"),
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+        ];
+        for (name, definition) in additions {
+            if !columns.iter().any(|column| column == name) {
+                self.connection.execute(
+                    &format!("ALTER TABLE memory_feedback ADD COLUMN {name} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn remember_fact(&self, text: &str, workspace: &str) -> Result<Fact, StoreError> {
         self.remember_fact_with_metadata(text, workspace, &FactMetadata::default())
     }
@@ -895,6 +1153,391 @@ impl Store {
         self.remember_fact(text, workspace)
     }
 
+    pub fn create_category(&self, name: &str, workspace: &str) -> Result<Category, StoreError> {
+        validate_graph_workspace(workspace)?;
+        if name.trim().is_empty() {
+            return Err(StoreError::Invalid(
+                "category name must not be empty".to_owned(),
+            ));
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO categories (name, workspace_id) VALUES (?1, ?2)",
+            params![name, workspace],
+        )?;
+        self.category_by_name(name, workspace)?.ok_or_else(|| {
+            StoreError::Invalid("category insert did not produce a readable row".to_owned())
+        })
+    }
+
+    pub fn list_categories(&self, workspace: &str) -> Result<Vec<Category>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, name, workspace_id, created_at
+             FROM categories
+             WHERE workspace_id = ?1
+             ORDER BY name, id",
+        )?;
+        let rows = statement
+            .query_map(params![workspace], map_category)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn categorize_pending(
+        &self,
+        category: &str,
+        query: &str,
+        workspace: &str,
+        limit: usize,
+    ) -> Result<Vec<Fact>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        if category.trim().is_empty() {
+            return Err(StoreError::Invalid(
+                "categorize_pending requires a category".to_owned(),
+            ));
+        }
+        if limit == 0 {
+            return Err(StoreError::Invalid(
+                "categorize_pending limit must be positive".to_owned(),
+            ));
+        }
+        let category = self.create_category(category, workspace)?;
+        let ids = {
+            let mut statement = self.connection.prepare(
+                "SELECT id
+                 FROM facts
+                 WHERE category_id IS NULL
+                   AND (workspace_id = '' OR workspace_id = ?1)
+                   AND lifecycle != 'forgotten'
+                   AND (?2 = '' OR instr(lower(text), lower(?2)) > 0)
+                 ORDER BY id
+                 LIMIT ?3",
+            )?;
+            let rows = statement
+                .query_map(params![workspace, query, limit as i64], |row| {
+                    row.get::<_, i64>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        let mut facts = Vec::with_capacity(ids.len());
+        for id in ids {
+            self.connection.execute(
+                "UPDATE facts SET category_id = ?1 WHERE id = ?2 AND category_id IS NULL",
+                params![category.id, id],
+            )?;
+            if let Some(fact) = self.fact_by_id(id, workspace)? {
+                facts.push(fact);
+            }
+        }
+        Ok(facts)
+    }
+
+    pub fn begin_run(&self, spec: &RunSpec) -> Result<Run, StoreError> {
+        validate_run_spec(spec)?;
+        let files = truncate_utf8(&spec.files, MAX_RUN_FILES_BYTES);
+        let diff = truncate_utf8(&spec.diff, MAX_RUN_DIFF_BYTES);
+        if let Some(existing) = self.run_by_key(&spec.run_id, &spec.workspace)? {
+            if existing.issue_ref != spec.issue_ref
+                || existing.pr_ref != spec.pr_ref
+                || existing.session != spec.session
+                || existing.git_ref != spec.git_ref
+                || existing.files != files
+                || existing.diff != diff
+            {
+                return Err(StoreError::Invalid(
+                    "run id conflicts with an existing record".to_owned(),
+                ));
+            }
+            return Ok(existing);
+        }
+        self.connection.execute(
+            "INSERT INTO runs
+                (run_id, issue_ref, pr_ref, session, git_ref, files, diff, workspace_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                spec.run_id,
+                spec.issue_ref,
+                spec.pr_ref,
+                spec.session,
+                spec.git_ref,
+                files,
+                diff,
+                spec.workspace
+            ],
+        )?;
+        self.run_by_key(&spec.run_id, &spec.workspace)?
+            .ok_or_else(|| {
+                StoreError::Invalid("run insert did not produce a readable row".to_owned())
+            })
+    }
+
+    pub fn end_run(
+        &self,
+        run_id: &str,
+        summary: &str,
+        workspace: &str,
+    ) -> Result<Option<Run>, StoreError> {
+        validate_run_key(run_id, workspace)?;
+        let Some(existing) = self.run_by_key(run_id, workspace)? else {
+            return Ok(None);
+        };
+        if existing.state == "closed" {
+            if !summary.is_empty() && existing.summary != summary {
+                return Err(StoreError::Invalid(
+                    "closed run summary conflicts with an existing record".to_owned(),
+                ));
+            }
+            return Ok(Some(existing));
+        }
+        let summary = truncate_utf8(summary, MAX_RUN_DIFF_BYTES);
+        self.connection.execute(
+            "UPDATE runs
+             SET state = 'closed', summary = ?1, ended_at = CURRENT_TIMESTAMP
+             WHERE run_id = ?2 AND workspace_id = ?3",
+            params![summary, run_id, workspace],
+        )?;
+        self.run_by_key(run_id, workspace)
+    }
+
+    pub fn link_run(
+        &self,
+        run_id: &str,
+        issue_ref: Option<&str>,
+        pr_ref: Option<&str>,
+        session: Option<&str>,
+        git_ref: Option<&str>,
+        workspace: &str,
+    ) -> Result<Option<Run>, StoreError> {
+        validate_run_key(run_id, workspace)?;
+        if issue_ref.is_none() && pr_ref.is_none() && session.is_none() && git_ref.is_none() {
+            return Err(StoreError::Invalid(
+                "link_run requires at least one link field".to_owned(),
+            ));
+        }
+        let Some(_) = self.run_by_key(run_id, workspace)? else {
+            return Ok(None);
+        };
+        self.connection.execute(
+            "UPDATE runs
+             SET issue_ref = COALESCE(?1, issue_ref),
+                 pr_ref = COALESCE(?2, pr_ref),
+                 session = COALESCE(?3, session),
+                 git_ref = COALESCE(?4, git_ref)
+             WHERE run_id = ?5 AND workspace_id = ?6",
+            params![issue_ref, pr_ref, session, git_ref, run_id, workspace],
+        )?;
+        self.run_by_key(run_id, workspace)
+    }
+
+    pub fn query_runs(&self, query: &str, workspace: &str) -> Result<Vec<Run>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        let pattern = format!("%{}%", query.trim());
+        let mut statement = self.connection.prepare(
+            "SELECT id, run_id, issue_ref, pr_ref, session, git_ref, files, diff,
+                    summary, state, workspace_id, created_at, ended_at
+             FROM runs
+             WHERE workspace_id = ?1
+               AND (?2 = '%%'
+                    OR run_id LIKE ?2 OR issue_ref LIKE ?2 OR pr_ref LIKE ?2
+                    OR session LIKE ?2 OR git_ref LIKE ?2 OR summary LIKE ?2)
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![workspace, pattern], map_run)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn record_measurement(&self, spec: &MeasurementSpec) -> Result<Measurement, StoreError> {
+        validate_measurement_spec(spec)?;
+        if let Some(existing) = self.measurement_by_key(
+            &spec.measurement,
+            &spec.sample,
+            &spec.variant,
+            &spec.workspace,
+        )? {
+            if existing.value != spec.value || existing.baseline != spec.baseline {
+                return Err(StoreError::Invalid(
+                    "measurement key conflicts with an existing observation".to_owned(),
+                ));
+            }
+            return Ok(existing);
+        }
+        self.connection.execute(
+            "INSERT INTO measurement_observations
+                (measurement, sample, variant, value, baseline, workspace_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                spec.measurement,
+                spec.sample,
+                spec.variant,
+                spec.value,
+                spec.baseline as i64,
+                spec.workspace
+            ],
+        )?;
+        self.measurement_by_key(
+            &spec.measurement,
+            &spec.sample,
+            &spec.variant,
+            &spec.workspace,
+        )?
+        .ok_or_else(|| {
+            StoreError::Invalid("measurement insert did not produce a readable row".to_owned())
+        })
+    }
+
+    pub fn query_measurements(
+        &self,
+        query: &str,
+        workspace: &str,
+    ) -> Result<Vec<Measurement>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        let pattern = format!("%{}%", query.trim());
+        let mut statement = self.connection.prepare(
+            "SELECT id, measurement, sample, variant, value, baseline,
+                    workspace_id, created_at
+             FROM measurement_observations
+             WHERE workspace_id = ?1
+               AND (?2 = '%%'
+                    OR measurement LIKE ?2 OR sample LIKE ?2 OR variant LIKE ?2)
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![workspace, pattern], map_measurement)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn record_feedback(&self, spec: &FeedbackSpec) -> Result<Feedback, StoreError> {
+        validate_feedback_spec(spec)?;
+        if let Some(existing) = self.feedback_by_key(&spec.feedback_id, &spec.workspace)? {
+            if existing.site != spec.site
+                || existing.item_type != spec.item_type
+                || existing.item_ref != spec.item_ref
+                || existing.signal != spec.signal
+                || existing.query_hash != spec.query_hash
+            {
+                return Err(StoreError::Invalid(
+                    "feedback id conflicts with an existing record".to_owned(),
+                ));
+            }
+            return Ok(existing);
+        }
+        self.connection.execute(
+            "INSERT INTO memory_feedback
+                (feedback_id, site, item_type, item_ref, signal, query_hash, workspace_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                spec.feedback_id,
+                spec.site,
+                spec.item_type,
+                spec.item_ref,
+                spec.signal,
+                spec.query_hash,
+                spec.workspace
+            ],
+        )?;
+        self.feedback_by_key(&spec.feedback_id, &spec.workspace)?
+            .ok_or_else(|| {
+                StoreError::Invalid("feedback insert did not produce a readable row".to_owned())
+            })
+    }
+
+    pub fn query_feedback(
+        &self,
+        query: &str,
+        workspace: &str,
+    ) -> Result<Vec<Feedback>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        let pattern = format!("%{}%", query.trim());
+        let mut statement = self.connection.prepare(
+            "SELECT id, feedback_id, site, item_type, item_ref, signal,
+                    query_hash, workspace_id, created_at
+             FROM memory_feedback
+             WHERE workspace_id = ?1
+               AND (?2 = '%%'
+                    OR feedback_id LIKE ?2 OR site LIKE ?2 OR item_type LIKE ?2
+                    OR item_ref LIKE ?2 OR signal LIKE ?2 OR query_hash LIKE ?2)
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![workspace, pattern], map_feedback)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn category_by_name(
+        &self,
+        name: &str,
+        workspace: &str,
+    ) -> Result<Option<Category>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, name, workspace_id, created_at
+                 FROM categories
+                 WHERE name = ?1 AND workspace_id = ?2",
+                params![name, workspace],
+                map_category,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn run_by_key(&self, run_id: &str, workspace: &str) -> Result<Option<Run>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, run_id, issue_ref, pr_ref, session, git_ref,
+                        files, diff, summary, state, workspace_id, created_at, ended_at
+                 FROM runs
+                 WHERE run_id = ?1 AND workspace_id = ?2",
+                params![run_id, workspace],
+                map_run,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn measurement_by_key(
+        &self,
+        measurement: &str,
+        sample: &str,
+        variant: &str,
+        workspace: &str,
+    ) -> Result<Option<Measurement>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, measurement, sample, variant, value, baseline,
+                        workspace_id, created_at
+                 FROM measurement_observations
+                 WHERE measurement = ?1 AND sample = ?2 AND variant = ?3
+                   AND workspace_id = ?4",
+                params![measurement, sample, variant, workspace],
+                map_measurement,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn feedback_by_key(
+        &self,
+        feedback_id: &str,
+        workspace: &str,
+    ) -> Result<Option<Feedback>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, feedback_id, site, item_type, item_ref, signal,
+                        query_hash, workspace_id, created_at
+                 FROM memory_feedback
+                 WHERE feedback_id = ?1 AND workspace_id = ?2",
+                params![feedback_id, workspace],
+                map_feedback,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     pub fn search_facts(&self, query: &str, workspace: &str) -> Result<Vec<Fact>, StoreError> {
         self.search_facts_with_filters(query, workspace, &FactFilters::default())
     }
@@ -916,7 +1559,8 @@ impl Store {
             .join(" AND ");
         let mut statement = self.connection.prepare(
             "SELECT f.id, f.text, f.sha256, f.workspace_id, f.lifecycle,
-                    f.source, f.project, f.domain, f.trust, f.strong, f.importance
+                    f.source, f.project, f.domain, f.trust, f.strong, f.importance,
+                    f.category_id
              FROM facts_fts
              JOIN facts f ON f.id = facts_fts.rowid
              WHERE facts_fts MATCH ?1
@@ -951,7 +1595,7 @@ impl Store {
         let like = format!("%{}%", query);
         let mut fallback = self.connection.prepare(
             "SELECT id, text, sha256, workspace_id, lifecycle,
-                    source, project, domain, trust, strong, importance
+                    source, project, domain, trust, strong, importance, category_id
              FROM facts
              WHERE text LIKE ?1
                AND (workspace_id = '' OR workspace_id = ?2)
@@ -992,7 +1636,7 @@ impl Store {
         validate_fact_filters(filters)?;
         let mut statement = self.connection.prepare(
             "SELECT id, text, sha256, workspace_id, lifecycle,
-                    source, project, domain, trust, strong, importance
+                    source, project, domain, trust, strong, importance, category_id
              FROM facts
              WHERE (workspace_id = '' OR workspace_id = ?1)
                AND lifecycle != 'forgotten'
@@ -1954,6 +2598,10 @@ impl Store {
             relations: self.list_relations(workspace)?,
             decisions: self.list_decisions(workspace)?,
             evidence: self.list_evidence(workspace)?,
+            categories: self.list_categories(workspace)?,
+            runs: self.query_runs("", workspace)?,
+            measurements: self.query_measurements("", workspace)?,
+            feedback: self.query_feedback("", workspace)?,
         })
     }
 
@@ -2008,7 +2656,7 @@ impl Store {
     pub fn list_forgotten(&self, workspace: &str) -> Result<Vec<Fact>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT id, text, sha256, workspace_id, lifecycle,
-                    source, project, domain, trust, strong, importance
+                    source, project, domain, trust, strong, importance, category_id
              FROM facts
              WHERE (workspace_id = '' OR workspace_id = ?1)
                AND lifecycle = 'forgotten'
@@ -2164,7 +2812,7 @@ impl Store {
         self.connection
             .query_row(
                 "SELECT id, text, sha256, workspace_id, lifecycle,
-                        source, project, domain, trust, strong, importance
+                        source, project, domain, trust, strong, importance, category_id
                  FROM facts
                  WHERE sha256 = ?1 AND workspace_id = ?2",
                 params![hash, workspace],
@@ -2178,7 +2826,7 @@ impl Store {
         self.connection
             .query_row(
                 "SELECT id, text, sha256, workspace_id, lifecycle,
-                        source, project, domain, trust, strong, importance
+                        source, project, domain, trust, strong, importance, category_id
                  FROM facts
                  WHERE id = ?1 AND (workspace_id = '' OR workspace_id = ?2)",
                 params![id, workspace],
@@ -2462,6 +3110,61 @@ fn map_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Fact> {
         trust: row.get(8)?,
         strong: row.get::<_, i64>(9)? != 0,
         importance: row.get(10)?,
+        category_id: row.get(11)?,
+    })
+}
+
+fn map_category(row: &rusqlite::Row<'_>) -> rusqlite::Result<Category> {
+    Ok(Category {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        workspace: row.get(2)?,
+        created_at: row.get(3)?,
+    })
+}
+
+fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
+    Ok(Run {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        issue_ref: row.get(2)?,
+        pr_ref: row.get(3)?,
+        session: row.get(4)?,
+        git_ref: row.get(5)?,
+        files: row.get(6)?,
+        diff: row.get(7)?,
+        summary: row.get(8)?,
+        state: row.get(9)?,
+        workspace: row.get(10)?,
+        created_at: row.get(11)?,
+        ended_at: row.get(12)?,
+    })
+}
+
+fn map_measurement(row: &rusqlite::Row<'_>) -> rusqlite::Result<Measurement> {
+    Ok(Measurement {
+        id: row.get(0)?,
+        measurement: row.get(1)?,
+        sample: row.get(2)?,
+        variant: row.get(3)?,
+        value: row.get(4)?,
+        baseline: row.get::<_, i64>(5)? != 0,
+        workspace: row.get(6)?,
+        created_at: row.get(7)?,
+    })
+}
+
+fn map_feedback(row: &rusqlite::Row<'_>) -> rusqlite::Result<Feedback> {
+    Ok(Feedback {
+        id: row.get(0)?,
+        feedback_id: row.get(1)?,
+        site: row.get(2)?,
+        item_type: row.get(3)?,
+        item_ref: row.get(4)?,
+        signal: row.get(5)?,
+        query_hash: row.get(6)?,
+        workspace: row.get(7)?,
+        created_at: row.get(8)?,
     })
 }
 
@@ -2625,6 +3328,61 @@ fn validate_fact_metadata(metadata: &FactMetadata) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn validate_run_key(run_id: &str, workspace: &str) -> Result<(), StoreError> {
+    validate_graph_workspace(workspace)?;
+    if run_id.trim().is_empty() {
+        return Err(StoreError::Invalid("run_id must not be empty".to_owned()));
+    }
+    Ok(())
+}
+
+fn validate_run_spec(spec: &RunSpec) -> Result<(), StoreError> {
+    validate_run_key(&spec.run_id, &spec.workspace)
+}
+
+fn validate_measurement_spec(spec: &MeasurementSpec) -> Result<(), StoreError> {
+    validate_graph_workspace(&spec.workspace)?;
+    if spec.measurement.trim().is_empty() {
+        return Err(StoreError::Invalid(
+            "measurement name must not be empty".to_owned(),
+        ));
+    }
+    if spec.sample.trim().is_empty() {
+        return Err(StoreError::Invalid(
+            "measurement sample must not be empty".to_owned(),
+        ));
+    }
+    if !spec.value.is_finite() {
+        return Err(StoreError::Invalid(
+            "measurement value must be finite".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_feedback_spec(spec: &FeedbackSpec) -> Result<(), StoreError> {
+    validate_graph_workspace(&spec.workspace)?;
+    if spec.feedback_id.trim().is_empty() {
+        return Err(StoreError::Invalid(
+            "feedback_id must not be empty".to_owned(),
+        ));
+    }
+    if spec.item_type.trim().is_empty() || spec.item_ref.trim().is_empty() {
+        return Err(StoreError::Invalid(
+            "feedback item_type and item_ref must not be empty".to_owned(),
+        ));
+    }
+    if !matches!(
+        spec.signal.as_str(),
+        "helpful" | "not_helpful" | "stale" | "irrelevant" | "unsafe"
+    ) {
+        return Err(StoreError::Invalid(
+            "feedback signal must be helpful, not_helpful, stale, irrelevant, or unsafe".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_fact_filters(filters: &FactFilters) -> Result<(), StoreError> {
     if let Some(trust) = filters.trust.as_deref() {
         if !matches!(trust, "high" | "medium" | "low") {
@@ -2765,6 +3523,19 @@ fn split_utf8_chunks(content: &str, max_bytes: usize) -> Result<Vec<String>, Sto
         chunks.push(current);
     }
     Ok(chunks)
+}
+
+fn truncate_utf8(content: &str, max_bytes: usize) -> String {
+    if content.len() <= max_bytes {
+        return content.to_owned();
+    }
+    let end = content
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= max_bytes)
+        .last()
+        .unwrap_or(0);
+    content[..end].to_owned()
 }
 
 fn validate_event_spec(spec: &EventSpec) -> Result<(), StoreError> {
@@ -3097,6 +3868,123 @@ mod tests {
             }
         );
         assert!(store.compose_recall("Rust", "").is_err());
+    }
+
+    #[test]
+    fn runs_measurements_feedback_and_categories_are_idempotent_and_scoped() {
+        let store = Store::in_memory().expect("fresh store");
+        let category = store
+            .create_category("engineering", "workspace-a")
+            .expect("category");
+        assert_eq!(
+            store.create_category("engineering", "workspace-a").unwrap(),
+            category
+        );
+        let fact = store
+            .remember_fact("Rust run fact", "workspace-a")
+            .expect("fact");
+        let categorized = store
+            .categorize_pending("engineering", "Rust", "workspace-a", 10)
+            .expect("categorized facts");
+        assert_eq!(categorized.len(), 1);
+        assert_eq!(categorized[0].id, fact.id);
+        assert_eq!(categorized[0].category_id, Some(category.id));
+        assert!(store
+            .categorize_pending("engineering", "Rust", "workspace-a", 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.list_categories("workspace-b").unwrap(), Vec::new());
+
+        let run_spec = RunSpec {
+            run_id: "run-1".to_owned(),
+            issue_ref: "NTL-722".to_owned(),
+            pr_ref: "1".to_owned(),
+            session: "session-1".to_owned(),
+            git_ref: "abc123".to_owned(),
+            files: "src/store.rs".to_owned(),
+            diff: "small diff".to_owned(),
+            workspace: "workspace-a".to_owned(),
+        };
+        let run = store.begin_run(&run_spec).expect("run");
+        assert_eq!(store.begin_run(&run_spec).unwrap(), run);
+        assert!(store
+            .begin_run(&RunSpec {
+                issue_ref: "different-issue".to_owned(),
+                ..run_spec.clone()
+            })
+            .is_err());
+        let linked = store
+            .link_run(
+                "run-1",
+                Some("NTL-722"),
+                Some("https://github.com/maxivillus/memory-mcp-rust/pull/1"),
+                None,
+                None,
+                "workspace-a",
+            )
+            .unwrap()
+            .expect("linked run");
+        assert!(linked.pr_ref.contains("pull/1"));
+        let ended = store
+            .end_run("run-1", "passed", "workspace-a")
+            .unwrap()
+            .expect("ended run");
+        assert_eq!(ended.state, "closed");
+        assert_eq!(ended.summary, "passed");
+        assert_eq!(
+            store.end_run("run-1", "", "workspace-a").unwrap(),
+            Some(ended)
+        );
+        assert_eq!(store.query_runs("NTL-722", "workspace-a").unwrap().len(), 1);
+        assert!(store.query_runs("run-1", "workspace-b").unwrap().is_empty());
+
+        let measurement_spec = MeasurementSpec {
+            measurement: "latency_ms".to_owned(),
+            sample: "sample-1".to_owned(),
+            variant: "rust".to_owned(),
+            value: 12.5,
+            baseline: false,
+            workspace: "workspace-a".to_owned(),
+        };
+        let measurement = store
+            .record_measurement(&measurement_spec)
+            .expect("measurement");
+        assert_eq!(
+            store.record_measurement(&measurement_spec).unwrap(),
+            measurement
+        );
+        assert!(store
+            .record_measurement(&MeasurementSpec {
+                value: 13.0,
+                ..measurement_spec.clone()
+            })
+            .is_err());
+        assert_eq!(
+            store.query_measurements("latency", "workspace-a").unwrap(),
+            vec![measurement]
+        );
+
+        let feedback_spec = FeedbackSpec {
+            feedback_id: "feedback-1".to_owned(),
+            site: "recall".to_owned(),
+            item_type: "fact".to_owned(),
+            item_ref: fact.id.to_string(),
+            signal: "helpful".to_owned(),
+            query_hash: "query-hash".to_owned(),
+            workspace: "workspace-a".to_owned(),
+        };
+        let feedback = store.record_feedback(&feedback_spec).expect("feedback");
+        assert_eq!(store.record_feedback(&feedback_spec).unwrap(), feedback);
+        assert_eq!(
+            store.query_feedback("helpful", "workspace-a").unwrap(),
+            vec![feedback]
+        );
+        assert!(store
+            .record_feedback(&FeedbackSpec {
+                signal: "invalid".to_owned(),
+                ..feedback_spec
+            })
+            .is_err());
     }
 
     #[test]

@@ -222,6 +222,158 @@ fn tool_contract(name: &str) -> (&'static str, Value) {
                 "required": ["query", "workspace"]
             }),
         ),
+        "run_begin" => (
+            "Begin an idempotent bounded run record.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string"},
+                    "id": {"type": "string"},
+                    "issue_ref": {"type": "string"},
+                    "issue": {"type": "string"},
+                    "pr_ref": {"type": "string"},
+                    "pr": {"type": "string"},
+                    "session": {"type": "string"},
+                    "git_ref": {"type": "string"},
+                    "ref": {"type": "string"},
+                    "commit": {"type": "string"},
+                    "files": {},
+                    "changed_files": {},
+                    "diff": {},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["run_id", "workspace"]
+            }),
+        ),
+        "run_end" => (
+            "Close a run idempotently with an optional bounded summary.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string"},
+                    "id": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "result": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["run_id", "workspace"]
+            }),
+        ),
+        "link_run" => (
+            "Attach issue, pull request, session, or Git references to a run.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string"},
+                    "id": {"type": "string"},
+                    "issue_ref": {"type": "string"},
+                    "issue": {"type": "string"},
+                    "pr_ref": {"type": "string"},
+                    "pr": {"type": "string"},
+                    "session": {"type": "string"},
+                    "git_ref": {"type": "string"},
+                    "ref": {"type": "string"},
+                    "commit": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["run_id", "workspace"]
+            }),
+        ),
+        "query_run" => (
+            "Query bounded run records in a workspace.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["workspace"]
+            }),
+        ),
+        "record_measurement" => (
+            "Record one idempotent aggregate measurement observation.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "measurement": {"type": "string"},
+                    "name": {"type": "string"},
+                    "sample": {"type": "string"},
+                    "sample_id": {"type": "string"},
+                    "variant": {"type": "string"},
+                    "value": {"type": "number"},
+                    "baseline": {"type": "boolean"},
+                    "is_baseline": {"type": "boolean"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["measurement", "sample", "value", "workspace"]
+            }),
+        ),
+        "query_measurement" => (
+            "Query aggregate measurement observations in a workspace.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["workspace"]
+            }),
+        ),
+        "record_feedback" => (
+            "Record bounded idempotent feedback for a memory item.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "feedback_id": {"type": "string"},
+                    "id": {"type": "string"},
+                    "site": {"type": "string"},
+                    "item_type": {"type": "string"},
+                    "type": {"type": "string"},
+                    "item_ref": {"type": "string"},
+                    "ref": {"type": "string"},
+                    "signal": {"type": "string", "enum": ["helpful", "not_helpful", "stale", "irrelevant", "unsafe"]},
+                    "query_hash": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["feedback_id", "item_type", "item_ref", "signal", "workspace"]
+            }),
+        ),
+        "query_feedback" => (
+            "Query bounded feedback records in a workspace.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["workspace"]
+            }),
+        ),
+        "list_categories" => ("List workspace categories.", workspace_schema()),
+        "categorize_pending" => (
+            "Assign a category to unclassified active facts.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string"},
+                    "category_name": {"type": "string"},
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1},
+                    "max_results": {"type": "integer", "minimum": 1},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["category", "workspace"]
+            }),
+        ),
         "list_forgotten" => (
             "List forgotten facts with provenance metadata.",
             workspace_schema(),
