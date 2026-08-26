@@ -91,10 +91,11 @@ handling remains available after the seven-day marker expires.
 
 This is an incremental projection and standby migration boundary, not yet a
 native Redis execution engine. The SQLite Store remains the complete
-materialized engine and restart backup; fact history, context lineage,
-selected-database metadata, native Redis reads for all tools, migration from
-snapshot-only namespaces, and production measurements remain gated follow-up
-work.
+materialized engine and restart backup; selected-database metadata, native
+Redis reads for all tools, migration from snapshot-only namespaces, and
+production measurements remain gated follow-up work. Fact history and context
+lineage are now included in the workspace projection, but their native records
+are not yet authoritative read paths.
 
 The implementation is staged behind a coverage gate:
 

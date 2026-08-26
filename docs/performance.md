@@ -57,12 +57,12 @@ observable, but the local SQLite store remains the full-route materialized
 engine and standby; no native Redis performance win is claimed.
 
 The native projection is deliberately an incremental migration boundary. It
-covers the exported workspace entities (facts, contexts, events, handoffs,
-graph, decisions, evidence, categories, runs, measurements, feedback, and
-registered workspaces), while fact history, context lineage, selected database
-metadata, and native Redis reads remain follow-up work. Measurements must
-separate projection cost from snapshot backup cost and report rejection/fallback
-behavior when either bound is reached.
+covers the exported workspace entities (facts, contexts, events, fact history,
+context lineage, handoffs, graph, decisions, evidence, categories, runs,
+measurements, feedback, and registered workspaces), while selected database
+metadata and native Redis reads remain follow-up work. Measurements must
+separate projection cost from snapshot backup cost and report
+rejection/fallback behavior when either bound is reached.
 
 The replication budget is part of the acceptance contract. The watcher uses a
 small revision/health read, fetches a state batch only after a revision change,

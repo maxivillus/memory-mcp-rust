@@ -447,8 +447,8 @@ server through `BackendCoordinator`:
 - each workspace touched by a state-changing operation also receives a
   bounded native entity projection: hashed workspace/index keys point to
   individually addressable JSON records for facts, contexts, events,
-  handoffs, graph, decisions, evidence, categories, runs, measurements,
-  feedback, and registered workspaces;
+  fact history, context lineage, handoffs, graph, decisions, evidence,
+  categories, runs, measurements, feedback, and registered workspaces;
 - native projection replacement, the SQLite standby image, the monotonic
   revision, and the durable operation ledger are committed in one
   `WATCH`/`MULTI`/`EXEC` transaction; a per-workspace manifest records the
@@ -521,9 +521,8 @@ claim that this projection slice is already a complete native Redis backend:
 
 1. make native per-entity records the authoritative Redis read/write path for
    every Store operation while preserving the complete SQLite semantics;
-2. extend projection coverage to fact history, context lineage, selected
-   database metadata, and backup/rebuild migration, with explicit handling of
-   legacy snapshot-only namespaces;
+2. extend projection coverage to selected database metadata and backup/rebuild
+   migration, with explicit handling of legacy snapshot-only namespaces;
 3. add real-service migration, isolation, conflict, lag, backoff, clean-stop,
    and resource measurements rather than relying only on the bounded RESP
    fixture;

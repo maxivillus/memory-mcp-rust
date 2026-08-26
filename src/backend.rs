@@ -845,10 +845,26 @@ fn native_projection_for_workspace(
         )?;
     }
     for fact in exported.facts {
+        for history in store.fact_history(fact.id, workspace)? {
+            push_native_entity(
+                &mut entities,
+                "fact_history",
+                &history.id.to_string(),
+                &history,
+            )?;
+        }
         push_native_entity(&mut entities, "fact", &fact.id.to_string(), &fact)?;
     }
     for context in exported.contexts {
         push_native_entity(&mut entities, "context", &context.reference, &context)?;
+    }
+    for lineage in store.context_map(None, workspace)? {
+        let lineage_key = format!(
+            "{}\u{1f}{}\u{1f}{}",
+            lineage.parent_reference, lineage.child_reference, lineage.relation
+        );
+        let lineage_id = encode(Sha256::digest(lineage_key.as_bytes()));
+        push_native_entity(&mut entities, "context_lineage", &lineage_id, &lineage)?;
     }
     for event in exported.events {
         push_native_entity(&mut entities, "event", &event.id.to_string(), &event)?;
@@ -1236,6 +1252,98 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_projects_history_and_lineage_into_native_redis_state() {
+        let values = Arc::new(Mutex::new(HashMap::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server_values = Arc::clone(&values);
+        let server = thread::spawn(move || run_snapshot_redis(listener, server_values, None));
+        let adapter = RedisAdapter::connect(&format!("redis://{address}"), "native-history-test")
+            .expect("Redis adapter");
+        let database = test_database_path();
+        let mut inner = CoordinatorInner::new(&database, true).expect("coordinator state");
+        inner.attach_redis(adapter).expect("initial Redis state");
+        let coordinator = BackendCoordinator {
+            shared: Arc::new(Mutex::new(inner)),
+            stop: None,
+            watcher: None,
+        };
+
+        let fact_arguments = json!({"text": "history fact", "workspace": "w"});
+        coordinator
+            .execute_tool(
+                "remember_fact",
+                fact_arguments.as_object().unwrap(),
+                |store| {
+                    store
+                        .remember_fact("history fact", "w")
+                        .map(|fact| serde_json::to_value(fact).expect("fact"))
+                        .map_err(BackendToolError::Execution)
+                },
+            )
+            .expect("fact operation");
+
+        let parent_arguments = json!({
+            "ref": "ctx-parent",
+            "name": "Parent",
+            "content": "parent",
+            "workspace": "w"
+        });
+        coordinator
+            .execute_tool(
+                "put_context",
+                parent_arguments.as_object().unwrap(),
+                |store| {
+                    store
+                        .put_context("ctx-parent", "Parent", "parent", "w")
+                        .map(|context| serde_json::to_value(context).expect("context"))
+                        .map_err(BackendToolError::Execution)
+                },
+            )
+            .expect("parent context operation");
+
+        let child_arguments = json!({
+            "ref": "ctx-child",
+            "name": "Child",
+            "content": "child",
+            "workspace": "w"
+        });
+        coordinator
+            .execute_tool(
+                "put_context",
+                child_arguments.as_object().unwrap(),
+                |store| {
+                    let context = store
+                        .put_context("ctx-child", "Child", "child", "w")
+                        .map_err(BackendToolError::Execution)?;
+                    store
+                        .link_context("ctx-parent", "ctx-child", "derived_from", "w")
+                        .map_err(BackendToolError::Execution)?;
+                    Ok(serde_json::to_value(context).expect("context"))
+                },
+            )
+            .expect("child context operation");
+
+        let state = coordinator.shared.lock().expect("coordinator lock");
+        let native = state
+            .redis
+            .as_ref()
+            .expect("Redis connection")
+            .native_entities("w")
+            .expect("native projection");
+        assert!(native.iter().any(|entity| entity.kind == "fact_history"));
+        assert!(native.iter().any(|entity| entity.kind == "context_lineage"));
+        drop(state);
+        drop(coordinator);
+        server.join().expect("Redis fixture");
+        let _ = fs::remove_file(database.with_extension("outbox.jsonl"));
+        let _ = fs::remove_file(database.with_extension("reconciliation.jsonl"));
+        let _ = fs::remove_file(database.with_extension("db-wal"));
+        let _ = fs::remove_file(database.with_extension("db-shm"));
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
     fn watcher_stops_without_waiting_for_the_next_tick() {
         let database = test_database_path();
         let inner = CoordinatorInner::new(&database, true).expect("coordinator state");
@@ -1329,7 +1437,7 @@ mod tests {
             // The first native projection publish must commit before the
             // fixture drops the connection; the next operation then exercises
             // the real client-side loss path.
-            run_snapshot_redis(first_listener, first_values, Some(24));
+            run_snapshot_redis(first_listener, first_values, Some(26));
         });
         let adapter = RedisAdapter::connect(
             &format!("redis://{first_address}"),
@@ -1432,7 +1540,7 @@ mod tests {
                 .expect("committed ledger entry");
             assert_eq!(ledger.operation_name, "remember_fact");
             assert_eq!(ledger.status, "committed");
-            assert_eq!(ledger.entity_count, 2);
+            assert_eq!(ledger.entity_count, 4);
             assert_eq!(
                 adapter
                     .native_manifest("w")
