@@ -270,6 +270,18 @@ fn tool_contract(name: &str) -> (&'static str, Value) {
             "Report the explicit disabled-provider embedding fallback.",
             workspace_schema(),
         ),
+        "consolidate" => (
+            "Report deterministic exact-duplicate consolidation for active facts.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["workspace"]
+            }),
+        ),
         "search_facts" => (
             "Search active facts with optional provenance filters.",
             json!({
@@ -605,6 +617,20 @@ fn tool_contract(name: &str) -> (&'static str, Value) {
                 "required": ["query"]
             }),
         ),
+        "query_anchored" => (
+            "Query decision and evidence records by code or issue anchors.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "path": {"type": "string"},
+                    "symbol": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["workspace"]
+            }),
+        ),
         "attach_evidence" => (
             "Attach a bounded source anchor and selected-text hash to a fact.",
             json!({
@@ -874,6 +900,19 @@ fn tool_contract(name: &str) -> (&'static str, Value) {
                     "workspace_id": {"type": "string"}
                 },
                 "required": ["idempotency_key", "actor", "workspace"]
+            }),
+        ),
+        "backup_workspace" => (
+            "Write a deterministic JSON snapshot to an explicit workspace path.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "output": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "workspace_id": {"type": "string"}
+                },
+                "required": ["path", "workspace"]
             }),
         ),
         _ => (

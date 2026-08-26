@@ -470,6 +470,28 @@ pub struct EmbeddingBackfill {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AnchoredSearch {
+    pub decisions: Vec<Decision>,
+    pub evidence: Vec<Evidence>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ConsolidationReport {
+    pub status: String,
+    pub scanned: i64,
+    pub consolidated: i64,
+    pub remaining: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkspaceBackup {
+    pub path: String,
+    pub bytes: i64,
+    pub facts: i64,
+    pub contexts: i64,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Stats {
     pub facts: i64,
@@ -1887,6 +1909,114 @@ impl Store {
         Ok(PreparedSummary {
             summary: self.summarize_index(workspace)?,
             recall: self.compose_recall(query, workspace)?,
+        })
+    }
+
+    pub fn query_anchored(
+        &self,
+        query: &str,
+        workspace: &str,
+    ) -> Result<AnchoredSearch, StoreError> {
+        validate_graph_workspace(workspace)?;
+        let pattern = format!("%{}%", query.trim());
+        let decisions = {
+            let mut statement = self.connection.prepare(
+                "SELECT id, category, subject, scenario, reasoning,
+                        outcome, confidence, decision_maker, issue_ref,
+                        path, symbol, parent_id, workspace_id
+                 FROM decisions
+                 WHERE workspace_id = ?1
+                   AND (?2 = '%%' OR path LIKE ?2 OR symbol LIKE ?2 OR issue_ref LIKE ?2)
+                 ORDER BY id",
+            )?;
+            let rows = statement
+                .query_map(params![workspace, pattern], map_decision)?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        let evidence = {
+            let mut statement = self.connection.prepare(
+                "SELECT id, fact_id, source_ref, source, checksum, fetched_at,
+                        repository_ref, path, symbol, line_start, line_end,
+                        column_start, column_end, selected_text_sha256,
+                        resolution_status, workspace_id, created_at
+                 FROM evidence
+                 WHERE workspace_id = ?1
+                   AND (?2 = '%%' OR source_ref LIKE ?2 OR path LIKE ?2 OR symbol LIKE ?2)
+                 ORDER BY id",
+            )?;
+            let rows = statement
+                .query_map(params![workspace, pattern], map_evidence)?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        Ok(AnchoredSearch {
+            decisions,
+            evidence,
+        })
+    }
+
+    pub fn consolidate(
+        &self,
+        query: &str,
+        workspace: &str,
+    ) -> Result<ConsolidationReport, StoreError> {
+        let facts = if query.trim().is_empty() {
+            self.list_facts(workspace)?
+        } else {
+            self.search_facts(query, workspace)?
+        };
+        let scanned = facts.len() as i64;
+        Ok(ConsolidationReport {
+            status: "complete".to_owned(),
+            scanned,
+            // The schema enforces SHA-256/workspace uniqueness, so exact
+            // duplicate consolidation is already completed at ingestion.
+            consolidated: 0,
+            remaining: scanned,
+        })
+    }
+
+    pub fn backup_workspace(
+        &self,
+        path: &str,
+        workspace: &str,
+    ) -> Result<WorkspaceBackup, StoreError> {
+        validate_context_workspace(workspace)?;
+        if path.trim().is_empty() {
+            return Err(StoreError::Invalid(
+                "backup path must not be empty".to_owned(),
+            ));
+        }
+        let backup_path = Path::new(path);
+        if backup_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(StoreError::Invalid(
+                "backup path must not contain parent-directory components".to_owned(),
+            ));
+        }
+        if backup_path.exists() && backup_path.is_dir() {
+            return Err(StoreError::Invalid(
+                "backup path must reference a file".to_owned(),
+            ));
+        }
+        if let Some(parent) = backup_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let snapshot = self.export_snapshot(workspace)?;
+        let encoded = serde_json::to_vec_pretty(&snapshot).map_err(|error| {
+            StoreError::Invalid(format!("backup serialization failed: {error}"))
+        })?;
+        fs::write(backup_path, &encoded)?;
+        Ok(WorkspaceBackup {
+            path: path.to_owned(),
+            bytes: encoded.len() as i64,
+            facts: snapshot.facts.len() as i64,
+            contexts: snapshot.contexts.len() as i64,
         })
     }
 
@@ -4642,6 +4772,70 @@ mod tests {
         let embeddings = store.embed_backfill("workspace-a").unwrap();
         assert_eq!(embeddings.status, "disabled");
         assert_eq!(embeddings.updated, 0);
+    }
+
+    #[test]
+    fn anchored_queries_consolidation_and_backups_are_deterministic() {
+        let store = Store::in_memory().expect("fresh store");
+        let fact = store
+            .remember_fact("anchored fact", "workspace-a")
+            .expect("fact");
+        store
+            .record_decision(&DecisionSpec {
+                category: "storage".to_owned(),
+                subject: "memory".to_owned(),
+                scenario: "anchor".to_owned(),
+                reasoning: "test".to_owned(),
+                outcome: "SQLite".to_owned(),
+                confidence: Some(0.9),
+                decision_maker: "test".to_owned(),
+                issue_ref: "NTL-722".to_owned(),
+                path: "src/store.rs".to_owned(),
+                symbol: "Store".to_owned(),
+                parent_id: None,
+                workspace: "workspace-a".to_owned(),
+            })
+            .expect("decision");
+        store
+            .attach_evidence(&EvidenceSpec {
+                fact_id: fact.id,
+                source_ref: "src/store.rs:anchor".to_owned(),
+                source: "repository".to_owned(),
+                checksum: "checksum".to_owned(),
+                fetched_at: None,
+                repository_ref: "main".to_owned(),
+                path: "src/store.rs".to_owned(),
+                symbol: "Store".to_owned(),
+                line_start: Some(1),
+                line_end: Some(2),
+                column_start: None,
+                column_end: None,
+                selected_text: "anchored fact".to_owned(),
+                resolution_status: "resolved".to_owned(),
+                workspace: "workspace-a".to_owned(),
+            })
+            .expect("evidence");
+        let anchored = store.query_anchored("src/store.rs", "workspace-a").unwrap();
+        assert_eq!(anchored.decisions.len(), 1);
+        assert_eq!(anchored.evidence.len(), 1);
+        let consolidated = store.consolidate("anchored", "workspace-a").unwrap();
+        assert_eq!(consolidated.scanned, 1);
+        assert_eq!(consolidated.consolidated, 0);
+        assert_eq!(consolidated.remaining, 1);
+
+        let backup_path = std::env::temp_dir().join(format!(
+            "memory-mcp-rust-backup-{}.json",
+            std::process::id()
+        ));
+        let backup = store
+            .backup_workspace(backup_path.to_str().unwrap(), "workspace-a")
+            .expect("workspace backup");
+        assert!(backup.bytes > 0);
+        assert_eq!(backup.facts, 1);
+        assert!(fs::read_to_string(&backup_path)
+            .unwrap()
+            .contains("anchored fact"));
+        let _ = fs::remove_file(backup_path);
     }
 
     #[test]

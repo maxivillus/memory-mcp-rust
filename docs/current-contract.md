@@ -365,3 +365,20 @@ The eleventh implementation slice adds local-document and freshness boundaries:
 
 Database selection and backups, richer retention policy, and optional embedding
 or Redis adapters remain staged. No provider or performance claim is made.
+
+The twelfth implementation slice adds deterministic anchor and backup helpers:
+
+- query_anchored searches decision issue/path/symbol anchors and evidence
+  source/path/symbol anchors within one workspace;
+- consolidate reports the exact-duplicate invariant enforced by
+  `(sha256, workspace_id)` without silently merging semantically different
+  facts;
+- backup_workspace writes an explicit, bounded JSON workspace snapshot and
+  rejects empty or parent-directory output paths;
+- store and stdio tests cover anchor matching, consolidation reporting, and
+  backup readback.
+
+Named database selection/archive/delete and physical database backups remain
+staged because the current connection is intentionally single-store; the
+implemented backup is an explicit workspace JSON snapshot. Optional embedding
+and Redis adapters remain disabled and unclaimed.

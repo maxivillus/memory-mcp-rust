@@ -304,6 +304,15 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
                 .map_err(CallError::Execution)?,
         )
         .expect("embedding backfill serializes"),
+        "consolidate" => {
+            let query = optional_string(arguments, "query")?.unwrap_or("");
+            serde_json::to_value(
+                store
+                    .consolidate(query, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("consolidation serializes")
+        }
         "run_begin" => {
             let run_id = required_string(arguments, "run_id")
                 .or_else(|_| required_string(arguments, "id"))?;
@@ -874,6 +883,18 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
             )
             .expect("decision conflicts serialize")
         }
+        "query_anchored" => {
+            let query = optional_string(arguments, "query")?
+                .or(optional_string(arguments, "path")?)
+                .or(optional_string(arguments, "symbol")?)
+                .unwrap_or("");
+            serde_json::to_value(
+                store
+                    .query_anchored(query, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("anchored query serializes")
+        }
         "attach_evidence" => {
             let fact_id =
                 required_i64(arguments, "fact_id").or_else(|_| required_i64(arguments, "id"))?;
@@ -954,6 +975,17 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
             let id = workspace_argument(arguments)?;
             serde_json::to_value(store.reset_workspace(id).map_err(CallError::Execution)?)
                 .expect("workspace serializes")
+        }
+        "backup_workspace" => {
+            let path = required_string(arguments, "path")
+                .or_else(|_| required_string(arguments, "output"))?;
+            let workspace = required_context_workspace(arguments)?;
+            serde_json::to_value(
+                store
+                    .backup_workspace(path, workspace)
+                    .map_err(CallError::Execution)?,
+            )
+            .expect("workspace backup serializes")
         }
         "stats" => serde_json::to_value(store.stats().map_err(CallError::Execution)?)
             .expect("stats serialize"),
@@ -1654,6 +1686,49 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("\"status\":\"disabled\""));
+        let anchored = handle_line(
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"query_anchored","arguments":{"query":"store","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(anchored["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"decisions\""));
+        let consolidated = handle_line(
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"consolidate","arguments":{"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert!(consolidated["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"status\":\"complete\""));
+        let backup_path = std::env::temp_dir().join(format!(
+            "memory-mcp-rust-protocol-backup-{}.json",
+            std::process::id()
+        ));
+        let backup = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "backup_workspace",
+                    "arguments": {
+                        "path": backup_path.to_str().unwrap(),
+                        "workspace": "w"
+                    }
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        assert!(backup["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"bytes\""));
+        let _ = std::fs::remove_file(backup_path);
         let _ = std::fs::remove_file(path);
     }
 
