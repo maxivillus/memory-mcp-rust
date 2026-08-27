@@ -5,7 +5,13 @@ AppSec, artifact, and release readbacks recorded for the performance decision
 record. The decision
 accepts Redis as the canonical primary state with a Redis-restored in-memory
 compatibility engine and SQLite as the standby/fallback image; it does not
-claim a performance improvement.
+claim a performance improvement. This file is an immutable, decision-time
+record: the Context and implementation checkpoint sections below are historical
+snapshots, so phrases such as “currently”, “not yet”, and “Proposed” describe
+those checkpoints rather than the current repository. The current behavior is
+summarized in [`docs/current-contract.md`](../current-contract.md), and the
+pointwise refinement is recorded in
+[`ADR-0002`](ADR-0002-pointwise-redis-replication.md).
 
 ## Context
 

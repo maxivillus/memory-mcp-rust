@@ -25,8 +25,9 @@ surface.
 
 ## Public tool inventory
 
-The names and schemas are grouped here for review. The Rust tool descriptor set
-is authoritative for every parameter, default, enum, and bound.
+The names are grouped here for review. Exact parameter schemas are available in
+[`docs/upstream-tools.json`](upstream-tools.json); the Rust tool descriptor set
+remains authoritative for every parameter, default, enum, and bound.
 
 ### Facts, retrieval, lifecycle, and review
 

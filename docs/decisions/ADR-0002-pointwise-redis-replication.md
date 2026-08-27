@@ -1,8 +1,9 @@
 ## Status
 
-Proposed refinement of the accepted Redis-primary model in ADR-0001. The
-product owner selected Redis-first operation with SQLite fallback; this record
-defines the write and mirror mechanics for that choice.
+Implemented refinement of the accepted Redis-primary model in ADR-0001. The
+current Rust coordinator and its tests implement the write and mirror mechanics
+described below; this record makes no performance claim. Current public
+behavior is summarized in [`docs/current-contract.md`](../current-contract.md).
 
 ## Decision
 

@@ -93,6 +93,30 @@ configuration is:
 The exact configuration key is client-specific; keep the server attached to
 stdin/stdout and give its database directory write access.
 
+### Migrate an existing SQLite database
+
+The release binary includes a copy-first migration command for a verified
+legacy SQLite database. It opens the source read-only, refuses an existing
+target, runs the Rust schema upgrades on a private copy, checks integrity and
+data fingerprints, and publishes the new target atomically. The source is left
+unchanged.
+
+Choose a new target path that does not already exist, then run the repository
+launcher:
+
+```sh
+MEMORY_MCP_RUST_BIN="$PWD/target/release/memory-mcp-rust" \
+MEMORY_MIGRATE_SOURCE=/path/to/legacy.db \
+MEMORY_MIGRATE_TARGET=/path/to/data/facts-rust.db \
+  ./scripts/memory-mcp-migrate.sh
+```
+
+The command prints a JSON report with integrity and `data_match` results. Once
+the report passes, point the client at the new file with `MEMORY_MCP_DB`; do
+not replace the legacy source in place. For a pre-cutover comparison of legacy
+and Rust launchers, `scripts/memory-mcp-preflight.py` checks their contracts,
+SQLite tables, configured environment names, and advertised tool routes.
+
 ## How the backend works
 
 ```text
@@ -136,6 +160,7 @@ measurement rules.
 | `MEMORY_MCP_REDIS_NAMESPACE` | Redis key namespace. Defaults to `memory-mcp`. |
 | `MEMORY_MCP_REDIS_WATCH_INTERVAL_MS` | Bounded standby/recovery watcher interval. Default is 5 seconds. |
 | `MEMORY_MCP_REDIS_MAX_BACKOFF_MS` | Maximum watcher backoff after an error. Default is 60 seconds. |
+| `MEMORY_MCP_CONTEXT_MAX_BYTES` | Maximum UTF-8 context payload accepted by context storage. Defaults to 4 MiB; valid values range from 1 byte to 16 MiB. |
 
 Redis endpoint validation is deliberately loopback-only. A separate Docker
 service hostname or remote Redis endpoint is rejected by the binary; use a
@@ -347,6 +372,7 @@ The repository layout follows the runtime boundary:
 | `docs/current-contract.md` | Current protocol and safety contract. |
 | `docs/decisions/` | Architecture decisions for Redis-first storage and pointwise replication. |
 | `docs/documentation-roadmap.md` | Scope and verification record for the documentation set. |
+| `docs/tech-radar.md` | Architecture patterns, dependencies, and implementation map. |
 
 ## Further reading
 
@@ -357,3 +383,7 @@ The repository layout follows the runtime boundary:
 - [`docs/decisions/ADR-0001-redis-primary-with-sqlite-fallback.md`](docs/decisions/ADR-0001-redis-primary-with-sqlite-fallback.md)
   and [`docs/decisions/ADR-0002-pointwise-redis-replication.md`](docs/decisions/ADR-0002-pointwise-redis-replication.md)
   — the selected backend design.
+- [`docs/documentation-roadmap.md`](docs/documentation-roadmap.md) — documentation
+  scope, source baseline, and verification record.
+- [`docs/tech-radar.md`](docs/tech-radar.md) — implementation patterns and
+  dependency map.
