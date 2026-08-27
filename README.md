@@ -315,6 +315,14 @@ MEMORY_MCP_RUST_BIN=/path/to/memory-mcp-rust \
   scripts/memory-mcp-migrate.sh
 ```
 
+The Rust repository ships two helper scripts used by this documentation:
+`scripts/memory-mcp-migrate.sh` for copy-first migration and
+`scripts/memory-mcp-preflight.py` for the legacy/Rust contract check. It does
+not ship the legacy Python server (`memory_mcp.py`) or the legacy Python test
+suites. Those are external rollback and parity inputs; in the rollout example,
+replace `/path/to/...` with a separate legacy checkout. The Rust binary itself
+does not require Python.
+
 For the complete Python↔Rust contract preflight and controlled cutover/rollback
 procedure, see [`docs/deployment/memory-mcp-rust-rollout.md`](docs/deployment/memory-mcp-rust-rollout.md).
 
@@ -379,6 +387,8 @@ The repository layout follows the runtime boundary:
 | `docs/current-contract.md` | Compatibility and safety contract. |
 | `docs/decisions/` | Architecture decisions for Redis-first storage and pointwise replication. |
 | `docs/upstream-tools.json` | Exact 80-tool descriptions and input schemas. |
+| `scripts/memory-mcp-migrate.sh` | Shipped copy-first migration wrapper. |
+| `scripts/memory-mcp-preflight.py` | Shipped legacy/Rust contract preflight utility. |
 
 ## Further reading
 
