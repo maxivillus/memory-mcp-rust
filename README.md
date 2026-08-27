@@ -1,8 +1,7 @@
 # memory-mcp-rust
 
-`memory-mcp-rust` is a compatibility-first Rust implementation of the
-`memory-mcp` stdio server: one executable, newline-delimited JSON-RPC 2.0, and
-80 advertised tools for durable, searchable memory.
+`memory-mcp-rust` is a Rust MCP server: one executable, newline-delimited
+JSON-RPC 2.0, and 80 advertised tools for durable, searchable memory.
 
 The default backend is bundled SQLite with FTS5. When a supported loopback
 Redis endpoint is configured and reachable, Redis becomes the primary backend
@@ -12,11 +11,10 @@ decision source.
 
 ## What it provides
 
-- One Rust binary with no Python runtime requirement.
 - MCP over stdin/stdout: one JSON-RPC request per line and one newline-delimited
   response per request with an id. Notifications produce no response;
   diagnostics go to stderr.
-- The upstream-compatible server identity `memory-mcp` version `0.23.0`.
+- The server identity `memory-mcp` version `0.23.0` during initialization.
 - Exactly 80 tools in `tools/list`; the compatibility alias `add_fact` is
   callable but intentionally not advertised.
 - Durable facts, immutable context artifacts, lifecycle events, typed
@@ -24,8 +22,6 @@ decision source.
   databases, and workspaces.
 - Optional local/provider-backed embeddings, extraction, recall, verification,
   and categorization, each behind an explicit environment flag.
-- Copy-first SQLite migration with integrity, row-count, and per-row
-  fingerprint checks.
 
 ## Technologies and design ideas
 
@@ -38,9 +34,9 @@ decision source.
 | Redis integration | Bounded in-tree RESP2 adapter | Redis can own the complete state without adding a client-library runtime dependency. |
 | Optional intelligence | Loopback HTTP adapters and deterministic `test` providers | Extraction, embeddings, recall, verification, and categorization stay opt-in and advisory. |
 
-The main design boundaries are compatibility first, bounded payloads, immutable
-context references, explicit workspace scope, idempotent state changes, and
-safe recovery. Model output can suggest a fact or category, but only a human
+The main design boundaries are stable protocol contracts, bounded payloads,
+immutable context references, explicit workspace scope, idempotent state
+changes, and safe recovery. Model output can suggest a fact or category, but only a human
 review path can make it trusted; retrieved memory never authorizes a
 safety-critical action.
 
@@ -170,10 +166,9 @@ unconfirmed candidate and never grants authority.
 ## Tool catalog
 
 The table below covers every advertised tool. Exact parameter names, required
-fields, defaults, enums, and bounds live in the machine-readable contract at
-[`docs/upstream-tools.json`](docs/upstream-tools.json). Most workspace-aware
-tools accept either `workspace` or `workspace_id`; context operations require
-an explicit non-empty workspace.
+fields, defaults, enums, and bounds are defined by the Rust tool descriptors and
+verified by protocol tests. Most workspace-aware tools accept either `workspace`
+or `workspace_id`; context operations require an explicit non-empty workspace.
 
 ### Facts, retrieval, lifecycle, and review
 
@@ -291,48 +286,6 @@ an explicit non-empty workspace.
 but it is intentionally absent from `tools/list`. Clients should prefer
 `remember_fact` when they can choose the name.
 
-## Optional legacy migration and cutover
-
-Normal Rust-only use does not enter this section: the build, run, test, and
-Docker paths above use the Rust binary and do not require Python. The
-procedures below are only for importing an existing database from an external
-legacy deployment or retaining that deployment as a rollback/comparison target.
-
-Migration is copy-first. Keep the external legacy database as a rollback
-point, verify its backup, and choose a destination that does not already exist:
-
-```sh
-./target/release/memory-mcp-rust migrate --source LEGACY.db --target RUST.db
-```
-
-The subcommand opens the source read-only, applies Rust schema migrations to a
-private temporary copy, checks source and target integrity, compares durable
-row counts, and verifies per-row typed SHA-256 fingerprints before publishing
-the destination without overwrite. The JSON report contains checks, counts,
-and fingerprints rather than memory payloads or private paths.
-
-The environment-variable wrapper is useful in deployment scripts:
-
-```sh
-MEMORY_MIGRATE_SOURCE=/path/to/verified-legacy-copy.db \
-MEMORY_MIGRATE_TARGET=/path/to/new-rust.db \
-MEMORY_MCP_RUST_BIN=/path/to/memory-mcp-rust \
-  scripts/memory-mcp-migrate.sh
-```
-
-The Rust repository ships two helper scripts used by this optional flow:
-`scripts/memory-mcp-migrate.sh` for copy-first migration and
-`scripts/memory-mcp-preflight.py` for the legacy/Rust contract check. The
-preflight script is a standalone comparison utility; it is not used to start,
-run, or test the Rust server. The repository does not ship the external legacy
-server (`memory_mcp.py`) or its test suites. Those are rollback and parity
-inputs; in the rollout example, replace `/path/to/...` with a separate legacy
-checkout. The Rust binary itself does not require Python.
-
-For the complete optional legacy/Rust contract preflight and controlled
-cutover/rollback procedure, see
-[`docs/deployment/memory-mcp-rust-rollout.md`](docs/deployment/memory-mcp-rust-rollout.md).
-
 ## Docker
 
 The repository does not publish an image or ship a Dockerfile. The following
@@ -380,26 +333,20 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-These are the checks for this Rust repository. No Python runtime or Python
-test suite is required for local development; the Python preflight utility
-above is only for an explicit comparison with an external legacy deployment.
-
 The repository layout follows the runtime boundary:
 
 | Path | Responsibility |
 | --- | --- |
-| `src/main.rs` | Stdio entry point and the `migrate` subcommand. |
-| `src/protocol.rs` | JSON-RPC/MCP request handling and compatibility dispatch. |
-| `src/tools.rs` | Advertised tool names and the embedded upstream descriptor contract. |
-| `src/store.rs` | SQLite schema, FTS5 indexes, migrations, and compatibility semantics. |
+| `src/main.rs` | Stdio entry point and command dispatch. |
+| `src/protocol.rs` | JSON-RPC/MCP request handling and tool dispatch. |
+| `src/tools.rs` | Advertised tool names and descriptor schemas. |
+| `src/store.rs` | SQLite schema, FTS5 indexes, upgrades, and operation semantics. |
 | `src/backend.rs` | Redis/SQLite selection, standby, outbox, reconciliation, and watcher. |
 | `src/redis.rs` | Bounded RESP2 connection and Redis state/projection operations. |
 | `src/pipeline.rs` and `src/providers.rs` | Optional extraction, recall, verification, categorization, and embedding adapters. |
-| `docs/current-contract.md` | Compatibility and safety contract. |
+| `docs/current-contract.md` | Current protocol and safety contract. |
 | `docs/decisions/` | Architecture decisions for Redis-first storage and pointwise replication. |
-| `docs/upstream-tools.json` | Exact 80-tool descriptions and input schemas. |
-| `scripts/memory-mcp-migrate.sh` | Shipped copy-first migration wrapper. |
-| `scripts/memory-mcp-preflight.py` | Shipped optional legacy/Rust comparison utility; not a server runtime dependency. |
+| `docs/documentation-roadmap.md` | Scope and verification record for the documentation set. |
 
 ## Further reading
 
@@ -407,11 +354,6 @@ The repository layout follows the runtime boundary:
   persistence, parity, and current backend contract.
 - [`docs/performance.md`](docs/performance.md) — benchmark procedure and why
   performance efficacy remains `not_claimed`.
-- [`docs/deployment/memory-mcp-rust-rollout.md`](docs/deployment/memory-mcp-rust-rollout.md)
-  — migration, preflight, cutover, rollback, and resource guardrails.
 - [`docs/decisions/ADR-0001-redis-primary-with-sqlite-fallback.md`](docs/decisions/ADR-0001-redis-primary-with-sqlite-fallback.md)
   and [`docs/decisions/ADR-0002-pointwise-redis-replication.md`](docs/decisions/ADR-0002-pointwise-redis-replication.md)
   — the selected backend design.
-- [Legacy `memory-mcp`](https://github.com/maxivillus/memory-mcp) — upstream
-  compatibility reference; this README documents the current Rust repository,
-  not every legacy deployment option.

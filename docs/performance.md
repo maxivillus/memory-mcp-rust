@@ -3,7 +3,7 @@
 The repository includes a bounded memory-bench binary for the performance
 decision record. It runs one fixed workload:
 
-1. open a persistent SQLite connection and complete one-time migrations;
+1. open a persistent SQLite connection and complete one-time schema setup;
 2. insert unique facts into one workspace;
 3. search the same workspace repeatedly.
 
@@ -23,7 +23,7 @@ The binary reports both backend timings only when Redis passes its connection
 and PING probe. If the configured endpoint is unavailable, it reports
 selected_backend=sqlite and an explicit fallback reason.
 
-The JSON output separates migration/setup, writes, searches, and total time.
+The JSON output separates setup, writes, searches, and total time.
 When the Redis adapter is selected, it also reports payload-free
 `redis_commands`, `redis_request_bytes`, and `redis_response_bytes` counters;
 the SQLite row leaves those fields null. These counters make command and wire
@@ -56,7 +56,7 @@ reserved for attach, schema rebuild, recovery, and an amortized checkpoint
 every 256 committed revisions. The projection is capped at 4096 entities and
 8 MiB per delta batch; each record is individually addressable through a hashed
 key and a workspace index. A version-2
-schema marker triggers a bounded full rebuild for legacy snapshot-only
+schema marker triggers a bounded full rebuild for snapshot-only
 namespaces. No native Redis performance win is claimed.
 
 The native projection covers the exported workspace entities (facts, contexts,
