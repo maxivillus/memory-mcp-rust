@@ -4,6 +4,12 @@ This runbook describes the controlled replacement of the Python memory-mcp
 stdio server with `memory-mcp-rust`. The Python launcher remains the rollback
 implementation until the complete gate is green.
 
+The Rust repository ships `scripts/memory-mcp-migrate.sh` and
+`scripts/memory-mcp-preflight.py`. It does not ship the legacy Python server,
+its launcher, or its Python test suites. The legacy command, database copy, and
+launcher configuration referenced below must come from a separate legacy
+checkout or deployment.
+
 The Rust server uses Redis as the preferred backend when a supported Redis
 setting is configured and reachable. SQLite remains the standby and fallback
 store. A Redis outage must therefore select SQLite, retain offline writes in
@@ -66,13 +72,15 @@ file names; private absolute paths remain internal to the store.
 
 ## Contract and launcher preflight
 
-Run the preflight against the old Python command and the Rust command, pointing
-each at its own migrated copy. Supply the environment variable names declared
-by the two launchers, not their values:
+Run the shipped preflight utility against the old Python command and the Rust
+command, pointing each at its own migrated copy. `memory_mcp.py` in the example
+is an external legacy entrypoint, not a file in this repository; replace the
+placeholder with the command used by the legacy checkout. Supply the environment
+variable names declared by the two launchers, not their values:
 
 ```sh
 python3 scripts/memory-mcp-preflight.py \
-  --legacy-command 'python3 /path/to/memory_mcp.py' \
+  --legacy-command 'python3 /path/to/legacy-checkout/memory_mcp.py' \
   --rust-command '/path/to/memory-mcp-rust' \
   --legacy-db /path/to/python-copy.db \
   --rust-db /path/to/rust-copy.db \

@@ -189,12 +189,19 @@ wrapper for the same operation.
 
 ## Compatibility test baseline
 
-The upstream CI runs Python 3.11 and both suites:
+The upstream/legacy CI runs Python 3.11 and both suites:
 
 ```text
 python -m unittest discover -s tests -v
 python -m unittest -q test_memory_mcp
 ```
+
+These commands describe the external legacy baseline; they are not runnable
+from this Rust checkout. `tests/test_memory_mcp.py` and
+`test_memory_mcp.py` are legacy test files and are not shipped in this
+repository. Use a separate legacy checkout when reproducing that baseline;
+the Rust repository's local checks are `cargo test` and the Rust-side parity
+tests.
 
 At the pinned revision, `tests/test_memory_mcp.py` contains 157 test methods
 and the legacy `test_memory_mcp.py` contains 78. The Rust port must turn these
@@ -245,11 +252,12 @@ servers' initialize identity, all 80 tool descriptors, launcher environment
 names, SQLite row counts, and disposable empty-argument routes. It treats
 missing required arguments as valid route evidence, but blocks unknown or
 unimplemented handlers. The actual legacy-Python-versus-Rust preflight remains
-a release gate: it must be run with the deployed Python command, its migrated
-database copy, and the complete set of environment names that affect provider
-and pipeline behavior. The Rust entry point accepts those names and routes the
-corresponding operations through the compatibility layer; removing them to make
-the comparison green would invalidate the parity check.
+a release gate: the preflight utility is shipped here, but the deployed Python
+command is external to this repository. It must be run with that command, its
+migrated database copy, and the complete set of environment names that affect
+provider and pipeline behavior. The Rust entry point accepts those names and
+routes the corresponding operations through the compatibility layer; removing
+them to make the comparison green would invalidate the parity check.
 
 The slice descriptions below record historical implementation milestones. The
 Redis-first coordinator and the completed provider/pipeline compatibility
