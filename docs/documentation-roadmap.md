@@ -13,7 +13,7 @@ their links are updated; repository history remains the recovery mechanism.
 
 ## Source baseline
 
-The baseline is `origin/main` at `23f5f6c6a314fe45c636acbecf4c18af1a4b4519`.
+The baseline is `origin/main` at `6f5d8b4e8f5086b47c6c7ecfbf7f74130867eea7`.
 Facts were checked against the current source and tests, especially:
 
 - `src/main.rs`, `src/protocol.rs`, and `src/tools.rs` for the executable,
@@ -23,7 +23,7 @@ Facts were checked against the current source and tests, especially:
 - `Cargo.toml` and the repository test configuration for supported checks;
 - the architecture decisions and performance notes under `docs/`.
 
-## Audit findings and plan
+## Audit findings and remediation plan
 
 1. Keep onboarding, Docker, tool, storage, and current backend documentation.
 2. Keep public docs focused on the current Rust workflow and remove links to
@@ -32,6 +32,19 @@ Facts were checked against the current source and tests, especially:
    issues when they describe live fields or operations.
 4. Verify internal links, stale terminology, source-sensitive paths, and the
    Rust formatting, test, and lint commands.
+
+The repeat audit recorded seven findings. This remediation pass resolves them
+without changing executable behavior:
+
+| Finding | Resolution |
+| --- | --- |
+| ADR-0001 mixed decision-time and current implementation claims. | Its status now labels the checkpoints as historical and points to the current contract. |
+| ADR-0002 remained `Proposed` although its mechanics were implemented. | Its status now records the implemented refinement without making a performance claim. |
+| The roadmap baseline referenced an older commit. | The source baseline is `6f5d8b4e8f5086b47c6c7ecfbf7f74130867eea7`. |
+| The migration command and launcher were hard to discover. | README now documents the copy-first command, safety behavior, report, and preflight helper. |
+| The tech radar and roadmap were not discoverable from the landing page. | README now links both documents from its project map and Further reading. |
+| README omitted `MEMORY_MCP_CONTEXT_MAX_BYTES`. | README now documents its default and allowed range. |
+| The current contract implied schemas were listed inline. | The wording now links the checked-in JSON schema reference and keeps Rust descriptors authoritative. |
 
 ## Verification
 
