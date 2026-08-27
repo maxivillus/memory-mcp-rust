@@ -1,10 +1,9 @@
 # Current memory-mcp contract
 
 This document is the compatibility baseline for the Rust rewrite. It records
-the behavior of the upstream Python server at commit
-[`13d30a0f840e49b71a983609fd4a180e31ff219c`](https://github.com/maxivillus/memory-mcp/tree/13d30a0f840e49b71a983609fd4a180e31ff219c).
-The upstream `memory_mcp.py`, its `TOOLS` map, and the test suites remain the
-source of truth until a Rust parity test replaces each item below.
+the reviewed upstream contract snapshot kept in `docs/upstream-tools.json`.
+The pinned contract snapshot and the Rust parity tests remain the source of
+truth for the tool surface.
 
 ## Runtime and wire protocol
 
@@ -29,6 +28,21 @@ source of truth until a Rust parity test replaces each item below.
 
 The names and schemas are grouped here for review. The upstream `TOOLS` map is
 the authoritative schema for every parameter, default, enum, and bound.
+
+## Resource and security bounds
+
+- fact text is limited to 16,000 Unicode scalar values before persistence;
+- context content is limited to `MEMORY_MCP_CONTEXT_MAX_BYTES`, defaulting to
+  4 MiB and capped at 16 MiB;
+- lifecycle payloads are sanitized for credential-like fields, honor
+  `exclude_paths`, and are limited to 16 KiB after sanitization; metadata is
+  limited to 16 KiB;
+- document ingestion requires a caller-supplied root plus a relative path and
+  reads at most 16 MiB through a bounded stream; the root is never persisted;
+- explicit backup arguments are file names resolved below a mode-0700 private
+  `backups/` directory, and backup files use mode 0600;
+- the bundled plaintext Redis and HTTP provider adapters accept only loopback
+  endpoints. Remote services require a local TLS proxy or sidecar.
 
 ### Facts, retrieval, lifecycle, and review
 
@@ -268,7 +282,8 @@ SQLite behavior has a broader deterministic test baseline.
 The fourth implementation slice adds SQLite-backed lifecycle events and
 one-shot handoffs:
 
-- capture_event stores event type, metadata, payload hash/size/truncation, and
+- capture_event sanitizes secrets, removes caller-selected payload paths,
+  bounds payload and metadata bytes, then stores the sanitized envelope behind
   an immutable workspace-scoped context reference; the idempotency key is
   replay-safe and conflicting replays are rejected;
 - list_events and read_event provide deterministic workspace-scoped reads;
@@ -387,9 +402,10 @@ provider is claimed by the SQLite fallback.
 
 The eleventh implementation slice adds local-document and freshness boundaries:
 
-- ingest_document admits only a regular, valid-UTF-8 file within the configured
-  byte bound, rejects parent-directory path components, and stores the content
-  as an immutable workspace context with a deterministic generated reference;
+- ingest_document requires an explicit local root and repository-relative path,
+  admits only a regular, valid-UTF-8 file within the configured byte bound,
+  rejects traversal and symlink escapes, and stores bounded chunks as immutable
+  workspace contexts without persisting the root path;
 - sweep_freshness and decay_sweep mark old valid active facts as `degraded` and
   record each transition in fact_history; the age threshold is explicit and
   negative thresholds are rejected;
@@ -408,8 +424,9 @@ The twelfth implementation slice adds deterministic anchor and backup helpers:
 - consolidate reports the exact-duplicate invariant enforced by
   `(sha256, workspace_id)` without silently merging semantically different
   facts;
-- backup_workspace writes an explicit, bounded JSON workspace snapshot and
-  rejects empty or parent-directory output paths;
+- backup_workspace writes an atomic JSON workspace snapshot under the private
+  `backups/` directory with mode 0600; explicit output arguments are restricted
+  to one file name and cannot escape that directory;
 - store and stdio tests cover anchor matching, consolidation reporting, and
   backup readback.
 
@@ -417,7 +434,7 @@ At the twelfth implementation slice, named database
 selection/archive/delete and physical database backups remained staged because
 the connection was intentionally single-store; the implemented backup was an
 explicit workspace JSON snapshot. Optional embedding and Redis adapters
-remained disabled and unclaimed.
+were still treated as optional and unclaimed at that historical slice.
 
 The thirteenth implementation slice completes the SQLite database lifecycle:
 
@@ -428,14 +445,15 @@ The thirteenth implementation slice completes the SQLite database lifecycle:
   store, while archive_database and delete_database reject the active store;
 - reset_database clears the selected store or an inactive named store without
   changing its schema;
-- backup_database uses SQLite VACUUM INTO at an explicit output path, so
-  active WAL state is included in a consistent physical backup;
+- backup_database uses SQLite VACUUM INTO a private temporary file and then
+  atomically publishes a mode-0600 file under `backups/`, so active WAL state
+  is included without accepting arbitrary output paths;
 - store and stdio tests cover isolation across selected databases, archive and
   deletion safeguards, reset behavior, path validation, and backup readback.
 
 The SQLite implementation now covers the file-backed database lifecycle in
-the pinned tool inventory. Optional embedding and Redis adapters remain
-disabled and unclaimed.
+the pinned tool inventory. Database files are opened as regular mode-0600
+files and symbolic-link database paths are rejected.
 
 The fourteenth implementation slice adds a bounded performance harness and an
 optional Redis core-fact adapter:
@@ -449,7 +467,8 @@ optional Redis core-fact adapter:
   operations;
 - Redis configuration is optional: no URL, an invalid endpoint, or an
   unavailable service selects the SQLite fallback without exposing connection
-  credentials;
+  credentials. The bundled plaintext RESP adapter accepts only loopback
+  endpoints; remote deployments must provide a local TLS proxy or sidecar;
 - the benchmark emits the selected backend and fallback reason, but keeps
   performance efficacy explicitly not claimed until a paired workload and
   environment review is available.
@@ -559,9 +578,10 @@ policy above for the next implementation stages:
   `add_fact` alias must cross the same coordinator, with no direct dispatcher
   path that silently bypasses Redis, the standby, or the outbox;
 - Redis may be configured with an explicit `MEMORY_MCP_REDIS_URL`/`REDIS_URL`
-  or with Docker-style host, port, database, user, and password variables;
-  explicit URLs take precedence, and credentials remain environment-only and
-  are never emitted in logs, reports, test fixtures, or protocol responses.
+  or with host, port, database, user, and password variables; explicit URLs
+  take precedence, loopback-only endpoint validation is applied before connect,
+  and credentials remain environment-only and are never emitted in logs,
+  reports, test fixtures, or protocol responses.
 
 Option A is now the selected implementation model: Redis owns the canonical
 revision and the complete operation state, while the compatibility engine is

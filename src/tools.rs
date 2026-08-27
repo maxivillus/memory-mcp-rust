@@ -96,11 +96,11 @@ pub fn advertised_tools() -> Vec<Value> {
 fn tool_contract(name: &str) -> (&'static str, Value) {
     match name {
         "remember_fact" => (
-            "Store a deduplicated fact with optional provenance metadata.",
+            "Store a deduplicated fact with optional provenance metadata; text is limited to 16000 characters.",
             json!({
                 "type": "object",
                 "properties": {
-                    "text": {"type": "string"},
+                    "text": {"type": "string", "maxLength": 16000},
                     "source": {"type": "string"},
                     "project": {"type": "string"},
                     "domain": {"type": "string"},
@@ -684,7 +684,7 @@ fn tool_contract(name: &str) -> (&'static str, Value) {
                 "properties": {
                     "ref": {"type": "string"},
                     "name": {"type": "string"},
-                    "content": {"type": "string"},
+                    "content": {"type": "string", "description": "UTF-8 context payload bounded by MEMORY_MCP_CONTEXT_MAX_BYTES (default 4194304 bytes)."},
                     "schema": {"type": "string"},
                     "source": {"type": "string"},
                     "expires_at": {"type": "string"},
@@ -697,20 +697,20 @@ fn tool_contract(name: &str) -> (&'static str, Value) {
             }),
         ),
         "ingest_document" => (
-            "Read a bounded UTF-8 local document into an immutable context.",
+            "Preview or commit one UTF-8 document from an explicit local root as bounded immutable workspace-scoped context chunks; the root path is never stored or returned.",
             json!({
                 "type": "object",
                 "properties": {
+                    "root": {"type": "string", "description": "Explicit local directory root used only for this read."},
                     "path": {"type": "string"},
-                    "ref": {"type": "string"},
-                    "reference": {"type": "string"},
                     "name": {"type": "string"},
-                    "max_bytes": {"type": "integer", "minimum": 1},
-                    "limit": {"type": "integer", "minimum": 1},
-                    "workspace": {"type": "string"},
-                    "workspace_id": {"type": "string"}
+                    "chunk_chars": {"type": "integer", "minimum": 256, "maximum": 16000, "default": 4000},
+                    "max_bytes": {"type": "integer", "minimum": 1, "maximum": 16777216, "default": 4194304},
+                    "ttl_seconds": {"type": "integer", "minimum": 0, "maximum": 604800},
+                    "commit": {"type": "boolean", "default": false},
+                    "workspace": {"type": "string"}
                 },
-                "required": ["path", "workspace"]
+                "required": ["root", "path", "workspace"]
             }),
         ),
         "list_context" => (
@@ -807,22 +807,26 @@ fn tool_contract(name: &str) -> (&'static str, Value) {
             }),
         ),
         "capture_event" => (
-            "Capture one idempotent lifecycle event for a context.",
+            "Capture one sanitized, byte-bounded lifecycle envelope in the exact workspace; secrets and excluded paths are removed before persistence.",
             json!({
                 "type": "object",
                 "properties": {
-                    "idempotency_key": {"type": "string"},
-                    "event_id": {"type": "string"},
-                    "event_type": {"type": "string"},
-                    "type": {"type": "string"},
-                    "context_ref": {"type": "string"},
-                    "context": {"type": "string"},
-                    "metadata": {"type": "object"},
-                    "payload": {},
-                    "workspace": {"type": "string"},
-                    "workspace_id": {"type": "string"}
+                    "idempotency_key": {"type": "string", "maxLength": 256},
+                    "event_id": {"type": "string", "maxLength": 256},
+                    "event_kind": {"type": "string", "maxLength": 64},
+                    "session_id": {"type": "string", "maxLength": 256},
+                    "source": {"type": "string", "maxLength": 256},
+                    "cwd": {"type": "string", "maxLength": 1024},
+                    "path": {"type": "string", "maxLength": 1024},
+                    "tool_name": {"type": "string", "maxLength": 256},
+                    "payload": {"description": "JSON value or text; secrets are redacted and the payload is byte-bounded."},
+                    "content": {"type": "string", "description": "Alias for a text payload."},
+                    "exclude_paths": {"type": "array", "items": {"type": "string"}, "maxItems": 32},
+                    "capture": {"type": "boolean", "default": true},
+                    "workspace": {"type": "string"}
                 },
-                "required": ["idempotency_key", "event_type", "context_ref", "workspace"]
+                "required": ["idempotency_key", "event_kind", "workspace"],
+                "anyOf": [{"required": ["payload"]}, {"required": ["content"]}]
             }),
         ),
         "list_events" => ("List lifecycle events in a workspace.", workspace_schema()),
@@ -924,16 +928,13 @@ fn tool_contract(name: &str) -> (&'static str, Value) {
             }),
         ),
         "backup_database" => (
-            "Create a physical SQLite backup at an explicit output path.",
+            "Create a private physical SQLite backup in the store's backups directory.",
             json!({
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
-                    "database": {"type": "string"},
-                    "path": {"type": "string"},
-                    "output": {"type": "string"}
-                },
-                "required": ["path"]
+                    "database": {"type": "string"}
+                }
             }),
         ),
         "delete_database" => (
@@ -977,16 +978,13 @@ fn tool_contract(name: &str) -> (&'static str, Value) {
             }),
         ),
         "backup_workspace" => (
-            "Write a deterministic JSON snapshot to an explicit workspace path.",
+            "Write a deterministic JSON snapshot to the private backups directory.",
             json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
-                    "output": {"type": "string"},
-                    "workspace": {"type": "string"},
-                    "workspace_id": {"type": "string"}
+                    "workspace": {"type": "string"}
                 },
-                "required": ["path", "workspace"]
+                "required": ["workspace"]
             }),
         ),
         _ => (

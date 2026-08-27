@@ -3,13 +3,12 @@
 //! Python implementation; the durable state remains owned by `Store`.
 
 use crate::providers;
-use crate::store::{EvidenceSpec, Fact, FactMetadata, Store, StoreError};
+use crate::store::{EvidenceSpec, Fact, FactMetadata, Store, StoreError, MAX_FACT_TEXT_CHARS};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 const DEFAULT_PROFILE: &str = "balanced";
-const MAX_FACT_TEXT_CHARS: usize = 16 * 1024;
 
 pub fn maybe_enrich_fact(
     store: &Store,
@@ -123,7 +122,7 @@ pub fn ingest_turn(store: &Store, arguments: &Map<String, Value>) -> Result<Valu
             .and_then(Value::as_str)
             .unwrap_or("")
             .trim();
-        if text.is_empty() || text.len() > MAX_FACT_TEXT_CHARS {
+        if text.is_empty() || text.chars().count() > MAX_FACT_TEXT_CHARS {
             failed += 1;
             continue;
         }
@@ -255,7 +254,7 @@ pub fn absorb(store: &Store, arguments: &Map<String, Value>) -> Result<Value, St
         if text.is_empty() {
             return Ok(json!({"error": format!("facts[{index}].text is required")}));
         }
-        if text.len() > MAX_FACT_TEXT_CHARS {
+        if text.chars().count() > MAX_FACT_TEXT_CHARS {
             return Ok(
                 json!({"error": format!("facts[{index}].text is too long (max {MAX_FACT_TEXT_CHARS} characters)")}),
             );

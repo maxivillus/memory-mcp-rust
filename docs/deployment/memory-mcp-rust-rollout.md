@@ -20,7 +20,12 @@ completed.
 3. Keep Redis credentials in the runtime secret store. The migration and
    preflight commands below accept only database paths, command strings, and
    environment **names**; they do not print or persist environment values.
-4. Do not restart an active agent runtime as part of this rehearsal. A real
+4. The bundled plaintext Redis and HTTP provider adapters are loopback-only.
+   Put any remote service behind a local TLS proxy or sidecar before enabling
+   it; never broaden the allowlist by putting credentials in a URL.
+5. Backup output names are resolved below the private `backups/` directory;
+   callers must pass a single file name, not an absolute path.
+6. Do not restart an active agent runtime as part of this rehearsal. A real
    cutover requires the owner of the AI stack to schedule controlled recreation
    of every affected service.
 

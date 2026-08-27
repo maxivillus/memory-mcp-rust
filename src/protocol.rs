@@ -4,12 +4,14 @@ use crate::providers;
 use crate::store::{
     ContextMetadata, DecisionSpec, EntitySpec, EventSpec, EvidenceSpec, FactFilters, FactMetadata,
     FeedbackSpec, HandoffSpec, MeasurementSpec, RelationSpec, RunSpec, Store, StoreError,
+    MAX_FACT_TEXT_CHARS,
 };
 use crate::tools;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -17,6 +19,12 @@ use std::sync::{Mutex, OnceLock};
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "memory-mcp";
 const SERVER_VERSION: &str = "0.23.0";
+const MAX_EVENT_PAYLOAD_BYTES: usize = 16 * 1024;
+const MAX_EVENT_METADATA_BYTES: usize = 16 * 1024;
+const MAX_EVENT_STRING_BYTES: usize = 4096;
+const MAX_EVENT_EXCLUDE_PATHS: usize = 32;
+const MAX_EVENT_PATH_BYTES: usize = 256;
+const REDACTED_EVENT_VALUE: &str = "[REDACTED]";
 
 static AUTO_ORIENTED_SESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static SEARCH_GUARD_COUNTS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
@@ -755,18 +763,9 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
             }
         }
         "ingest_document" => {
-            let path = required_string(arguments, "path")?;
-            let reference =
-                optional_string(arguments, "ref")?.or(optional_string(arguments, "reference")?);
-            let name = optional_string(arguments, "name")?;
-            let max_bytes = optional_usize(arguments, &["max_bytes", "limit"], 1_048_576)?;
-            let workspace = required_context_workspace(arguments)?;
-            serde_json::to_value(
-                store
-                    .ingest_document(path, reference, name, max_bytes, workspace)
-                    .map_err(CallError::Execution)?,
-            )
-            .expect("document context serializes")
+            return Err(CallError::InvalidParams(
+                "ingest_document requires root, path, and workspace".to_owned(),
+            ));
         }
         "put_context" => {
             let reference = required_string(arguments, "ref")
@@ -899,12 +898,18 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
                 .unwrap_or_else(|| json!({}));
             let payload = arguments.get("payload").cloned().unwrap_or(Value::Null);
             let workspace = required_context_workspace(arguments)?;
+            let exclusions = event_exclusions(arguments)?;
+            let (_, metadata_text, _) =
+                prepare_sanitized_json(&metadata, &HashSet::new(), MAX_EVENT_METADATA_BYTES)?;
+            let (sanitized_payload, payload_json, payload_truncated) =
+                prepare_sanitized_json(&payload, &exclusions, MAX_EVENT_PAYLOAD_BYTES)?;
             let spec = EventSpec {
                 idempotency_key: idempotency_key.to_owned(),
                 event_type: event_type.to_owned(),
                 context_reference: context_reference.to_owned(),
-                metadata: serde_json::to_string(&metadata).expect("event metadata serializes"),
-                payload: serde_json::to_string(&payload).expect("event payload serializes"),
+                metadata: metadata_text,
+                payload: event_payload_text(&sanitized_payload, &payload_json),
+                payload_truncated,
                 workspace: workspace.to_owned(),
             };
             serde_json::to_value(store.capture_event(&spec).map_err(CallError::Execution)?)
@@ -1951,11 +1956,203 @@ fn exact_ingest_document(
     )
 }
 
+fn event_exclusions(arguments: &Map<String, Value>) -> Result<HashSet<String>, CallError> {
+    let values = optional_string_array(arguments, "exclude_paths")?.unwrap_or_default();
+    if values.len() > MAX_EVENT_EXCLUDE_PATHS {
+        return Err(CallError::InvalidParams(format!(
+            "exclude_paths may contain at most {MAX_EVENT_EXCLUDE_PATHS} paths"
+        )));
+    }
+    values
+        .into_iter()
+        .map(|value| {
+            let mut path = value.trim().replace('/', ".");
+            if path.len() > MAX_EVENT_PATH_BYTES {
+                return Err(CallError::InvalidParams(
+                    "exclude_paths entries are too long".to_owned(),
+                ));
+            }
+            if let Some(stripped) = path.strip_prefix("$.") {
+                path = stripped.to_owned();
+            }
+            if let Some(stripped) = path.strip_prefix("payload.") {
+                path = stripped.to_owned();
+            }
+            let components = path.split('.').map(str::trim).collect::<Vec<_>>();
+            if components.is_empty()
+                || components
+                    .iter()
+                    .any(|component| component.is_empty() || *component == "..")
+            {
+                return Err(CallError::InvalidParams(
+                    "exclude_paths must contain non-empty object paths".to_owned(),
+                ));
+            }
+            Ok(components.join("."))
+        })
+        .collect()
+}
+
+fn prepare_sanitized_json(
+    value: &Value,
+    exclusions: &HashSet<String>,
+    max_bytes: usize,
+) -> Result<(Value, String, bool), CallError> {
+    let original_bytes = serde_json::to_vec(value).map_err(|error| {
+        CallError::InvalidParams(format!("event value must be serializable JSON: {error}"))
+    })?;
+    let mut truncated = original_bytes.len() > max_bytes || event_value_was_truncated(value);
+    let mut sanitized = sanitize_event_value(value, "", exclusions);
+    let mut serialized = serde_json::to_string(&sanitized).map_err(|error| {
+        CallError::InvalidParams(format!("event value serialization failed: {error}"))
+    })?;
+    if serialized.len() > max_bytes {
+        sanitized = json!({"truncated": true, "reason": "size_limit"});
+        serialized = serde_json::to_string(&sanitized).expect("event truncation marker serializes");
+        truncated = true;
+    }
+    Ok((sanitized, serialized, truncated))
+}
+
+fn sanitize_event_value(value: &Value, path: &str, exclusions: &HashSet<String>) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut sanitized = Map::new();
+            for (key, value) in object {
+                let child_path = join_event_path(path, key);
+                if event_path_excluded(&child_path, exclusions) {
+                    continue;
+                }
+                let value = if is_sensitive_event_key(key) {
+                    Value::String(REDACTED_EVENT_VALUE.to_owned())
+                } else {
+                    sanitize_event_value(value, &child_path, exclusions)
+                };
+                sanitized.insert(key.clone(), value);
+            }
+            Value::Object(sanitized)
+        }
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let child_path = join_event_path(path, &index.to_string());
+                    if event_path_excluded(&child_path, exclusions) {
+                        Value::Null
+                    } else {
+                        sanitize_event_value(value, &child_path, exclusions)
+                    }
+                })
+                .collect(),
+        ),
+        Value::String(value) => Value::String(sanitize_event_string(value)),
+        _ => value.clone(),
+    }
+}
+
+fn join_event_path(parent: &str, child: &str) -> String {
+    if parent.is_empty() {
+        child.to_owned()
+    } else {
+        format!("{parent}.{child}")
+    }
+}
+
+fn event_path_excluded(path: &str, exclusions: &HashSet<String>) -> bool {
+    exclusions.iter().any(|excluded| {
+        path == excluded
+            || path
+                .strip_prefix(excluded)
+                .is_some_and(|suffix| suffix.starts_with('.'))
+    })
+}
+
+fn is_sensitive_event_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase().replace('-', "_");
+    key == "cwd"
+        || key == "path"
+        || key.ends_with("_path")
+        || [
+            "password",
+            "passwd",
+            "secret",
+            "token",
+            "api_key",
+            "apikey",
+            "authorization",
+            "credential",
+            "private_key",
+            "access_key",
+            "client_secret",
+            "cookie",
+        ]
+        .iter()
+        .any(|needle| key.contains(needle))
+}
+
+fn sanitize_event_string(value: &str) -> String {
+    let lower = value.trim().to_ascii_lowercase();
+    let secret = lower.starts_with("bearer ")
+        || lower.starts_with("basic ")
+        || lower.starts_with("sk-")
+        || lower.starts_with("ghp_")
+        || lower.starts_with("github_pat_")
+        || lower.starts_with("xoxb-")
+        || lower.starts_with("akia")
+        || lower.contains("-----begin ")
+        || lower.contains("authorization: bearer ")
+        || lower.contains("authorization: basic ")
+        || lower.contains("password=")
+        || lower.contains("password:")
+        || lower.contains("token=")
+        || lower.contains("token:")
+        || lower.contains("api_key=")
+        || lower.contains("api_key:");
+    let value = if secret { REDACTED_EVENT_VALUE } else { value };
+    truncate_event_utf8(value, MAX_EVENT_STRING_BYTES)
+}
+
+fn event_value_was_truncated(value: &Value) -> bool {
+    match value {
+        Value::String(value) => value.len() > MAX_EVENT_STRING_BYTES,
+        Value::Array(values) => values.iter().any(event_value_was_truncated),
+        Value::Object(values) => values.values().any(event_value_was_truncated),
+        _ => false,
+    }
+}
+
+fn truncate_event_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let end = value
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= max_bytes)
+        .last()
+        .unwrap_or(0);
+    value[..end].to_owned()
+}
+
+fn event_payload_text(value: &Value, serialized: &str) -> String {
+    value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| serialized.to_owned())
+}
+
 fn read_document_under_root(
     root: &str,
     relative: &str,
     arguments: &Map<String, Value>,
 ) -> Result<(String, String), CallError> {
+    let max_bytes = optional_usize(arguments, &["max_bytes"], 4 * 1024 * 1024)?;
+    if max_bytes == 0 || max_bytes > 16 * 1024 * 1024 {
+        return Err(CallError::InvalidParams(
+            "max_bytes must be between 1 and 16777216".to_owned(),
+        ));
+    }
     let root_path = Path::new(root);
     let canonical_root = fs::canonicalize(root_path).map_err(|error| {
         CallError::Execution(StoreError::Invalid(format!(
@@ -1987,9 +2184,19 @@ fn read_document_under_root(
             "path must stay inside root".to_owned(),
         ));
     }
-    let max_bytes = optional_usize(arguments, &["max_bytes"], 4 * 1024 * 1024)?;
-    let bytes =
-        fs::read(&candidate).map_err(|error| CallError::Execution(StoreError::Io(error)))?;
+    let metadata =
+        fs::metadata(&candidate).map_err(|error| CallError::Execution(StoreError::Io(error)))?;
+    if metadata.len() > max_bytes as u64 {
+        return Err(CallError::InvalidParams(
+            "document exceeds max_bytes".to_owned(),
+        ));
+    }
+    let file =
+        fs::File::open(&candidate).map_err(|error| CallError::Execution(StoreError::Io(error)))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((max_bytes + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| CallError::Execution(StoreError::Io(error)))?;
     if bytes.len() > max_bytes {
         return Err(CallError::InvalidParams(
             "document exceeds max_bytes".to_owned(),
@@ -2012,10 +2219,22 @@ fn exact_capture_event(store: &Store, arguments: &Map<String, Value>) -> Result<
     let workspace = exact_workspace(arguments)?;
     let key = required_string(arguments, "idempotency_key")?;
     let event_id = optional_string(arguments, "event_id")?.unwrap_or(key);
-    let kind = required_string(arguments, "event_kind")?
-        .trim()
-        .to_lowercase()
-        .replace('_', "-");
+    let raw_kind = required_string(arguments, "event_kind")?;
+    let session_id = optional_string(arguments, "session_id")?.unwrap_or("");
+    let source = optional_string(arguments, "source")?.unwrap_or("");
+    let cwd = optional_string(arguments, "cwd")?.unwrap_or("");
+    let path = optional_string(arguments, "path")?.unwrap_or("");
+    let tool_name = optional_string(arguments, "tool_name")?.unwrap_or("");
+    validate_event_string(key, 256, "idempotency_key")?;
+    validate_event_string(event_id, 256, "event_id")?;
+    validate_event_string(raw_kind, 64, "event_kind")?;
+    validate_event_string(session_id, 256, "session_id")?;
+    validate_event_string(source, 256, "source")?;
+    validate_event_string(cwd, 1024, "cwd")?;
+    validate_event_string(path, 1024, "path")?;
+    validate_event_string(tool_name, 256, "tool_name")?;
+    let kind = raw_kind.trim().to_lowercase().replace('_', "-");
+    validate_event_string(&kind, 64, "event_kind")?;
     if kind.is_empty() {
         return Err(CallError::InvalidParams(
             "event_kind must not be empty".to_owned(),
@@ -2029,6 +2248,21 @@ fn exact_capture_event(store: &Store, arguments: &Map<String, Value>) -> Result<
         .or_else(|| arguments.get("content"))
         .cloned()
         .ok_or_else(|| CallError::InvalidParams("payload or content is required".to_owned()))?;
+    let exclusions = event_exclusions(arguments)?;
+    let (sanitized_payload, payload_json, payload_truncated) =
+        prepare_sanitized_json(&payload, &exclusions, MAX_EVENT_PAYLOAD_BYTES)?;
+    let payload_text = event_payload_text(&sanitized_payload, &payload_json);
+    let safe_source = sanitize_event_string(source);
+    let metadata_value = json!({
+        "event_id": event_id,
+        "session_id": session_id,
+        "source": source,
+        "cwd": cwd,
+        "path": path,
+        "tool_name": tool_name,
+    });
+    let (_, metadata_text, _) =
+        prepare_sanitized_json(&metadata_value, &HashSet::new(), MAX_EVENT_METADATA_BYTES)?;
     if let Some(existing) = store
         .read_event(key, workspace)
         .map_err(CallError::Execution)?
@@ -2037,17 +2271,14 @@ fn exact_capture_event(store: &Store, arguments: &Map<String, Value>) -> Result<
                          "event": event_value(&existing),
                          "context": Value::Null, "pruned": 0}));
     }
-    let payload_text = payload
-        .as_str()
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| serde_json::to_string(&payload).expect("event payload serializes"));
     let envelope = json!({
-        "version": 1, "event_id": event_id, "event_kind": kind,
-        "session_id": optional_string(arguments, "session_id")?.unwrap_or(""),
-        "source": optional_string(arguments, "source")?.unwrap_or(""),
-        "tool_name": optional_string(arguments, "tool_name")?.unwrap_or(""),
+        "version": 1, "event_id": sanitize_event_string(event_id), "event_kind": kind,
+        "session_id": sanitize_event_string(session_id),
+        "source": safe_source.clone(),
+        "tool_name": sanitize_event_string(tool_name),
         "payload_format": if payload.is_string() { "text" } else { "json" },
-        "payload": payload, "truncated": false,
+        "payload": sanitized_payload, "truncated": payload_truncated,
+        "sanitized": true,
     });
     let content = serde_json::to_string(&envelope).expect("event envelope serializes");
     let reference = stable_context_ref("ctx", &format!("event\0{workspace}\0{key}"));
@@ -2061,9 +2292,7 @@ fn exact_capture_event(store: &Store, arguments: &Map<String, Value>) -> Result<
                     &json!({"kind":"lifecycle_event","version":1,"event_kind":kind}),
                 )
                 .expect("event schema serializes"),
-                source: optional_string(arguments, "source")?
-                    .unwrap_or("")
-                    .to_owned(),
+                source: safe_source,
                 expires_at: None,
             },
             workspace,
@@ -2074,14 +2303,9 @@ fn exact_capture_event(store: &Store, arguments: &Map<String, Value>) -> Result<
             idempotency_key: key.to_owned(),
             event_type: kind.to_owned(),
             context_reference: reference,
-            metadata: serde_json::to_string(&json!({
-                "event_id": event_id, "session_id": optional_string(arguments, "session_id")?.unwrap_or(""),
-                "source": optional_string(arguments, "source")?.unwrap_or(""),
-                "cwd": optional_string(arguments, "cwd")?.unwrap_or(""),
-                "path": optional_string(arguments, "path")?.unwrap_or(""),
-                "tool_name": optional_string(arguments, "tool_name")?.unwrap_or(""),
-            })).expect("event metadata serializes"),
+            metadata: metadata_text,
             payload: payload_text,
+            payload_truncated,
             workspace: workspace.to_owned(),
         })
         .map_err(CallError::Execution)?;
@@ -2089,6 +2313,15 @@ fn exact_capture_event(store: &Store, arguments: &Map<String, Value>) -> Result<
         json!({"accepted": true, "duplicate": false, "event": event_value(&event),
               "context": context_metadata(&context), "pruned": 0}),
     )
+}
+
+fn validate_event_string(value: &str, max_chars: usize, label: &str) -> Result<(), CallError> {
+    if value.chars().count() > max_chars {
+        return Err(CallError::InvalidParams(format!(
+            "{label} exceeds the configured limit ({max_chars} characters)"
+        )));
+    }
+    Ok(())
 }
 
 fn event_value(event: &crate::store::LifecycleEvent) -> Value {
@@ -3243,6 +3476,11 @@ fn exact_remember_fact(store: &Store, arguments: &Map<String, Value>) -> Result<
         return Err(CallError::InvalidParams(
             "fact text must not be empty".to_owned(),
         ));
+    }
+    if text.chars().count() > MAX_FACT_TEXT_CHARS {
+        return Err(CallError::InvalidParams(format!(
+            "fact text exceeds the configured limit ({MAX_FACT_TEXT_CHARS} characters)"
+        )));
     }
     let strict = optional_bool(arguments, &["strict"], false)?
         || optional_string(arguments, "admission")? == Some("strict");
@@ -4788,7 +5026,52 @@ mod tests {
     use super::*;
     use crate::backend::BackendCoordinator;
     use crate::store::Store;
+    use std::ffi::OsString;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    const OPTIONAL_PROVIDER_FLAGS: [&str; 5] = [
+        "MEMORY_MCP_EMBEDDINGS",
+        "MEMORY_MCP_EXTRACT",
+        "MEMORY_MCP_RECALL",
+        "MEMORY_MCP_VERIFY",
+        "MEMORY_MCP_CATEGORIZE",
+    ];
+
+    struct IsolatedProviderEnvironment {
+        previous: Vec<(&'static str, Option<OsString>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn isolated_provider_environment() -> IsolatedProviderEnvironment {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("provider environment lock");
+        let previous = OPTIONAL_PROVIDER_FLAGS
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect::<Vec<_>>();
+        for name in OPTIONAL_PROVIDER_FLAGS {
+            std::env::set_var(name, "0");
+        }
+        IsolatedProviderEnvironment {
+            previous,
+            _lock: lock,
+        }
+    }
+
+    impl Drop for IsolatedProviderEnvironment {
+        fn drop(&mut self) {
+            for (name, value) in &self.previous {
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+        }
+    }
 
     #[test]
     fn initialize_and_tools_list_match_contract_baseline() {
@@ -4870,7 +5153,6 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         let path = root.join("facts.db");
-        let backup_path = root.join("protocol-backup.db");
         let store = Store::open(&path).unwrap();
 
         let create = handle_request(
@@ -4917,7 +5199,7 @@ mod tests {
                     "name": "backup_database",
                     "arguments": {
                         "database": "current",
-                        "path": backup_path.to_str().unwrap()
+                        "path": "protocol-backup.db"
                     }
                 }
             }),
@@ -5043,6 +5325,7 @@ mod tests {
 
     #[test]
     fn ingestion_and_recall_tools_are_reachable_through_stdio_dispatch() {
+        let _provider_environment = isolated_provider_environment();
         let store = Store::in_memory().unwrap();
         let absorbed = handle_line(
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"absorb","arguments":{"texts":["Rust memory","SQLite index"],"workspace":"w"}}}"#,
@@ -5145,7 +5428,7 @@ mod tests {
             .contains("review"));
 
         let run = handle_line(
-            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run_begin","arguments":{"run_id":"r-1","issue_ref":"NTL-722","files":["src/store.rs"],"workspace":"w"}}}"#,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run_begin","arguments":{"run_id":"r-1","issue_ref":"performance-decision","files":["src/store.rs"],"workspace":"w"}}}"#,
             &store,
         )
         .unwrap();
@@ -5304,11 +5587,15 @@ mod tests {
 
     #[test]
     fn document_freshness_and_embedding_boundary_tools_are_reachable() {
+        let _provider_environment = isolated_provider_environment();
         let store = Store::in_memory().unwrap();
-        let path = std::env::temp_dir().join(format!(
-            "memory-mcp-rust-protocol-document-{}.txt",
+        let root = std::env::temp_dir().join(format!(
+            "memory-mcp-rust-protocol-document-root-{}",
             std::process::id()
         ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.txt");
         std::fs::write(&path, "protocol document").unwrap();
         let ingest = handle_request(
             json!({
@@ -5318,18 +5605,51 @@ mod tests {
                 "params": {
                     "name": "ingest_document",
                     "arguments": {
-                        "path": path.to_str().unwrap(),
-                        "workspace": "w"
+                        "root": root.to_str().unwrap(),
+                        "path": "document.txt",
+                        "workspace": "w",
+                        "commit": true
                     }
                 }
             }),
             &store,
         )
         .unwrap();
-        assert!(ingest["result"]["content"][0]["text"]
+        let ingest_text = ingest["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(ingest_text.contains("\"result_status\":\"ok\""));
+        let ingest_value: Value = serde_json::from_str(ingest_text).unwrap();
+        let reference = ingest_value["refs"][0].as_str().unwrap();
+        let read = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": "read_context",
+                    "arguments": {"ref": reference, "workspace": "w"}
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        assert!(read["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
             .contains("protocol document"));
+        let legacy = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": "ingest_document",
+                    "arguments": {"path": path.to_str().unwrap(), "workspace": "w"}
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        assert_eq!(legacy["error"]["code"], -32602);
 
         handle_line(
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"remember_fact","arguments":{"text":"old enough","workspace":"w"}}}"#,
@@ -5372,10 +5692,6 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("\"status\":\"complete\""));
-        let backup_path = std::env::temp_dir().join(format!(
-            "memory-mcp-rust-protocol-backup-{}.json",
-            std::process::id()
-        ));
         let backup = handle_request(
             json!({
                 "jsonrpc": "2.0",
@@ -5384,7 +5700,7 @@ mod tests {
                 "params": {
                     "name": "backup_workspace",
                     "arguments": {
-                        "path": backup_path.to_str().unwrap(),
+                        "path": "protocol-backup.json",
                         "workspace": "w"
                     }
                 }
@@ -5396,8 +5712,7 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("\"bytes\""));
-        let _ = std::fs::remove_file(backup_path);
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5448,6 +5763,81 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("agent-b"));
+    }
+
+    #[test]
+    fn capture_event_removes_secrets_exclusions_and_oversized_payloads() {
+        let store = Store::in_memory().unwrap();
+        store
+            .put_context("event-seed", "event seed", "context", "w")
+            .unwrap();
+        let captured = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "capture_event",
+                    "arguments": {
+                        "idempotency_key": "event-safe",
+                        "event_kind": "tool-call",
+                        "workspace": "w",
+                        "source": "issue-ref",
+                        "cwd": "/private/path",
+                        "path": "/private/path/file",
+                        "payload": {
+                            "keep": "value",
+                            "remove": "must-not-persist",
+                            "credentials": {"password": "do-not-persist"},
+                            "nested": {"token": "do-not-persist-token"},
+                            "header": "Authorization: Bearer do-not-persist-header"
+                        },
+                        "exclude_paths": ["remove"]
+                    }
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        let captured_text = captured["result"]["content"][0]["text"].as_str().unwrap();
+        let captured_value: Value = serde_json::from_str(captured_text).unwrap();
+        let context_ref = captured_value["context"]["ref"].as_str().unwrap();
+        let context = store.context(context_ref, "w").unwrap().unwrap();
+        assert!(context.content.contains("[REDACTED]"));
+        assert!(context.content.contains("value"));
+        assert!(!context.content.contains("must-not-persist"));
+        assert!(!context.content.contains("do-not-persist-token"));
+        assert!(!context.content.contains("do-not-persist-header"));
+        assert!(!context.content.contains("/private/path"));
+        let event = store.read_event("event-safe", "w").unwrap().unwrap();
+        assert!(event.metadata.contains("[REDACTED]"));
+        assert!(!event.metadata.contains("/private/path"));
+
+        let oversized = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "capture_event",
+                    "arguments": {
+                        "idempotency_key": "event-large",
+                        "event_kind": "tool-call",
+                        "workspace": "w",
+                        "payload": "x".repeat(MAX_EVENT_PAYLOAD_BYTES + 128)
+                    }
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        let oversized_text = oversized["result"]["content"][0]["text"].as_str().unwrap();
+        let oversized_value: Value = serde_json::from_str(oversized_text).unwrap();
+        assert_eq!(oversized_value["event"]["payload_truncated"], true);
+        let oversized_ref = oversized_value["context"]["ref"].as_str().unwrap();
+        let oversized_context = store.context(oversized_ref, "w").unwrap().unwrap();
+        assert!(oversized_context.byte_size < 20_000);
+        assert!(oversized_context.content.contains("\"truncated\":true"));
     }
 
     #[test]
