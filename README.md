@@ -291,10 +291,15 @@ an explicit non-empty workspace.
 but it is intentionally absent from `tools/list`. Clients should prefer
 `remember_fact` when they can choose the name.
 
-## Migration
+## Optional legacy migration and cutover
 
-Migration is copy-first. Keep the legacy database as a rollback point, verify
-its backup, and choose a destination that does not already exist:
+Normal Rust-only use does not enter this section: the build, run, test, and
+Docker paths above use the Rust binary and do not require Python. The
+procedures below are only for importing an existing database from an external
+legacy deployment or retaining that deployment as a rollback/comparison target.
+
+Migration is copy-first. Keep the external legacy database as a rollback
+point, verify its backup, and choose a destination that does not already exist:
 
 ```sh
 ./target/release/memory-mcp-rust migrate --source LEGACY.db --target RUST.db
@@ -315,16 +320,18 @@ MEMORY_MCP_RUST_BIN=/path/to/memory-mcp-rust \
   scripts/memory-mcp-migrate.sh
 ```
 
-The Rust repository ships two helper scripts used by this documentation:
+The Rust repository ships two helper scripts used by this optional flow:
 `scripts/memory-mcp-migrate.sh` for copy-first migration and
-`scripts/memory-mcp-preflight.py` for the legacy/Rust contract check. It does
-not ship the legacy Python server (`memory_mcp.py`) or the legacy Python test
-suites. Those are external rollback and parity inputs; in the rollout example,
-replace `/path/to/...` with a separate legacy checkout. The Rust binary itself
-does not require Python.
+`scripts/memory-mcp-preflight.py` for the legacy/Rust contract check. The
+preflight script is a standalone comparison utility; it is not used to start,
+run, or test the Rust server. The repository does not ship the external legacy
+server (`memory_mcp.py`) or its test suites. Those are rollback and parity
+inputs; in the rollout example, replace `/path/to/...` with a separate legacy
+checkout. The Rust binary itself does not require Python.
 
-For the complete Python↔Rust contract preflight and controlled cutover/rollback
-procedure, see [`docs/deployment/memory-mcp-rust-rollout.md`](docs/deployment/memory-mcp-rust-rollout.md).
+For the complete optional legacy/Rust contract preflight and controlled
+cutover/rollback procedure, see
+[`docs/deployment/memory-mcp-rust-rollout.md`](docs/deployment/memory-mcp-rust-rollout.md).
 
 ## Docker
 
@@ -373,6 +380,10 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+These are the checks for this Rust repository. No Python runtime or Python
+test suite is required for local development; the Python preflight utility
+above is only for an explicit comparison with an external legacy deployment.
+
 The repository layout follows the runtime boundary:
 
 | Path | Responsibility |
@@ -388,7 +399,7 @@ The repository layout follows the runtime boundary:
 | `docs/decisions/` | Architecture decisions for Redis-first storage and pointwise replication. |
 | `docs/upstream-tools.json` | Exact 80-tool descriptions and input schemas. |
 | `scripts/memory-mcp-migrate.sh` | Shipped copy-first migration wrapper. |
-| `scripts/memory-mcp-preflight.py` | Shipped legacy/Rust contract preflight utility. |
+| `scripts/memory-mcp-preflight.py` | Shipped optional legacy/Rust comparison utility; not a server runtime dependency. |
 
 ## Further reading
 

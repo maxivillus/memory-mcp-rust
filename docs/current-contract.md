@@ -99,8 +99,8 @@ optional fields.
 
 ## Persistence contract
 
-- The active SQLite path is `MEMORY_MCP_DB`; without it the default is the
-  script-relative `<repo>/data/facts.db`.
+- The active SQLite path is `MEMORY_MCP_DB`; without it the default is
+  `data/facts.db` relative to the process working directory.
 - Every connection enables WAL mode, `busy_timeout=5000`, and foreign keys.
   The connection timeout is 10 seconds. The store is designed for multiple
   local writers sharing one explicitly configured file.
@@ -187,26 +187,35 @@ prints counts and fingerprints only; it does not print database paths or
 memory payloads. `scripts/memory-mcp-migrate.sh` is the environment-variable
 wrapper for the same operation.
 
-## Compatibility test baseline
+## Optional legacy compatibility baseline
 
-The upstream/legacy CI runs Python 3.11 and both suites:
+The current repository is built and tested with the Rust toolchain:
+
+```text
+cargo fmt --check
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+No Python runtime or Python test suite is required to build, run, or test this
+Rust checkout. For an explicit migration or parity investigation, a separate
+legacy checkout may reproduce the historical upstream baseline with Python
+3.11 and these commands:
 
 ```text
 python -m unittest discover -s tests -v
 python -m unittest -q test_memory_mcp
 ```
 
-These commands describe the external legacy baseline; they are not runnable
-from this Rust checkout. `tests/test_memory_mcp.py` and
-`test_memory_mcp.py` are legacy test files and are not shipped in this
-repository. Use a separate legacy checkout when reproducing that baseline;
-the Rust repository's local checks are `cargo test` and the Rust-side parity
-tests.
+Those commands are external legacy evidence, not Rust commands. The files
+`tests/test_memory_mcp.py` and `test_memory_mcp.py` are not shipped in this
+repository and must be obtained from that separate legacy checkout.
 
-At the pinned revision, `tests/test_memory_mcp.py` contains 157 test methods
-and the legacy `test_memory_mcp.py` contains 78. The Rust port must turn these
-behavioral areas into parity tests rather than treating a successful process
-start as compatibility:
+At the pinned legacy revision, `tests/test_memory_mcp.py` contains 157 test
+methods and the legacy `test_memory_mcp.py` contains 78. These counts are
+historical parity scope, not the Rust repository's local test command. Parity
+review covers the following behavioral areas; a successful process start is
+not sufficient evidence of compatibility:
 
 - fact deduplication, filters, bounded chunks, lifecycle, review, retention,
   conflict detection, export, and workspace isolation;
@@ -221,10 +230,9 @@ start as compatibility:
 - stdio JSON-RPC errors for malformed input, non-object requests, bad params,
   unknown methods, and notification handling.
 
-## Rust acceptance boundary for this stage
+## Historical Rust acceptance boundary
 
-This document completes the contract-capture stage only. The next implementation
-stage can be accepted when the Rust project has:
+The original contract-capture milestone was accepted when the Rust project had:
 
 1. a single executable entry point with the wire behavior above and the
    copy-first migration subcommand;
@@ -242,22 +250,22 @@ with deterministic SQLite fallback.
 The current implementation provides one stdio executable, bundled SQLite/FTS5
 initialization, additive legacy-store upgrades, the pinned 80-tool descriptors,
 and concrete compatibility handlers for the full advertised contract. The
-provider/pipeline layer preserves the Python deployment's feature switches for
-extraction, embeddings, recall, verification, categorization, and LLM-backed
-operations; deterministic test providers are available for isolated checks.
+provider/pipeline layer preserves the external legacy deployment's feature
+switch names for compatibility with extraction, embeddings, recall,
+verification, categorization, and LLM-backed operations; deterministic test
+providers are available for isolated checks.
 
 The deployment migration slice adds a copy-first SQLite migration command and
-two bounded launch checks. `scripts/memory-mcp-preflight.py` compares both
-servers' initialize identity, all 80 tool descriptors, launcher environment
-names, SQLite row counts, and disposable empty-argument routes. It treats
-missing required arguments as valid route evidence, but blocks unknown or
-unimplemented handlers. The actual legacy-Python-versus-Rust preflight remains
-a release gate: the preflight utility is shipped here, but the deployed Python
-command is external to this repository. It must be run with that command, its
-migrated database copy, and the complete set of environment names that affect
-provider and pipeline behavior. The Rust entry point accepts those names and
-routes the corresponding operations through the compatibility layer; removing
-them to make the comparison green would invalidate the parity check.
+an optional legacy/Rust launch comparison. The shipped
+`scripts/memory-mcp-preflight.py` utility compares both servers' initialize
+identity, all 80 tool descriptors, launcher environment names, SQLite row
+counts, and disposable empty-argument routes. It is a release-gate helper for
+an explicit cross-implementation comparison, not a Rust server dependency or
+the Rust repository's test command. The deployed legacy command and its
+migrated database copy are external to this repository; the Rust entry point
+accepts the corresponding legacy environment names through its compatibility
+layer. Removing them to make the comparison green would invalidate the parity
+check.
 
 The slice descriptions below record historical implementation milestones. The
 Redis-first coordinator and the completed provider/pipeline compatibility
