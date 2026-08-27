@@ -94,7 +94,7 @@ pub fn embed(texts: &[String]) -> Result<Vec<Vec<f32>>, ProviderError> {
             let value = http_json(
                 &format!("{}/api/embed", embedding_base_url()),
                 &payload,
-                None,
+                false,
             )?;
             let rows = value
                 .get("embeddings")
@@ -110,7 +110,7 @@ pub fn embed(texts: &[String]) -> Result<Vec<Vec<f32>>, ProviderError> {
             let value = http_json(
                 &format!("{}/embeddings", embedding_base_url()),
                 &payload,
-                non_empty_env("MEMORY_MCP_EMBED_KEY"),
+                has_non_empty_env("MEMORY_MCP_EMBED_KEY"),
             )?;
             let rows = value
                 .get("data")
@@ -158,7 +158,7 @@ pub fn chat_json(messages: &[(&str, &str)]) -> Result<Value, ProviderError> {
                     "format": "json",
                     "think": false,
                 }),
-                None,
+                false,
             )?;
             let content = value
                 .get("message")
@@ -181,7 +181,7 @@ pub fn chat_json(messages: &[(&str, &str)]) -> Result<Value, ProviderError> {
                     "temperature": 0,
                     "response_format": {"type": "json_object"},
                 }),
-                non_empty_env("MEMORY_MCP_LLM_KEY"),
+                has_non_empty_env("MEMORY_MCP_LLM_KEY"),
             )?;
             let content = value
                 .get("choices")
@@ -397,17 +397,11 @@ fn words(text: &str) -> BTreeSet<String> {
         .collect()
 }
 
-fn non_empty_env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+fn has_non_empty_env(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| !value.is_empty())
 }
 
-fn http_json(
-    url: &str,
-    payload: &Value,
-    credential: Option<String>,
-) -> Result<Value, ProviderError> {
+fn http_json(url: &str, payload: &Value, has_credential: bool) -> Result<Value, ProviderError> {
     let (scheme, authority, path) = parse_http_url(url)?;
     if scheme != "http" {
         return Err(ProviderError(
@@ -422,14 +416,9 @@ fn http_json(
                 .into(),
         ));
     }
-    if credential.is_some()
-        && std::env::var("MEMORY_MCP_ALLOW_INSECURE_HTTP")
-            .ok()
-            .as_deref()
-            != Some("1")
-    {
+    if has_credential {
         return Err(ProviderError(
-            "refusing to send provider credentials over plaintext HTTP (set MEMORY_MCP_ALLOW_INSECURE_HTTP=1 for a trusted local endpoint)".into(),
+            "provider credentials require encrypted transport; plaintext HTTP is disabled".into(),
         ));
     }
     let body = serde_json::to_vec(payload).map_err(|error| {
@@ -451,9 +440,6 @@ fn http_json(
         "POST {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
     );
-    if let Some(key) = credential {
-        request.push_str(&format!("Authorization: Bearer {key}\r\n"));
-    }
     request.push_str("\r\n");
     stream
         .write_all(request.as_bytes())
@@ -549,11 +535,19 @@ mod tests {
 
     #[test]
     fn provider_http_is_local_only() {
-        let error = http_json("http://provider.internal:8080/v1", &json!({}), None)
+        let error = http_json("http://provider.internal:8080/v1", &json!({}), false)
             .expect_err("remote provider must be rejected before connecting");
         assert!(error.0.contains("loopback-only"));
         assert!(is_loopback_host("127.0.0.1"));
         assert!(is_loopback_host("::1"));
         assert!(!is_loopback_host("provider.internal"));
+    }
+
+    #[test]
+    fn provider_http_rejects_credentials_even_for_loopback() {
+        let error = http_json("http://127.0.0.1:1/v1", &json!({}), true)
+            .expect_err("plaintext provider must never receive credentials");
+        assert!(error.0.contains("encrypted transport"));
+        assert!(error.0.contains("disabled"));
     }
 }

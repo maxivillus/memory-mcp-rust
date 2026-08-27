@@ -75,7 +75,6 @@ pub fn ingest_turn(store: &Store, arguments: &Map<String, Value>) -> Result<Valu
         }));
     }
     let mut parsed = None;
-    let mut last_error = String::new();
     let prompt = "You extract durable facts from a conversation transcript. Return ONLY JSON matching {\"facts\":[{\"text\":\"...\",\"type\":\"user|feedback|project|reference\",\"trust\":\"high|medium|low\",\"strong\":false,\"scope\":\"project|global\",\"importance\":0.5}]}";
     for _ in 0..3 {
         match providers::chat_json(&[
@@ -86,12 +85,11 @@ pub fn ingest_turn(store: &Store, arguments: &Map<String, Value>) -> Result<Valu
                 parsed = Some(value);
                 break;
             }
-            Ok(value) => last_error = format!("unexpected JSON shape: {}", value),
-            Err(error) => last_error = error.to_string(),
+            Ok(_) | Err(_) => {}
         }
     }
     let Some(parsed) = parsed else {
-        eprintln!("memory-mcp ingest_turn: {last_error}");
+        eprintln!("memory-mcp ingest_turn failed after bounded provider attempts");
         return Ok(json!({
             "error": "extraction failed after 3 attempts (provider error; see server stderr)",
             "ingested": 0,

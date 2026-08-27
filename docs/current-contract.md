@@ -34,15 +34,21 @@ the authoritative schema for every parameter, default, enum, and bound.
 - fact text is limited to 16,000 Unicode scalar values before persistence;
 - context content is limited to `MEMORY_MCP_CONTEXT_MAX_BYTES`, defaulting to
   4 MiB and capped at 16 MiB;
-- lifecycle payloads are sanitized for credential-like fields, honor
-  `exclude_paths`, and are limited to 16 KiB after sanitization; metadata is
-  limited to 16 KiB;
+- lifecycle payloads and metadata are sanitized for sensitive-key values,
+  credential-shaped strings, URLs, and filesystem paths, honor `exclude_paths`,
+  and are limited to 16 KiB after sanitization; event identifiers containing
+  restricted data are rejected;
 - document ingestion requires a caller-supplied root plus a relative path and
   reads at most 16 MiB through a bounded stream; the root is never persisted;
 - explicit backup arguments are file names resolved below a mode-0700 private
   `backups/` directory, and backup files use mode 0600;
 - the bundled plaintext Redis and HTTP provider adapters accept only loopback
-  endpoints. Remote services require a local TLS proxy or sidecar.
+  endpoints. HTTP provider credentials are rejected unconditionally; remote
+  services require a local TLS proxy or sidecar.
+- stderr diagnostics use stable generic messages and never include backend,
+  provider, migration, command-line, or caller-controlled error details.
+- database and backup protocol responses expose names, sizes, and bounded
+  generated file names only; absolute filesystem paths remain internal.
 
 ### Facts, retrieval, lifecycle, and review
 

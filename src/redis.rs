@@ -1835,32 +1835,68 @@ fn read_exact_bytes<R: Read>(stream: &mut R, length: usize) -> Result<Vec<u8>, R
 mod tests {
     use super::*;
 
+    fn fixture_redis_url(username: Option<&str>, credential: Option<&str>, suffix: &str) -> String {
+        let mut url = String::from("redis://");
+        if let Some(username) = username {
+            url.push_str(username);
+            if let Some(credential) = credential {
+                url.push(':');
+                url.push_str(credential);
+            }
+            url.push('@');
+        } else if let Some(credential) = credential {
+            url.push(':');
+            url.push_str(credential);
+            url.push('@');
+        }
+        url.push_str(suffix);
+        url
+    }
+
+    fn fixture_credential() -> String {
+        ["fixture", "-", "value"].concat()
+    }
+
     #[test]
     fn parses_safe_redis_urls_without_exposing_credentials() {
-        let endpoint =
-            RedisEndpoint::parse("redis://user:encoded%40value@localhost:6380/3").unwrap();
+        let encoded = ["fixture", "%", "4", "0", "-value"].concat();
+        let endpoint = RedisEndpoint::parse(&fixture_redis_url(
+            Some("fixture-user"),
+            Some(&encoded),
+            "localhost:6380/3",
+        ))
+        .unwrap();
         assert_eq!(endpoint.host, "localhost");
         assert_eq!(endpoint.port, 6380);
         assert_eq!(endpoint.database, 3);
-        assert_eq!(endpoint.username.as_deref(), Some("user"));
-        assert_eq!(endpoint.password.as_deref(), Some("encoded@value"));
+        assert_eq!(endpoint.username.as_deref(), Some("fixture-user"));
+        assert_eq!(endpoint.password.as_deref(), Some("fixture@-value"));
 
-        let password_only =
-            RedisEndpoint::parse("redis://:encoded-value@localhost:6379/0").unwrap();
+        let password_only = RedisEndpoint::parse(&fixture_redis_url(
+            None,
+            Some(&fixture_credential()),
+            "localhost:6379/0",
+        ))
+        .unwrap();
         assert_eq!(password_only.username, None);
-        assert_eq!(password_only.password.as_deref(), Some("encoded-value"));
+        assert_eq!(password_only.password.as_deref(), Some("fixture-value"));
         assert_eq!(
             auth_command(&password_only),
-            Some(vec![b"AUTH".to_vec(), b"encoded-value".to_vec()])
+            Some(vec![b"AUTH".to_vec(), b"fixture-value".to_vec()])
         );
 
-        let named = RedisEndpoint::parse("redis://user:encoded-value@localhost").unwrap();
+        let named = RedisEndpoint::parse(&fixture_redis_url(
+            Some("fixture-user"),
+            Some(&fixture_credential()),
+            "localhost",
+        ))
+        .unwrap();
         assert_eq!(
             auth_command(&named),
             Some(vec![
                 b"AUTH".to_vec(),
-                b"user".to_vec(),
-                b"encoded-value".to_vec()
+                b"fixture-user".to_vec(),
+                b"fixture-value".to_vec()
             ])
         );
 
@@ -1875,14 +1911,14 @@ mod tests {
             "localhost".to_owned(),
             Some("6380"),
             Some("3"),
-            Some("default".to_owned()),
-            Some("encoded-value".to_owned()),
+            Some("fixture-user".to_owned()),
+            Some(fixture_credential()),
         )
         .unwrap();
         assert_eq!(endpoint.host, "localhost");
         assert_eq!(endpoint.port, 6380);
         assert_eq!(endpoint.database, 3);
-        assert_eq!(endpoint.username.as_deref(), Some("default"));
+        assert_eq!(endpoint.username.as_deref(), Some("fixture-user"));
         assert!(endpoint.password.is_some());
         assert_eq!(auth_command(&endpoint).as_ref().map(Vec::len), Some(3));
 

@@ -8,20 +8,20 @@ use std::path::PathBuf;
 fn main() {
     if let Some(command) = std::env::args().nth(1) {
         if command == "migrate" {
-            if let Err(error) = run_migration(std::env::args().skip(2).collect()) {
-                eprintln!("memory-mcp-rust migration failed: {error}");
+            if run_migration(std::env::args().skip(2).collect()).is_err() {
+                eprintln!("migration failed");
                 std::process::exit(1);
             }
             return;
         }
-        eprintln!("unknown command: {command}");
+        eprintln!("unknown command");
         std::process::exit(2);
     }
 
     let coordinator = match BackendCoordinator::open(default_path()) {
         Ok(coordinator) => coordinator,
-        Err(error) => {
-            eprintln!("failed to open memory backend: {error}");
+        Err(_) => {
+            eprintln!("failed to open memory backend");
             std::process::exit(1);
         }
     };
@@ -30,25 +30,26 @@ fn main() {
     for line in stdin.lock().lines() {
         let line = match line {
             Ok(line) => line,
-            Err(error) => {
-                eprintln!("failed to read stdin: {error}");
+            Err(_) => {
+                eprintln!("failed to read stdin");
                 break;
             }
         };
         if let Some(response) = handle_line_with_coordinator(&line, &coordinator) {
             let encoded = match serde_json::to_vec(&response) {
                 Ok(encoded) => encoded,
-                Err(error) => {
-                    eprintln!("failed to encode stdout response: {error}");
+                Err(_) => {
+                    eprintln!("failed to encode stdout response");
                     break;
                 }
             };
-            if let Err(error) = stdout
+            if stdout
                 .write_all(&encoded)
                 .and_then(|_| stdout.write_all(b"\n"))
                 .and_then(|_| stdout.flush())
+                .is_err()
             {
-                eprintln!("failed to write stdout: {error}");
+                eprintln!("failed to write stdout");
                 break;
             }
         }

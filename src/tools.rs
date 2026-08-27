@@ -807,7 +807,7 @@ fn tool_contract(name: &str) -> (&'static str, Value) {
             }),
         ),
         "capture_event" => (
-            "Capture one sanitized, byte-bounded lifecycle envelope in the exact workspace; secrets and excluded paths are removed before persistence.",
+            "Capture one sanitized, byte-bounded lifecycle envelope in the exact workspace; sensitive-key values, credential-shaped strings, URLs, filesystem paths, and excluded paths are removed before persistence.",
             json!({
                 "type": "object",
                 "properties": {
