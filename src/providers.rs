@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 const MAX_HTTP_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -205,6 +205,7 @@ pub fn category_for(text: &str, existing: &[String]) -> Result<String, ProviderE
     } else {
         existing.join(", ")
     };
+    let preview = text.chars().take(600).collect::<String>();
     let value = chat_json(&[
         (
             "system",
@@ -212,7 +213,7 @@ pub fn category_for(text: &str, existing: &[String]) -> Result<String, ProviderE
         ),
         (
             "user",
-            &format!("Existing categories: {existing_text}\nFact: {}", &text[..text.len().min(600)]),
+            &format!("Existing categories: {existing_text}\nFact: {preview}"),
         ),
     ])?;
     value
@@ -414,6 +415,13 @@ fn http_json(
                 .into(),
         ));
     }
+    let host = provider_host(&authority)?;
+    if !is_loopback_host(host) {
+        return Err(ProviderError(
+            "provider endpoints must be loopback-only; use a local TLS gateway for remote providers"
+                .into(),
+        ));
+    }
     if credential.is_some()
         && std::env::var("MEMORY_MCP_ALLOW_INSECURE_HTTP")
             .ok()
@@ -431,7 +439,7 @@ fn http_json(
         .to_socket_addrs()
         .map_err(|error| ProviderError(format!("provider endpoint lookup failed: {error}")))?;
     let address = addresses
-        .next()
+        .find(|address| address.ip().is_loopback())
         .ok_or_else(|| ProviderError("provider endpoint has no addresses".into()))?;
     let mut stream = TcpStream::connect_timeout(&address, HTTP_TIMEOUT)
         .map_err(|error| ProviderError(format!("provider connection failed: {error}")))?;
@@ -453,6 +461,7 @@ fn http_json(
         .map_err(|error| ProviderError(format!("provider request failed: {error}")))?;
     let mut response = Vec::new();
     stream
+        .take((MAX_HTTP_RESPONSE_BYTES as u64) + 1)
         .read_to_end(&mut response)
         .map_err(|error| ProviderError(format!("provider response failed: {error}")))?;
     if response.len() > MAX_HTTP_RESPONSE_BYTES {
@@ -502,4 +511,49 @@ fn parse_http_url(url: &str) -> Result<(&str, String, String), ProviderError> {
         format!("{authority}:80")
     };
     Ok((scheme, authority, path))
+}
+
+fn provider_host(authority: &str) -> Result<&str, ProviderError> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let closing = rest
+            .find(']')
+            .ok_or_else(|| ProviderError("provider URL has an invalid IPv6 authority".into()))?;
+        if !rest[closing + 1..].is_empty() && !rest[closing + 1..].starts_with(':') {
+            return Err(ProviderError(
+                "provider URL has an invalid authority".into(),
+            ));
+        }
+        return Ok(&rest[..closing]);
+    }
+    let host = authority
+        .rsplit_once(':')
+        .filter(|(_, port)| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
+        .map_or(authority, |(host, _)| host);
+    if host.is_empty() {
+        return Err(ProviderError("provider URL has an empty host".into()));
+    }
+    Ok(host)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_http_is_local_only() {
+        let error = http_json("http://provider.internal:8080/v1", &json!({}), None)
+            .expect_err("remote provider must be rejected before connecting");
+        assert!(error.0.contains("loopback-only"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("provider.internal"));
+    }
 }

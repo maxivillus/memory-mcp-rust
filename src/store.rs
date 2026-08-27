@@ -8,7 +8,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug)]
@@ -298,6 +298,7 @@ pub struct EventSpec {
     pub context_reference: String,
     pub metadata: String,
     pub payload: String,
+    pub payload_truncated: bool,
     pub workspace: String,
 }
 
@@ -545,7 +546,11 @@ pub struct Workspace {
     pub status: String,
 }
 
+pub const MAX_FACT_TEXT_CHARS: usize = 16 * 1024;
+pub const DEFAULT_CONTEXT_MAX_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_CONTEXT_MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EVENT_PAYLOAD_BYTES: usize = 16 * 1024;
+const MAX_EVENT_METADATA_BYTES: usize = 16 * 1024;
 const MAX_RUN_FILES_BYTES: usize = 64 * 1024;
 const MAX_RUN_DIFF_BYTES: usize = 128 * 1024;
 const MAX_DATABASE_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
@@ -617,7 +622,29 @@ impl Store {
                 fs::create_dir_all(parent)?;
             }
         }
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(StoreError::Invalid(
+                    "database path must not be a symbolic link".to_owned(),
+                ));
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(StoreError::Invalid(
+                    "database path must reference a regular file".to_owned(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut options = OpenOptions::new();
+                options.read(true).write(true).create_new(true);
+                #[cfg(unix)]
+                std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+                drop(options.open(path)?);
+            }
+            Err(error) => return Err(StoreError::Io(error)),
+        }
         let connection = Connection::open(path)?;
+        set_private_file_mode(path)?;
         Self::from_connection(connection, Some(path.to_path_buf()))
     }
 
@@ -1470,11 +1497,7 @@ impl Store {
         workspace: &str,
         metadata: &FactMetadata,
     ) -> Result<Fact, StoreError> {
-        if text.trim().is_empty() {
-            return Err(StoreError::Invalid(
-                "fact text must not be empty".to_owned(),
-            ));
-        }
+        validate_fact_text(text)?;
         validate_fact_metadata(metadata)?;
         let sha256 = sha256(text);
         let was_present = self.fact_by_hash(&sha256, workspace)?.is_some();
@@ -2479,37 +2502,14 @@ impl Store {
         workspace: &str,
     ) -> Result<WorkspaceBackup, StoreError> {
         validate_context_workspace(workspace)?;
-        if path.trim().is_empty() {
-            return Err(StoreError::Invalid(
-                "backup path must not be empty".to_owned(),
-            ));
-        }
-        let backup_path = Path::new(path);
-        if backup_path
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-        {
-            return Err(StoreError::Invalid(
-                "backup path must not contain parent-directory components".to_owned(),
-            ));
-        }
-        if backup_path.exists() && backup_path.is_dir() {
-            return Err(StoreError::Invalid(
-                "backup path must reference a file".to_owned(),
-            ));
-        }
-        if let Some(parent) = backup_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
+        let backup_path = self.resolve_private_backup_path(path)?;
         let snapshot = self.export_snapshot(workspace)?;
         let encoded = serde_json::to_vec_pretty(&snapshot).map_err(|error| {
             StoreError::Invalid(format!("backup serialization failed: {error}"))
         })?;
-        fs::write(backup_path, &encoded)?;
+        atomic_private_file(&backup_path, &encoded)?;
         Ok(WorkspaceBackup {
-            path: path.to_owned(),
+            path: backup_path.to_string_lossy().into_owned(),
             bytes: encoded.len() as i64,
             facts: snapshot.facts.len() as i64,
             contexts: snapshot.contexts.len() as i64,
@@ -2520,33 +2520,11 @@ impl Store {
     /// compatibility contract when no explicit output path is supplied.
     pub fn backup_workspace_default(&self, workspace: &str) -> Result<WorkspaceBackup, StoreError> {
         validate_context_workspace(workspace)?;
-        let base = self
-            .database_path
-            .borrow()
-            .as_deref()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let backup_dir = base.join("backups");
-        fs::create_dir_all(&backup_dir)?;
-        #[cfg(unix)]
-        std::fs::set_permissions(
-            &backup_dir,
-            std::os::unix::fs::PermissionsExt::from_mode(0o700),
-        )?;
         let sequence = SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let output = backup_dir.join(format!(
-            "workspace-{workspace}.{}-{sequence}.json",
-            std::process::id()
-        ));
-        let output = output.to_string_lossy().into_owned();
-        let backup = self.backup_workspace(&output, workspace)?;
-        #[cfg(unix)]
-        std::fs::set_permissions(
-            Path::new(&output),
-            std::os::unix::fs::PermissionsExt::from_mode(0o600),
-        )?;
-        Ok(backup)
+        self.backup_workspace(
+            &format!("workspace-{}-{sequence}.json", std::process::id()),
+            workspace,
+        )
     }
 
     pub fn current_database(&self) -> Result<DatabaseInfo, StoreError> {
@@ -2648,42 +2626,49 @@ impl Store {
             return self.memory_backup_database(name, output_path);
         }
         let source = self.database_source_path(name)?;
-        let output = validate_database_backup_path(output_path)?;
+        let output = self.resolve_private_backup_path(output_path)?;
         if same_database_path(&source, &output) {
             return Err(StoreError::Invalid(
                 "database backup output must differ from the source database".to_owned(),
             ));
         }
-        if output.exists() {
-            return Err(StoreError::Invalid(
-                "database backup output already exists".to_owned(),
-            ));
-        }
-        if let Some(parent) = output.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
-
+        let backup_dir = output
+            .parent()
+            .ok_or_else(|| StoreError::Invalid("backup directory is missing".to_owned()))?;
+        let sequence = SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary = backup_dir.join(format!(".database-{}-{sequence}.tmp", std::process::id()));
+        let temporary_name = temporary.to_string_lossy().into_owned();
         let active_path = self.database_path.borrow().clone();
-        if active_path
+        let vacuum = if active_path
             .as_deref()
             .is_some_and(|active| same_database_path(active, &source))
         {
-            let output = output.to_string_lossy().into_owned();
-            self.connection.execute("VACUUM INTO ?1", params![output])?;
+            self.connection
+                .execute("VACUUM INTO ?1", params![temporary_name])
+                .map(|_| ())
+                .map_err(StoreError::from)
         } else {
             let source_store = Self::open(&source)?;
-            let output = output.to_string_lossy().into_owned();
             source_store
                 .connection
-                .execute("VACUUM INTO ?1", params![output])?;
+                .execute("VACUUM INTO ?1", params![temporary_name])
+                .map(|_| ())
+                .map_err(StoreError::from)
+        };
+        if let Err(error) = vacuum {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
         }
-
+        let result = set_private_file_mode(&temporary)
+            .and_then(|_| fs::rename(&temporary, &output).map_err(StoreError::from));
+        if let Err(error) = result {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
         let bytes = fs::metadata(&output)?.len() as i64;
         Ok(DatabaseBackup {
             database: name.to_owned(),
-            path: output_path.to_owned(),
+            path: output.to_string_lossy().into_owned(),
             bytes,
         })
     }
@@ -2699,24 +2684,11 @@ impl Store {
         if database != "current" {
             validate_database_name(database)?;
         }
-        let base = self
-            .database_path
-            .borrow()
-            .as_deref()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let backup_dir = base.join("backups");
-        fs::create_dir_all(&backup_dir)?;
-        #[cfg(unix)]
-        std::fs::set_permissions(
-            &backup_dir,
-            std::os::unix::fs::PermissionsExt::from_mode(0o700),
-        )?;
         let sequence = SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let output = backup_dir.join(format!("{database}.{}-{sequence}.db", std::process::id()));
-        let output = output.to_string_lossy().into_owned();
-        self.backup_database(database, &output)
+        self.backup_database(
+            database,
+            &format!("{database}-{}-{sequence}.db", std::process::id()),
+        )
     }
 
     pub fn delete_database(&self, name: &str) -> Result<bool, StoreError> {
@@ -2936,22 +2908,12 @@ impl Store {
         name: &str,
         output_path: &str,
     ) -> Result<DatabaseBackup, StoreError> {
-        let output = validate_database_backup_path(output_path)?;
-        if output.exists() {
-            return Err(StoreError::Invalid(
-                "database backup output already exists".to_owned(),
-            ));
-        }
-        if let Some(parent) = output.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
+        let output = self.resolve_private_backup_path(output_path)?;
         let snapshot = self.memory_snapshot_for_database(name)?;
-        create_private_file(&output, &snapshot)?;
+        atomic_private_file(&output, &snapshot)?;
         Ok(DatabaseBackup {
             database: name.to_owned(),
-            path: output_path.to_owned(),
+            path: output.to_string_lossy().into_owned(),
             bytes: i64::try_from(snapshot.len()).unwrap_or(i64::MAX),
         })
     }
@@ -3097,6 +3059,74 @@ impl Store {
 
     fn into_connection(self) -> Connection {
         self.connection.into_inner()
+    }
+
+    fn private_backup_dir(&self) -> Result<PathBuf, StoreError> {
+        let directory = self
+            .database_path
+            .borrow()
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(|parent| parent.join("backups"))
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("memory-mcp-rust-backups-{}", std::process::id()))
+            });
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(StoreError::Invalid(
+                    "backup directory must not be a symbolic link".to_owned(),
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(StoreError::Invalid(
+                    "backup directory must reference a directory".to_owned(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(&directory)?;
+            }
+            Err(error) => return Err(StoreError::Io(error)),
+        }
+        set_private_directory_mode(&directory)?;
+        Ok(directory)
+    }
+
+    fn resolve_private_backup_path(&self, requested: &str) -> Result<PathBuf, StoreError> {
+        if requested.trim().is_empty() {
+            return Err(StoreError::Invalid(
+                "backup path must not be empty".to_owned(),
+            ));
+        }
+        let requested = Path::new(requested);
+        let mut components = requested.components();
+        let Some(Component::Normal(name)) = components.next() else {
+            return Err(StoreError::Invalid(
+                "backup path must be one file name inside the private backup directory".to_owned(),
+            ));
+        };
+        if components.next().is_some() {
+            return Err(StoreError::Invalid(
+                "backup path must be one file name inside the private backup directory".to_owned(),
+            ));
+        }
+        let name = name.to_str().ok_or_else(|| {
+            StoreError::Invalid("backup file name must be valid UTF-8".to_owned())
+        })?;
+        if name.is_empty() || name == "." || name == ".." {
+            return Err(StoreError::Invalid(
+                "backup file name must not be empty or a traversal component".to_owned(),
+            ));
+        }
+        let output = self.private_backup_dir()?.join(name);
+        match fs::symlink_metadata(&output) {
+            Ok(_) => Err(StoreError::Invalid(
+                "backup output already exists".to_owned(),
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(output),
+            Err(error) => Err(StoreError::Io(error)),
+        }
     }
 
     fn database_root(&self) -> Result<PathBuf, StoreError> {
@@ -3408,72 +3438,6 @@ impl Store {
         Ok(rows)
     }
 
-    pub fn ingest_document(
-        &self,
-        path: &str,
-        reference: Option<&str>,
-        name: Option<&str>,
-        max_bytes: usize,
-        workspace: &str,
-    ) -> Result<Context, StoreError> {
-        validate_context_workspace(workspace)?;
-        if path.trim().is_empty() {
-            return Err(StoreError::Invalid(
-                "document path must not be empty".to_owned(),
-            ));
-        }
-        if max_bytes == 0 {
-            return Err(StoreError::Invalid(
-                "document max_bytes must be positive".to_owned(),
-            ));
-        }
-        let source_path = Path::new(path);
-        if source_path
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-        {
-            return Err(StoreError::Invalid(
-                "document path must not contain parent-directory components".to_owned(),
-            ));
-        }
-        let metadata = fs::metadata(source_path)?;
-        if !metadata.is_file() {
-            return Err(StoreError::Invalid(
-                "document path must reference a regular file".to_owned(),
-            ));
-        }
-        if metadata.len() > max_bytes as u64 {
-            return Err(StoreError::Invalid(format!(
-                "document exceeds max_bytes ({max_bytes})"
-            )));
-        }
-        let bytes = fs::read(source_path)?;
-        if bytes.len() > max_bytes {
-            return Err(StoreError::Invalid(format!(
-                "document exceeds max_bytes ({max_bytes})"
-            )));
-        }
-        let content = String::from_utf8(bytes)
-            .map_err(|_| StoreError::Invalid("document must be valid UTF-8".to_owned()))?;
-        let content_hash = sha256(&content);
-        let generated_reference = format!("document:{}:{content_hash}", sha256(workspace));
-        let generated_name = source_path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("document");
-        self.put_context_with_metadata(
-            reference.unwrap_or(&generated_reference),
-            name.unwrap_or(generated_name),
-            &content,
-            &ContextMetadata {
-                schema: "text/plain".to_owned(),
-                source: path.to_owned(),
-                ..ContextMetadata::default()
-            },
-            workspace,
-        )
-    }
-
     pub fn put_context(
         &self,
         reference: &str,
@@ -3499,6 +3463,12 @@ impl Store {
         workspace: &str,
     ) -> Result<Context, StoreError> {
         validate_context(reference, name, workspace, metadata.expires_at.as_deref())?;
+        let max_bytes = configured_context_max_bytes()?;
+        if content.len() > max_bytes {
+            return Err(StoreError::Invalid(format!(
+                "context content exceeds the configured size limit ({max_bytes} bytes)"
+            )));
+        }
         if let Some(expires_at) = metadata.expires_at.as_deref() {
             self.validate_timestamp(expires_at, "context expiry")?;
         }
@@ -3772,13 +3742,14 @@ impl Store {
         let payload_size = i64::try_from(spec.payload.len())
             .map_err(|_| StoreError::Invalid("event payload is too large".to_owned()))?;
         let payload_sha256 = sha256(&spec.payload);
-        let payload_truncated = spec.payload.len() > MAX_EVENT_PAYLOAD_BYTES;
+        let payload_truncated = spec.payload_truncated;
         if let Some(existing) = self.event_by_key(&spec.idempotency_key, &spec.workspace)? {
             if existing.event_type != spec.event_type
                 || existing.context_reference != spec.context_reference
                 || existing.metadata != spec.metadata
                 || existing.payload_sha256 != payload_sha256
                 || existing.payload_size != payload_size
+                || existing.payload_truncated != payload_truncated
             {
                 return Err(StoreError::Invalid(
                     "event idempotency key conflicts with an existing event".to_owned(),
@@ -5050,6 +5021,40 @@ fn create_private_file(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn atomic_private_file(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| StoreError::Invalid("private file directory is missing".to_owned()))?;
+    let sequence = SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".{}-{}-{sequence}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("backup"),
+        std::process::id()
+    ));
+    let result = create_private_file(&temporary, bytes)
+        .and_then(|_| set_private_file_mode(&temporary))
+        .and_then(|_| fs::rename(&temporary, path).map_err(StoreError::from));
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn set_private_file_mode(path: &Path) -> Result<(), StoreError> {
+    #[cfg(unix)]
+    fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    Ok(())
+}
+
+fn set_private_directory_mode(path: &Path) -> Result<(), StoreError> {
+    #[cfg(unix)]
+    fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    Ok(())
+}
+
 fn database_root_for_path(path: &Path) -> PathBuf {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -5079,29 +5084,6 @@ fn validate_database_name(name: &str) -> Result<(), StoreError> {
         ));
     }
     Ok(())
-}
-
-fn validate_database_backup_path(path: &str) -> Result<PathBuf, StoreError> {
-    if path.trim().is_empty() {
-        return Err(StoreError::Invalid(
-            "database backup path must not be empty".to_owned(),
-        ));
-    }
-    let path = PathBuf::from(path);
-    if path
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        return Err(StoreError::Invalid(
-            "database backup path must not contain parent-directory components".to_owned(),
-        ));
-    }
-    if path.exists() && path.is_dir() {
-        return Err(StoreError::Invalid(
-            "database backup path must reference a file".to_owned(),
-        ));
-    }
-    Ok(path)
 }
 
 fn archived_database_path(path: &Path) -> PathBuf {
@@ -5599,6 +5581,38 @@ fn truncate_utf8(content: &str, max_bytes: usize) -> String {
     content[..end].to_owned()
 }
 
+fn validate_fact_text(text: &str) -> Result<(), StoreError> {
+    if text.trim().is_empty() {
+        return Err(StoreError::Invalid(
+            "fact text must not be empty".to_owned(),
+        ));
+    }
+    if text.chars().count() > MAX_FACT_TEXT_CHARS {
+        return Err(StoreError::Invalid(format!(
+            "fact text exceeds the configured limit ({MAX_FACT_TEXT_CHARS} characters)"
+        )));
+    }
+    Ok(())
+}
+
+fn configured_context_max_bytes() -> Result<usize, StoreError> {
+    let Some(value) = std::env::var_os("MEMORY_MCP_CONTEXT_MAX_BYTES") else {
+        return Ok(DEFAULT_CONTEXT_MAX_BYTES);
+    };
+    let value = value.to_str().ok_or_else(|| {
+        StoreError::Invalid("MEMORY_MCP_CONTEXT_MAX_BYTES must be valid UTF-8".to_owned())
+    })?;
+    let value = value.parse::<usize>().map_err(|_| {
+        StoreError::Invalid("MEMORY_MCP_CONTEXT_MAX_BYTES must be a positive integer".to_owned())
+    })?;
+    if !(1..=MAX_CONTEXT_MAX_BYTES).contains(&value) {
+        return Err(StoreError::Invalid(format!(
+            "MEMORY_MCP_CONTEXT_MAX_BYTES must be between 1 and {MAX_CONTEXT_MAX_BYTES}"
+        )));
+    }
+    Ok(value)
+}
+
 fn validate_event_spec(spec: &EventSpec) -> Result<(), StoreError> {
     validate_context_workspace(&spec.workspace)?;
     for (value, label) in [
@@ -5609,6 +5623,16 @@ fn validate_event_spec(spec: &EventSpec) -> Result<(), StoreError> {
         if value.trim().is_empty() {
             return Err(StoreError::Invalid(format!("{label} must not be empty")));
         }
+    }
+    if spec.metadata.len() > MAX_EVENT_METADATA_BYTES {
+        return Err(StoreError::Invalid(
+            "event metadata exceeds the configured size limit".to_owned(),
+        ));
+    }
+    if spec.payload.len() > MAX_EVENT_PAYLOAD_BYTES {
+        return Err(StoreError::Invalid(
+            "event payload exceeds the configured size limit".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -5711,6 +5735,19 @@ mod tests {
                 contexts: 1
             }
         );
+    }
+
+    #[test]
+    fn fact_and_context_sizes_are_rejected_before_persistence() {
+        let store = Store::in_memory().expect("fresh store");
+        let long_fact = "x".repeat(MAX_FACT_TEXT_CHARS + 1);
+        assert!(store.remember_fact(&long_fact, "workspace-a").is_err());
+
+        let long_context = "x".repeat(DEFAULT_CONTEXT_MAX_BYTES + 1);
+        assert!(store
+            .put_context("too-large", "Too large", &long_context, "workspace-a")
+            .is_err());
+        assert!(store.context("too-large", "workspace-a").unwrap().is_none());
     }
 
     #[test]
@@ -6000,7 +6037,7 @@ mod tests {
 
         let run_spec = RunSpec {
             run_id: "run-1".to_owned(),
-            issue_ref: "NTL-722".to_owned(),
+            issue_ref: "performance-decision".to_owned(),
             pr_ref: "1".to_owned(),
             session: "session-1".to_owned(),
             git_ref: "abc123".to_owned(),
@@ -6019,15 +6056,15 @@ mod tests {
         let linked = store
             .link_run(
                 "run-1",
-                Some("NTL-722"),
-                Some("https://github.com/maxivillus/memory-mcp-rust/pull/1"),
+                Some("performance-decision"),
+                Some("fixture-pr-1"),
                 None,
                 None,
                 "workspace-a",
             )
             .unwrap()
             .expect("linked run");
-        assert!(linked.pr_ref.contains("pull/1"));
+        assert!(linked.pr_ref.contains("fixture-pr-1"));
         let ended = store
             .end_run("run-1", "passed", "workspace-a")
             .unwrap()
@@ -6038,7 +6075,13 @@ mod tests {
             store.end_run("run-1", "", "workspace-a").unwrap(),
             Some(ended)
         );
-        assert_eq!(store.query_runs("NTL-722", "workspace-a").unwrap().len(), 1);
+        assert_eq!(
+            store
+                .query_runs("performance-decision", "workspace-a")
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(store.query_runs("run-1", "workspace-b").unwrap().is_empty());
 
         let measurement_spec = MeasurementSpec {
@@ -6155,31 +6198,8 @@ mod tests {
     }
 
     #[test]
-    fn document_ingestion_is_bounded_and_freshness_is_audited() {
+    fn freshness_is_audited_without_an_unbounded_path_ingest_route() {
         let store = Store::in_memory().expect("fresh store");
-        let path = std::env::temp_dir().join(format!(
-            "memory-mcp-rust-document-{}.txt",
-            std::process::id()
-        ));
-        fs::write(&path, "Rust document").expect("document fixture");
-        let path_string = path.to_str().expect("UTF-8 temp path");
-        let context = store
-            .ingest_document(path_string, None, None, 1024, "workspace-a")
-            .expect("document context");
-        assert_eq!(context.content, "Rust document");
-        assert_eq!(
-            context.name,
-            format!("memory-mcp-rust-document-{}.txt", std::process::id())
-        );
-        assert!(store
-            .ingest_document(path_string, None, None, 4, "workspace-a")
-            .is_err());
-        let unsafe_path = format!("{path_string}/../document.txt");
-        assert!(store
-            .ingest_document(&unsafe_path, None, None, 1024, "workspace-a")
-            .is_err());
-        let _ = fs::remove_file(&path);
-
         let fact = store
             .remember_fact("freshness candidate", "workspace-a")
             .expect("fact");
@@ -6209,7 +6229,7 @@ mod tests {
                 outcome: "SQLite".to_owned(),
                 confidence: Some(0.9),
                 decision_maker: "test".to_owned(),
-                issue_ref: "NTL-722".to_owned(),
+                issue_ref: "performance-decision".to_owned(),
                 path: "src/store.rs".to_owned(),
                 symbol: "Store".to_owned(),
                 parent_id: None,
@@ -6243,19 +6263,31 @@ mod tests {
         assert_eq!(consolidated.consolidated, 0);
         assert_eq!(consolidated.remaining, 1);
 
-        let backup_path = std::env::temp_dir().join(format!(
-            "memory-mcp-rust-backup-{}.json",
-            std::process::id()
-        ));
         let backup = store
-            .backup_workspace(backup_path.to_str().unwrap(), "workspace-a")
+            .backup_workspace("anchored-workspace.json", "workspace-a")
             .expect("workspace backup");
         assert!(backup.bytes > 0);
         assert_eq!(backup.facts, 1);
-        assert!(fs::read_to_string(&backup_path)
+        assert!(fs::read_to_string(&backup.path)
             .unwrap()
             .contains("anchored fact"));
-        let _ = fs::remove_file(backup_path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&backup.path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(Path::new(&backup.path).parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        let _ = fs::remove_file(&backup.path);
     }
 
     #[test]
@@ -6274,6 +6306,7 @@ mod tests {
             context_reference: "ctx-a".to_owned(),
             metadata: r#"{"source":"test"}"#.to_owned(),
             payload: r#"{"turn":1}"#.to_owned(),
+            payload_truncated: false,
             workspace: "workspace-a".to_owned(),
         };
         let event = store.capture_event(&event_spec).expect("event");
@@ -6491,7 +6524,7 @@ mod tests {
                 outcome: "SQLite".to_owned(),
                 confidence: Some(0.9),
                 decision_maker: "agent".to_owned(),
-                issue_ref: "NTL-722".to_owned(),
+                issue_ref: "performance-decision".to_owned(),
                 path: "src/store.rs".to_owned(),
                 symbol: "Store".to_owned(),
                 parent_id: None,
@@ -6507,7 +6540,7 @@ mod tests {
                 outcome: "SQLite with FTS5".to_owned(),
                 confidence: Some(0.8),
                 decision_maker: "agent".to_owned(),
-                issue_ref: "NTL-722".to_owned(),
+                issue_ref: "performance-decision".to_owned(),
                 path: String::new(),
                 symbol: String::new(),
                 parent_id: Some(root.id),
@@ -6603,8 +6636,15 @@ mod tests {
             std::env::temp_dir().join(format!("memory-mcp-rust-databases-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let main_path = root.join("facts.db");
-        let backup_path = root.join("beta-backup.db");
         let store = Store::open(&main_path).expect("file-backed store");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&main_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
 
         assert_eq!(store.current_database().unwrap().name, "facts");
         let alpha = store.create_database("alpha").expect("alpha database");
@@ -6629,11 +6669,11 @@ mod tests {
         assert!(store.select_database("missing").is_err());
 
         let backup = store
-            .backup_database("current", backup_path.to_str().unwrap())
+            .backup_database("current", "beta-backup.db")
             .expect("physical database backup");
         assert_eq!(backup.database, "current");
         assert!(backup.bytes > 0);
-        let backup_store = Store::open(&backup_path).expect("read backup");
+        let backup_store = Store::open(&backup.path).expect("read backup");
         assert_eq!(backup_store.list_facts("workspace-a").unwrap().len(), 1);
         drop(backup_store);
 
@@ -6657,11 +6697,6 @@ mod tests {
 
     #[test]
     fn in_memory_database_lifecycle_is_snapshot_backed() {
-        let backup_path = std::env::temp_dir().join(format!(
-            "memory-mcp-rust-memory-backup-{}.db",
-            std::process::id()
-        ));
-        let _ = fs::remove_file(&backup_path);
         let store = Store::in_memory().expect("memory store");
         store.remember_fact("main fact", "w").expect("main fact");
         store.create_database("alpha").expect("alpha database");
@@ -6672,10 +6707,10 @@ mod tests {
         store.select_database("alpha").expect("select alpha again");
         assert_eq!(store.list_facts("w").expect("alpha facts").len(), 1);
         let backup = store
-            .backup_database("current", backup_path.to_str().unwrap())
+            .backup_database("current", "memory-backup.db")
             .expect("memory database backup");
         assert!(backup.bytes > 0);
-        let backup_store = Store::open(&backup_path).expect("open memory backup");
+        let backup_store = Store::open(&backup.path).expect("open memory backup");
         assert_eq!(backup_store.list_facts("w").expect("backup facts").len(), 1);
         drop(backup_store);
 
@@ -6712,7 +6747,7 @@ mod tests {
         assert!(store
             .delete_database("alpha")
             .expect("delete archived alpha"));
-        let _ = fs::remove_file(backup_path);
+        let _ = fs::remove_file(&backup.path);
     }
 
     #[test]

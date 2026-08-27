@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 const REDIS_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1349,11 +1349,12 @@ impl RedisEndpoint {
         username: Option<String>,
         password: Option<String>,
     ) -> Result<Self, RedisError> {
-        if host.is_empty() {
+        if host.trim().is_empty() {
             return Err(RedisError::Invalid(
                 "Redis host must not be empty".to_owned(),
             ));
         }
+        validate_redis_host(&host)?;
         let port = port
             .unwrap_or("6379")
             .parse::<u16>()
@@ -1433,6 +1434,7 @@ impl RedisEndpoint {
                 "Redis host must not be empty".to_owned(),
             ));
         }
+        validate_redis_host(&host)?;
         Ok(Self {
             host,
             port,
@@ -1441,6 +1443,22 @@ impl RedisEndpoint {
             password,
         })
     }
+}
+
+fn validate_redis_host(host: &str) -> Result<(), RedisError> {
+    let host = host.trim_matches(&['[', ']'][..]);
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false);
+    if !is_loopback {
+        return Err(RedisError::Invalid(
+            "only loopback Redis endpoints are supported; use a local TLS proxy for remote Redis"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn endpoint_from_env() -> Result<Option<RedisEndpoint>, RedisError> {
@@ -1539,6 +1557,13 @@ impl RedisConnection {
         let addresses = address.to_socket_addrs()?;
         let mut last_error = None;
         for address in addresses {
+            if !address.ip().is_loopback() {
+                last_error = Some(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Redis endpoint resolved outside loopback",
+                ));
+                continue;
+            }
             match TcpStream::connect_timeout(&address, REDIS_TIMEOUT) {
                 Ok(stream) => {
                     stream.set_read_timeout(Some(REDIS_TIMEOUT))?;
@@ -1812,42 +1837,49 @@ mod tests {
 
     #[test]
     fn parses_safe_redis_urls_without_exposing_credentials() {
-        let endpoint = RedisEndpoint::parse("redis://user:p%40ss@localhost:6380/3").unwrap();
+        let endpoint =
+            RedisEndpoint::parse("redis://user:encoded%40value@localhost:6380/3").unwrap();
         assert_eq!(endpoint.host, "localhost");
         assert_eq!(endpoint.port, 6380);
         assert_eq!(endpoint.database, 3);
         assert_eq!(endpoint.username.as_deref(), Some("user"));
-        assert_eq!(endpoint.password.as_deref(), Some("p@ss"));
+        assert_eq!(endpoint.password.as_deref(), Some("encoded@value"));
 
-        let password_only = RedisEndpoint::parse("redis://:secret@localhost:6379/0").unwrap();
+        let password_only =
+            RedisEndpoint::parse("redis://:encoded-value@localhost:6379/0").unwrap();
         assert_eq!(password_only.username, None);
-        assert_eq!(password_only.password.as_deref(), Some("secret"));
+        assert_eq!(password_only.password.as_deref(), Some("encoded-value"));
         assert_eq!(
             auth_command(&password_only),
-            Some(vec![b"AUTH".to_vec(), b"secret".to_vec()])
+            Some(vec![b"AUTH".to_vec(), b"encoded-value".to_vec()])
         );
 
-        let named = RedisEndpoint::parse("redis://user:secret@localhost").unwrap();
+        let named = RedisEndpoint::parse("redis://user:encoded-value@localhost").unwrap();
         assert_eq!(
             auth_command(&named),
-            Some(vec![b"AUTH".to_vec(), b"user".to_vec(), b"secret".to_vec()])
+            Some(vec![
+                b"AUTH".to_vec(),
+                b"user".to_vec(),
+                b"encoded-value".to_vec()
+            ])
         );
 
         assert!(RedisEndpoint::parse("https://localhost").is_err());
         assert!(RedisEndpoint::parse("redis://localhost/not-a-db").is_err());
+        assert!(RedisEndpoint::parse("redis://redis.internal:6379").is_err());
     }
 
     #[test]
     fn parses_host_based_redis_settings_without_exposing_credentials() {
         let endpoint = RedisEndpoint::from_host_fields(
-            "redis".to_owned(),
+            "localhost".to_owned(),
             Some("6380"),
             Some("3"),
             Some("default".to_owned()),
-            Some("fixture".to_owned()),
+            Some("encoded-value".to_owned()),
         )
         .unwrap();
-        assert_eq!(endpoint.host, "redis");
+        assert_eq!(endpoint.host, "localhost");
         assert_eq!(endpoint.port, 6380);
         assert_eq!(endpoint.database, 3);
         assert_eq!(endpoint.username.as_deref(), Some("default"));
@@ -1855,11 +1887,12 @@ mod tests {
         assert_eq!(auth_command(&endpoint).as_ref().map(Vec::len), Some(3));
 
         let defaults =
-            RedisEndpoint::from_host_fields("redis".to_owned(), None, None, None, None).unwrap();
+            RedisEndpoint::from_host_fields("localhost".to_owned(), None, None, None, None)
+                .unwrap();
         assert_eq!(defaults.port, 6379);
         assert_eq!(defaults.database, 0);
         assert!(RedisEndpoint::from_host_fields(
-            "redis".to_owned(),
+            "localhost".to_owned(),
             Some("not-a-port"),
             None,
             None,
@@ -1867,7 +1900,7 @@ mod tests {
         )
         .is_err());
         assert!(RedisEndpoint::from_host_fields(
-            "redis".to_owned(),
+            "localhost".to_owned(),
             None,
             Some("not-a-database"),
             None,

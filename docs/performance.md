@@ -1,7 +1,7 @@
 # Performance measurement
 
 The repository includes a bounded memory-bench binary for the performance
-decision in NTL-722. It runs one fixed workload:
+decision record. It runs one fixed workload:
 
 1. open a persistent SQLite connection and complete one-time migrations;
 2. insert unique facts into one workspace;
@@ -16,11 +16,11 @@ the optional namespaced Redis adapter. Docker-style split settings are also
 accepted when a URL is absent: MEMORY_MCP_REDIS_HOST or REDIS_HOST,
 MEMORY_MCP_REDIS_PORT or REDIS_PORT, optional *_DATABASE or *_DB, optional
 *_USERNAME or *_USER, and *_PASSWORD or *_PASS. Explicit URL settings take
-precedence. Password-only URLs such as
-`redis://:password@host:6379/0` and URLs with an explicit username are both
-supported; credentials are read from the environment and are not written to
-the report. The binary reports both backend timings only when Redis passes its
-connection and PING probe. If the configured endpoint is unavailable, it reports
+precedence. The bundled plaintext adapter accepts only localhost or an IP
+loopback address; use a local TLS proxy/sidecar when Redis is remote.
+Credentials are read from the environment and are not written to the report.
+The binary reports both backend timings only when Redis passes its connection
+and PING probe. If the configured endpoint is unavailable, it reports
 selected_backend=sqlite and an explicit fallback reason.
 
 The JSON output separates migration/setup, writes, searches, and total time.

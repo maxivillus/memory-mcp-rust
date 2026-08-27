@@ -1,7 +1,8 @@
 ## Status
 
 Accepted by PM after the product-owner selection of Option A and the QA,
-AppSec, artifact, and release readbacks recorded for NTL-722. The decision
+AppSec, artifact, and release readbacks recorded for the performance decision
+record. The decision
 accepts Redis as the canonical primary state with a Redis-restored in-memory
 compatibility engine and SQLite as the standby/fallback image; it does not
 claim a performance improvement.
