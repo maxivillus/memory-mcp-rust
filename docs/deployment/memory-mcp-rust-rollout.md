@@ -1,14 +1,21 @@
 ## Purpose
 
-This runbook describes the controlled replacement of the Python memory-mcp
-stdio server with `memory-mcp-rust`. The Python launcher remains the rollback
-implementation until the complete gate is green.
+This is an optional legacy migration and cutover runbook. Normal Rust-only
+build, launch, test, and Docker workflows do not require Python. Use this
+document only when importing an existing database from an external legacy
+deployment or keeping that deployment available for rollback and comparison.
+
+The runbook describes the controlled replacement of an external legacy
+`memory-mcp` stdio server with `memory-mcp-rust`. The external legacy launcher
+remains the rollback implementation until the complete gate is green.
 
 The Rust repository ships `scripts/memory-mcp-migrate.sh` and
 `scripts/memory-mcp-preflight.py`. It does not ship the legacy Python server,
-its launcher, or its Python test suites. The legacy command, database copy, and
-launcher configuration referenced below must come from a separate legacy
-checkout or deployment.
+its launcher, or its legacy test suites. The preflight script is a standalone
+comparison utility used only by this optional runbook; it is not a dependency
+of the Rust server. The legacy command, database copy, and launcher
+configuration referenced below must come from a separate legacy checkout or
+deployment.
 
 The Rust server uses Redis as the preferred backend when a supported Redis
 setting is configured and reachable. SQLite remains the standby and fallback
@@ -39,7 +46,7 @@ completed.
 ## Copy-first migration
 
 Use the Rust binary's migration subcommand or the wrapper script. The target
-must be new; an existing target is rejected so the Python database remains a
+must be new; an existing target is rejected so the legacy database remains a
 rollback point.
 
 ```sh
@@ -70,13 +77,16 @@ caller-controlled error details are not written to the process log. Database
 and backup responses likewise contain only bounded names, sizes, and generated
 file names; private absolute paths remain internal to the store.
 
-## Contract and launcher preflight
+## Optional legacy/Rust contract and launcher preflight
 
-Run the shipped preflight utility against the old Python command and the Rust
-command, pointing each at its own migrated copy. `memory_mcp.py` in the example
-is an external legacy entrypoint, not a file in this repository; replace the
-placeholder with the command used by the legacy checkout. Supply the environment
-variable names declared by the two launchers, not their values:
+Only for a cross-implementation cutover, run the shipped Python preflight
+utility against the external legacy command and the Rust command, pointing
+each at its own migrated copy. The utility is Python because it launches and
+compares two external stdio implementations; it is not part of the Rust
+runtime or the normal Rust test suite. `memory_mcp.py` in the example is an
+external legacy entrypoint, not a file in this repository; replace the
+placeholder with the command used by the legacy checkout. Supply the
+environment variable names declared by the two launchers, not their values:
 
 ```sh
 python3 scripts/memory-mcp-preflight.py \
@@ -124,13 +134,14 @@ entries. Update all configured host and container launchers consistently:
 - keep `MEMORY_MCP_DB` on the shared writable mount;
 - pass Redis settings through the existing secret interpolation without
   copying or logging the password;
-- retain the Python command and the verified source backup as rollback assets;
+- retain the external legacy command and the verified source backup as rollback
+  assets;
 - recreate services in a scheduled maintenance window, then run the same
   smoke checks against the actual service boundaries.
 
-If any check is red, do not switch the live launcher. Restore the Python
-launcher only through the approved stack rollout procedure; do not delete the
-verified database or discard the Rust target while investigating.
+If any check is red, do not switch the live launcher. Restore the external
+legacy launcher only through the approved stack rollout procedure; do not
+delete the verified database or discard the Rust target while investigating.
 
 ## Resource guardrails
 

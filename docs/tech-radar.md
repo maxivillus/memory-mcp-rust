@@ -22,8 +22,8 @@
 | Durable Redis operation ledger | Preserve committed/conflict operation metadata beyond the compatibility marker TTL without retaining request payloads. | `src/redis.rs`, `src/backend.rs` |
 | Revision watcher with backoff | Avoid full scans while idle, mirror bounded pointwise outbox batches, retry failures without a busy loop, and stop with the coordinator. | `src/backend.rs` |
 | Payload-free resource counters | Measure Redis commands/bytes and synchronization ticks/errors/duration without exposing memory contents. | `src/redis.rs`, `src/backend.rs`, `src/bin/memory-bench.rs` |
-| Copy-first SQLite migration | Preserve the Python rollback database while applying Rust schema migrations to a verified private copy; publish only after integrity, row-count, and typed fingerprint checks. | `src/migration.rs`, `src/main.rs`, `scripts/memory-mcp-migrate.sh` |
-| Legacy/Rust deployment preflight | Compare the exact MCP contract, launcher environment names, copied data counts, and all 80 disposable routes before a live cutover. | `scripts/memory-mcp-preflight.py`, `docs/deployment/memory-mcp-rust-rollout.md` |
+| Copy-first SQLite migration | Preserve the external legacy rollback database while applying Rust schema migrations to a verified private copy; publish only after integrity, row-count, and typed fingerprint checks. | `src/migration.rs`, `src/main.rs`, `scripts/memory-mcp-migrate.sh` |
+| Optional legacy/Rust deployment preflight | Compare the exact MCP contract, launcher environment names, copied data counts, and all 80 disposable routes before an explicit cross-implementation cutover. The shipped Python utility is not a Rust runtime dependency. | `scripts/memory-mcp-preflight.py`, `docs/deployment/memory-mcp-rust-rollout.md` |
 
 No new third-party dependency was introduced by the coordinator or its resource
 counters; the implementation uses existing dependencies and the Rust standard
@@ -49,5 +49,9 @@ library.
   workload and reports Redis command/byte counters when Redis is reachable.
 - `docs/`: current contract, ADR, performance caveats, and this architecture
   inventory.
-- `scripts/`: copy-first migration wrapper and the legacy/Rust deployment
-  preflight gate.
+- `scripts/`: copy-first migration wrapper and the optional legacy/Rust
+  deployment preflight gate.
+
+All normal build, run, and test paths are Rust. The legacy references above
+describe migration or release-comparison inputs; neither the external legacy
+service nor Python is required by the Rust binary.
