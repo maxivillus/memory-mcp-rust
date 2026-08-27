@@ -17,6 +17,12 @@ of the Rust server. The legacy command, database copy, and launcher
 configuration referenced below must come from a separate legacy checkout or
 deployment.
 
+The Rust repository ships `scripts/memory-mcp-migrate.sh` and
+`scripts/memory-mcp-preflight.py`. It does not ship the legacy Python server,
+its launcher, or its Python test suites. The legacy command, database copy, and
+launcher configuration referenced below must come from a separate legacy
+checkout or deployment.
+
 The Rust server uses Redis as the preferred backend when a supported Redis
 setting is configured and reachable. SQLite remains the standby and fallback
 store. A Redis outage must therefore select SQLite, retain offline writes in
