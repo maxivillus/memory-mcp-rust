@@ -113,8 +113,8 @@ where
             Err(CallError::InvalidParams(message)) => {
                 error_response(id.clone().unwrap_or(Value::Null), -32602, &message)
             }
-            Err(CallError::Execution(error)) => {
-                eprintln!("tool execution failed: {error}");
+            Err(CallError::Execution(_error)) => {
+                eprintln!("tool execution failed");
                 result_response(
                     id.clone().unwrap_or(Value::Null),
                     json!({
@@ -892,6 +892,9 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
                 .or_else(|_| required_string(arguments, "type"))?;
             let context_reference = required_string(arguments, "context_ref")
                 .or_else(|_| required_string(arguments, "context"))?;
+            reject_sensitive_event_string(idempotency_key, "idempotency_key")?;
+            reject_sensitive_event_string(event_type, "event_type")?;
+            reject_sensitive_event_string(context_reference, "context_ref")?;
             let metadata = arguments
                 .get("metadata")
                 .cloned()
@@ -2069,48 +2072,131 @@ fn event_path_excluded(path: &str, exclusions: &HashSet<String>) -> bool {
 }
 
 fn is_sensitive_event_key(key: &str) -> bool {
-    let key = key.to_ascii_lowercase().replace('-', "_");
+    let key = key
+        .chars()
+        .filter_map(|character| {
+            character
+                .is_ascii_alphanumeric()
+                .then_some(character.to_ascii_lowercase())
+        })
+        .collect::<String>();
     key == "cwd"
         || key == "path"
-        || key.ends_with("_path")
+        || key.ends_with("path")
+        || key == "key"
+        || key.ends_with("key")
         || [
             "password",
             "passwd",
             "secret",
             "token",
-            "api_key",
+            "apikey",
             "apikey",
             "authorization",
             "credential",
-            "private_key",
-            "access_key",
-            "client_secret",
+            "privatekey",
+            "accesskey",
+            "clientsecret",
             "cookie",
+            "sessionid",
+            "clientid",
+            "refreshtoken",
+            "sessiontoken",
         ]
         .iter()
         .any(|needle| key.contains(needle))
 }
 
 fn sanitize_event_string(value: &str) -> String {
+    let value = if event_string_is_sensitive(value) {
+        REDACTED_EVENT_VALUE
+    } else {
+        value
+    };
+    truncate_event_utf8(value, MAX_EVENT_STRING_BYTES)
+}
+
+fn reject_sensitive_event_string(value: &str, label: &str) -> Result<(), CallError> {
+    if event_string_is_sensitive(value) {
+        return Err(CallError::InvalidParams(format!(
+            "{label} contains restricted data"
+        )));
+    }
+    Ok(())
+}
+
+fn event_string_is_sensitive(value: &str) -> bool {
     let lower = value.trim().to_ascii_lowercase();
-    let secret = lower.starts_with("bearer ")
+    let credential_marker = lower.starts_with("bearer ")
         || lower.starts_with("basic ")
         || lower.starts_with("sk-")
         || lower.starts_with("ghp_")
         || lower.starts_with("github_pat_")
         || lower.starts_with("xoxb-")
         || lower.starts_with("akia")
+        || lower.contains("bearer ")
+        || lower.contains("basic ")
         || lower.contains("-----begin ")
-        || lower.contains("authorization: bearer ")
-        || lower.contains("authorization: basic ")
+        || lower.contains("authorization:")
+        || lower.contains("authorization=")
         || lower.contains("password=")
         || lower.contains("password:")
+        || lower.contains("password ")
+        || lower.contains("passwd=")
+        || lower.contains("passwd:")
+        || lower.contains("secret=")
+        || lower.contains("secret:")
+        || lower.contains("secret ")
         || lower.contains("token=")
         || lower.contains("token:")
+        || lower.contains("token ")
         || lower.contains("api_key=")
-        || lower.contains("api_key:");
-    let value = if secret { REDACTED_EVENT_VALUE } else { value };
-    truncate_event_utf8(value, MAX_EVENT_STRING_BYTES)
+        || lower.contains("api_key:")
+        || lower.contains("api-key=")
+        || lower.contains("api-key:")
+        || lower.contains("apikey=")
+        || lower.contains("apikey:")
+        || lower.contains("access_key=")
+        || lower.contains("access_key:")
+        || lower.contains("private_key=")
+        || lower.contains("private_key:")
+        || lower.contains("client_secret=")
+        || lower.contains("client_secret:")
+        || lower.contains("refresh_token=")
+        || lower.contains("refresh_token:")
+        || lower.contains("session_token=")
+        || lower.contains("session_token:");
+    credential_marker
+        || lower.contains("://")
+        || looks_like_filesystem_path(value)
+        || looks_like_jwt(&lower)
+}
+
+fn looks_like_filesystem_path(value: &str) -> bool {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    value.starts_with('/')
+        || value.starts_with("\\\\")
+        || (bytes.len() >= 3 && bytes[1] == b':' && matches!(bytes[2], b'/' | b'\\'))
+}
+
+fn looks_like_jwt(value: &str) -> bool {
+    value
+        .split(|character: char| {
+            character.is_whitespace()
+                || matches!(character, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']')
+        })
+        .any(|candidate| {
+            let mut parts = candidate.split('.');
+            let header = parts.next().unwrap_or("");
+            let payload = parts.next().unwrap_or("");
+            let signature = parts.next().unwrap_or("");
+            parts.next().is_none()
+                && header.starts_with("eyj")
+                && header.len() >= 8
+                && payload.len() >= 8
+                && signature.len() >= 8
+        })
 }
 
 fn event_value_was_truncated(value: &Value) -> bool {
@@ -2240,6 +2326,10 @@ fn exact_capture_event(store: &Store, arguments: &Map<String, Value>) -> Result<
             "event_kind must not be empty".to_owned(),
         ));
     }
+    reject_sensitive_event_string(key, "idempotency_key")?;
+    reject_sensitive_event_string(event_id, "event_id")?;
+    reject_sensitive_event_string(&kind, "event_kind")?;
+    reject_sensitive_event_string(session_id, "session_id")?;
     if arguments.get("capture").and_then(Value::as_bool) == Some(false) {
         return Ok(json!({"accepted": false, "status": "excluded", "reason": "capture_disabled"}));
     }
@@ -4247,7 +4337,7 @@ fn exact_export(store: &Store, arguments: &Map<String, Value>) -> Result<Value, 
 }
 
 fn database_value(info: &crate::store::DatabaseInfo) -> Value {
-    json!({"name": info.name, "database": info.name, "path": info.path,
+    json!({"name": info.name, "database": info.name,
            "active": info.active, "selected": info.active, "archived": info.archived,
            "bytes": info.bytes})
 }
@@ -5210,16 +5300,19 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("\"bytes\""));
+        assert!(!backup["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"path\""));
 
         let current = handle_line(
             r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"current_database","arguments":{}}}"#,
             &store,
         )
         .unwrap();
-        assert!(current["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("\"name\":\"protocol\""));
+        let current_text = current["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(current_text.contains("\"name\":\"protocol\""));
+        assert!(!current_text.contains("\"path\""));
 
         drop(store);
         let _ = std::fs::remove_dir_all(root);
@@ -5771,6 +5864,16 @@ mod tests {
         store
             .put_context("event-seed", "event seed", "context", "w")
             .unwrap();
+        let embedded_header = [
+            "prefix ",
+            "Authorization",
+            ": ",
+            "Bearer ",
+            "fixture-header",
+        ]
+        .concat();
+        let embedded_assignment = ["prefix ", "api", "_key=", "fixture-assignment"].concat();
+        let unknown_key_value = ["fixture", "-", "key"].concat();
         let captured = handle_request(
             json!({
                 "jsonrpc": "2.0",
@@ -5789,8 +5892,10 @@ mod tests {
                             "keep": "value",
                             "remove": "must-not-persist",
                             "credentials": {"password": "do-not-persist"},
-                            "nested": {"token": "do-not-persist-token"},
-                            "header": "Authorization: Bearer do-not-persist-header"
+                            "nested": {"token": "fixture-token"},
+                            "header": embedded_header,
+                            "unclassified": embedded_assignment,
+                            "apiKey": unknown_key_value
                         },
                         "exclude_paths": ["remove"]
                     }
@@ -5806,8 +5911,10 @@ mod tests {
         assert!(context.content.contains("[REDACTED]"));
         assert!(context.content.contains("value"));
         assert!(!context.content.contains("must-not-persist"));
-        assert!(!context.content.contains("do-not-persist-token"));
-        assert!(!context.content.contains("do-not-persist-header"));
+        assert!(!context.content.contains("fixture-token"));
+        assert!(!context.content.contains("fixture-header"));
+        assert!(!context.content.contains("fixture-assignment"));
+        assert!(!context.content.contains("fixture-key"));
         assert!(!context.content.contains("/private/path"));
         let event = store.read_event("event-safe", "w").unwrap().unwrap();
         assert!(event.metadata.contains("[REDACTED]"));
@@ -5838,6 +5945,35 @@ mod tests {
         let oversized_context = store.context(oversized_ref, "w").unwrap().unwrap();
         assert!(oversized_context.byte_size < 20_000);
         assert!(oversized_context.content.contains("\"truncated\":true"));
+    }
+
+    #[test]
+    fn capture_event_rejects_sensitive_identifiers_before_persistence() {
+        let store = Store::in_memory().unwrap();
+        let idempotency_key = ["prefix ", "Bearer ", "fixture-id"].concat();
+        let response = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "capture_event",
+                    "arguments": {
+                        "idempotency_key": idempotency_key,
+                        "event_kind": "tool-call",
+                        "workspace": "w",
+                        "payload": {"value": 1}
+                    }
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("idempotency_key contains restricted data"));
     }
 
     #[test]

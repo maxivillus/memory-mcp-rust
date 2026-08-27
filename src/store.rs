@@ -512,6 +512,7 @@ pub struct ConsolidationReport {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WorkspaceBackup {
+    #[serde(skip_serializing)]
     pub path: String,
     pub bytes: i64,
     pub facts: i64,
@@ -521,6 +522,7 @@ pub struct WorkspaceBackup {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct DatabaseInfo {
     pub name: String,
+    #[serde(skip_serializing)]
     pub path: String,
     pub active: bool,
     pub archived: bool,
@@ -530,6 +532,7 @@ pub struct DatabaseInfo {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct DatabaseBackup {
     pub database: String,
+    #[serde(skip_serializing)]
     pub path: String,
     pub bytes: i64,
 }
@@ -6268,6 +6271,7 @@ mod tests {
             .expect("workspace backup");
         assert!(backup.bytes > 0);
         assert_eq!(backup.facts, 1);
+        assert!(serde_json::to_value(&backup).unwrap().get("path").is_none());
         assert!(fs::read_to_string(&backup.path)
             .unwrap()
             .contains("anchored fact"));
@@ -6651,6 +6655,7 @@ mod tests {
         let beta = store.create_database("beta").expect("beta database");
         assert!(!alpha.active);
         assert!(!beta.active);
+        assert!(serde_json::to_value(&alpha).unwrap().get("path").is_none());
         assert!(store
             .list_databases()
             .unwrap()
@@ -6673,6 +6678,7 @@ mod tests {
             .expect("physical database backup");
         assert_eq!(backup.database, "current");
         assert!(backup.bytes > 0);
+        assert!(serde_json::to_value(&backup).unwrap().get("path").is_none());
         let backup_store = Store::open(&backup.path).expect("read backup");
         assert_eq!(backup_store.list_facts("workspace-a").unwrap().len(), 1);
         drop(backup_store);
@@ -6710,6 +6716,7 @@ mod tests {
             .backup_database("current", "memory-backup.db")
             .expect("memory database backup");
         assert!(backup.bytes > 0);
+        assert!(serde_json::to_value(&backup).unwrap().get("path").is_none());
         let backup_store = Store::open(&backup.path).expect("open memory backup");
         assert_eq!(backup_store.list_facts("w").expect("backup facts").len(), 1);
         drop(backup_store);

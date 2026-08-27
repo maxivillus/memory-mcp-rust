@@ -21,8 +21,9 @@ completed.
    preflight commands below accept only database paths, command strings, and
    environment **names**; they do not print or persist environment values.
 4. The bundled plaintext Redis and HTTP provider adapters are loopback-only.
-   Put any remote service behind a local TLS proxy or sidecar before enabling
-   it; never broaden the allowlist by putting credentials in a URL.
+   The HTTP adapter rejects credentials on plaintext transport. Put any remote
+   service behind a local TLS proxy or sidecar before enabling it; never broaden
+   the allowlist by putting credentials in a URL.
 5. Backup output names are resolved below the private `backups/` directory;
    callers must pass a single file name, not an absolute path.
 6. Do not restart an active agent runtime as part of this rehearsal. A real
@@ -57,6 +58,11 @@ atomically after these checks pass:
 
 The JSON result contains only checks, counts, and fingerprints. It does not
 contain fact text, credentials, or database paths.
+
+Runtime stderr is deliberately generic: provider, migration, backend, and
+caller-controlled error details are not written to the process log. Database
+and backup responses likewise contain only bounded names, sizes, and generated
+file names; private absolute paths remain internal to the store.
 
 ## Contract and launcher preflight
 
