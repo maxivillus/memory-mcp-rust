@@ -1068,14 +1068,18 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
                 .expect("decision serializes")
         }
         "query_decisions" | "find_precedents" => {
-            let query = required_string(arguments, "query")?;
-            let decisions = if name == "query_decisions" {
-                store.query_decisions(query, workspace)
+            if let Some(value) = advisory_guard(arguments, name)? {
+                value
             } else {
-                store.find_precedents(query, workspace)
+                let query = required_string(arguments, "query")?;
+                let decisions = if name == "query_decisions" {
+                    store.query_decisions(query, workspace)
+                } else {
+                    store.find_precedents(query, workspace)
+                }
+                .map_err(CallError::Execution)?;
+                serde_json::to_value(decisions).expect("decisions serialize")
             }
-            .map_err(CallError::Execution)?;
-            serde_json::to_value(decisions).expect("decisions serialize")
         }
         "get_causal_chain" => {
             let id = required_i64(arguments, "id")
@@ -1097,16 +1101,20 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
             .expect("decision conflicts serialize")
         }
         "query_anchored" => {
-            let query = optional_string(arguments, "query")?
-                .or(optional_string(arguments, "path")?)
-                .or(optional_string(arguments, "symbol")?)
-                .unwrap_or("");
-            serde_json::to_value(
-                store
-                    .query_anchored(query, workspace)
-                    .map_err(CallError::Execution)?,
-            )
-            .expect("anchored query serializes")
+            if let Some(value) = advisory_guard(arguments, "query_anchored")? {
+                value
+            } else {
+                let query = optional_string(arguments, "query")?
+                    .or(optional_string(arguments, "path")?)
+                    .or(optional_string(arguments, "symbol")?)
+                    .unwrap_or("");
+                serde_json::to_value(
+                    store
+                        .query_anchored(query, workspace)
+                        .map_err(CallError::Execution)?,
+                )
+                .expect("anchored query serializes")
+            }
         }
         "attach_evidence" => {
             let fact_id =
@@ -1469,6 +1477,9 @@ fn exact_compatibility_route(
             Some(pipeline::categorize_pending(store, arguments).map_err(CallError::Execution)?)
         }
         "compose_recall" if arguments.contains_key("turn_text") => {
+            if let Some(value) = advisory_guard(arguments, "compose_recall")? {
+                return Ok(Some(value));
+            }
             Some(pipeline::compose_recall(store, arguments).map_err(CallError::Execution)?)
         }
         "verify_facts" if arguments.contains_key("text") => {
@@ -2888,13 +2899,8 @@ fn exact_query_measurement(
 }
 
 fn exact_context_map(store: &Store, arguments: &Map<String, Value>) -> Result<Value, CallError> {
-    if optional_string(arguments, "purpose")?.unwrap_or("advisory") == "safety_critical" {
-        return Ok(json!({
-            "error": "context_map is advisory-only and cannot authorize safety-critical work",
-            "code": "advisory_only",
-            "memory_policy": "advisory_only",
-            "safety_critical_allowed": false,
-        }));
+    if let Some(value) = advisory_guard(arguments, "context_map")? {
+        return Ok(value);
     }
     if std::env::var("MEMORY_MCP_CONTEXT_MAP").ok().as_deref() != Some("1") {
         return Ok(json!({
@@ -3112,7 +3118,7 @@ fn exact_search_graph(store: &Store, arguments: &Map<String, Value>) -> Result<V
         ));
     }
     let graph = store
-        .search_graph(entity, workspace)
+        .graph_neighborhood(entity, depth, limit, workspace)
         .map_err(CallError::Execution)?;
     if graph.entities.is_empty() {
         return Ok(
@@ -3141,7 +3147,13 @@ fn exact_search_graph(store: &Store, arguments: &Map<String, Value>) -> Result<V
             "subject": names.get(&relation.subject_id).cloned().unwrap_or_else(|| relation.subject_id.to_string()),
             "predicate": relation.predicate,
             "object": names.get(&relation.object_id).cloned().unwrap_or_else(|| relation.object_id.to_string()),
-            "direction": if relation.subject_id == root_entity.id { "out" } else { "in" },
+            "direction": if relation.subject_id == root_entity.id {
+                "out"
+            } else if relation.object_id == root_entity.id {
+                "in"
+            } else {
+                "through"
+            },
         }))
         .collect::<Vec<_>>();
     Ok(json!({"root": root, "nodes": nodes, "edges": edges, "depth": depth}))
@@ -3259,22 +3271,23 @@ fn exact_find_precedents(
     store: &Store,
     arguments: &Map<String, Value>,
 ) -> Result<Value, CallError> {
-    if optional_string(arguments, "purpose")?.unwrap_or("advisory") == "safety_critical" {
-        return Ok(
-            json!({"error": "find_precedents is advisory-only", "code": "advisory_only",
-                         "memory_policy": "advisory_only", "safety_critical_allowed": false}),
-        );
+    if let Some(value) = advisory_guard(arguments, "find_precedents")? {
+        return Ok(value);
     }
     let workspace = arguments
         .get("workspace")
         .and_then(Value::as_str)
         .unwrap_or("");
     let scenario = required_string(arguments, "scenario")?.trim();
-    let limit = optional_usize(arguments, &["limit"], 10)?;
+    let profile = compatibility_profile(arguments)?;
+    let profile_limit = pipeline::retrieval_profile(&profile)
+        .expect("compatibility_profile validates the retrieval profile")
+        .max_hits;
+    let limit = optional_usize(arguments, &["limit"], 10)?.min(profile_limit);
     if scenario.is_empty() {
         return Ok(
             json!({"error": "scenario has no searchable terms", "count": 0,
-                         "precedents": [], "profile": optional_string(arguments, "profile")?.unwrap_or("balanced"),
+                         "precedents": [], "profile": profile,
                          "result_status": "empty"}),
         );
     }
@@ -3321,7 +3334,7 @@ fn exact_find_precedents(
     Ok(json!({"count": count, "precedents": precedents,
               "semantic": arguments.get("semantic").and_then(Value::as_bool).unwrap_or(false),
               "memory_policy": "advisory_only", "safety_critical_allowed": false,
-              "profile": optional_string(arguments, "profile")?.unwrap_or("balanced"),
+              "profile": profile,
               "result_status": if count == 0 { "empty" } else { "ok" },
               "retrieval": {"matched": count, "reason": if count == 0 { "no_matching_decisions" } else { "match" }}}))
 }
@@ -3492,7 +3505,16 @@ fn canonical_fact_value(
     workspace: &str,
 ) -> Result<Value, CallError> {
     let mut value = fact_value(fact);
+    let evidence = store
+        .fact_evidence_summary(fact.id, workspace)
+        .map_err(CallError::Execution)?;
     if let Some(object) = value.as_object_mut() {
+        object.insert("evidence_count".to_owned(), json!(evidence.total));
+        object.insert("evidence_status".to_owned(), json!(evidence.status()));
+        object.insert(
+            "resolved_evidence_count".to_owned(),
+            json!(evidence.resolved),
+        );
         if let Some(metadata) = store
             .fact_search_metadata(fact.id, workspace)
             .map_err(CallError::Execution)?
@@ -3516,10 +3538,7 @@ fn compatibility_profile(arguments: &Map<String, Value>) -> Result<String, CallE
         .unwrap_or("balanced")
         .trim()
         .to_owned();
-    if !matches!(
-        profile.as_str(),
-        "balanced" | "orientation" | "implementation" | "review" | "incident"
-    ) {
+    if pipeline::retrieval_profile(&profile).is_none() {
         return Err(CallError::InvalidParams(format!(
             "unknown retrieval profile: {profile}"
         )));
@@ -3531,15 +3550,18 @@ fn advisory_guard(
     arguments: &Map<String, Value>,
     operation: &str,
 ) -> Result<Option<Value>, CallError> {
-    if optional_string(arguments, "purpose")?.unwrap_or("advisory") == "safety_critical" {
-        return Ok(Some(json!({
+    match optional_string(arguments, "purpose")?.unwrap_or("advisory") {
+        "advisory" => Ok(None),
+        "safety_critical" => Ok(Some(json!({
             "error": format!("{operation} is advisory-only and cannot authorize safety-critical work"),
             "code": "advisory_only",
             "memory_policy": "advisory_only",
             "safety_critical_allowed": false,
-        })));
+        }))),
+        _ => Err(CallError::InvalidParams(
+            "purpose must be advisory or safety_critical".to_owned(),
+        )),
     }
-    Ok(None)
 }
 
 fn trust_rank(value: &str) -> u8 {
@@ -3767,11 +3789,29 @@ fn exact_search_facts(store: &Store, arguments: &Map<String, Value>) -> Result<V
             })
         })
         .collect::<Vec<_>>();
-    facts.truncate(limit);
+    let retrieval_profile = pipeline::retrieval_profile(&profile)
+        .expect("compatibility_profile validates the retrieval profile");
+    let mut eligible_facts = Vec::with_capacity(facts.len());
+    for fact in facts {
+        if pipeline::fact_is_eligible(store, &fact, workspace, arguments, &retrieval_profile)
+            .map_err(CallError::Execution)?
+        {
+            eligible_facts.push(fact);
+        }
+    }
+    facts = eligible_facts;
+    let effective_limit = limit.min(retrieval_profile.max_hits);
+    facts.truncate(effective_limit);
+    let graph_requested = arguments
+        .get("graph")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || retrieval_profile.graph_depth > 0;
     if arguments
         .get("semantic")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+        || graph_requested
     {
         return pipeline::hybrid_search(store, query, arguments, &facts)
             .map_err(CallError::Execution);
@@ -3830,20 +3870,46 @@ fn exact_search_semantic(
     if let Some(value) = advisory_guard(arguments, "search_semantic")? {
         return Ok(value);
     }
-    let _ = compatibility_profile(arguments)?;
+    let profile = compatibility_profile(arguments)?;
+    let retrieval_profile = pipeline::retrieval_profile(&profile)
+        .expect("compatibility_profile validates the retrieval profile");
     if !providers::embeddings_enabled() {
         let workspace = optional_workspace(arguments)?;
         let query = required_string(arguments, "query")?;
+        let requested_limit = optional_usize(arguments, &["limit"], 20)?;
+        if !(1..=100).contains(&requested_limit) {
+            return Err(CallError::InvalidParams(
+                "limit must be between 1 and 100".to_owned(),
+            ));
+        }
         let facts = store
             .search_semantic(query, workspace)
             .map_err(CallError::Execution)?;
-        let values = facts
+        let mut eligible_facts = Vec::with_capacity(facts.len());
+        for fact in facts {
+            if pipeline::fact_is_eligible(store, &fact, workspace, arguments, &retrieval_profile)
+                .map_err(CallError::Execution)?
+            {
+                eligible_facts.push(fact);
+            }
+        }
+        let effective_limit = requested_limit.min(retrieval_profile.max_hits);
+        eligible_facts.truncate(effective_limit);
+        let values = eligible_facts
             .iter()
             .map(|fact| canonical_fact_value(store, fact, workspace))
             .collect::<Result<Vec<_>, _>>()?;
+        let result_status = if values.is_empty() {
+            "empty"
+        } else {
+            "degraded"
+        };
         return Ok(json!({
             "count": values.len(), "facts": values, "model": providers::embedding_model(),
-            "result_status": if facts.is_empty() { "empty" } else { "degraded" },
+            "profile": retrieval_profile.name,
+            "evidence_policy": if retrieval_profile.requires_resolved_evidence { "resolved_anchor_required" } else { "advisory_metadata" },
+            "result_status": result_status,
+            "retrieval_outcome": if result_status == "empty" { "abstained" } else { "matched" },
             "error": "semantic search is disabled; lexical fallback returned"
         }));
     }
@@ -5163,6 +5229,15 @@ mod tests {
         }
     }
 
+    fn tool_payload(response: &Value) -> Value {
+        serde_json::from_str(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("tool response contains text"),
+        )
+        .expect("tool response contains JSON payload")
+    }
+
     #[test]
     fn initialize_and_tools_list_match_contract_baseline() {
         let store = Store::in_memory().unwrap();
@@ -6049,6 +6124,167 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("\"outcome\":\"SQLite\""));
+    }
+
+    #[test]
+    fn retrieval_profiles_bound_results_and_require_resolved_evidence() {
+        let _environment = isolated_provider_environment();
+        let store = Store::in_memory().unwrap();
+        for index in 0..8 {
+            store
+                .remember_fact(&format!("profilecap candidate {index}"), "w")
+                .unwrap();
+        }
+        let orientation = handle_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_facts","arguments":{"query":"profilecap","limit":100,"profile":"orientation","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let orientation_payload = tool_payload(&orientation);
+        assert_eq!(orientation_payload["profile"], "orientation");
+        assert!(orientation_payload["count"].as_u64().unwrap() <= 6);
+
+        let evidence_fact = store
+            .remember_fact("profilecap resolved evidence", "w")
+            .unwrap();
+        let attach = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"attach_evidence","arguments":{{"fact_id":{},"source_ref":"contract:profile","selected_text":"profilecap resolved evidence","resolution_status":"resolved","workspace":"w"}}}}}}"#,
+            evidence_fact.id
+        );
+        let attached = handle_line(&attach, &store).unwrap();
+        assert!(!attached["result"]["isError"].as_bool().unwrap());
+
+        let review = handle_line(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_facts","arguments":{"query":"profilecap","limit":100,"profile":"review","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let review_payload = tool_payload(&review);
+        assert_eq!(review_payload["profile"], "review");
+        assert_eq!(
+            review_payload["evidence_policy"],
+            "resolved_anchor_required"
+        );
+        assert_eq!(review_payload["count"], 1);
+        assert_eq!(review_payload["facts"][0]["id"], evidence_fact.id);
+        assert_eq!(review_payload["facts"][0]["evidence_status"], "resolved");
+    }
+
+    #[test]
+    fn graph_depth_and_profile_graph_rrf_are_bounded() {
+        let _environment = isolated_provider_environment();
+        let store = Store::in_memory().unwrap();
+        let graph_fact = store
+            .remember_fact("fact reachable through the Rust graph", "w")
+            .unwrap();
+        for (name, entity_type) in [
+            ("Rust", "language"),
+            ("SQLite", "database"),
+            ("WAL", "storage"),
+        ] {
+            store
+                .remember_entity(&crate::store::EntitySpec {
+                    name: name.to_owned(),
+                    entity_type: entity_type.to_owned(),
+                    aliases: Vec::new(),
+                    workspace: "w".to_owned(),
+                })
+                .unwrap();
+        }
+        for (subject, predicate, object) in
+            [("Rust", "uses", "SQLite"), ("SQLite", "enables", "WAL")]
+        {
+            store
+                .remember_relation(&crate::store::RelationSpec {
+                    subject: subject.to_owned(),
+                    predicate: predicate.to_owned(),
+                    object: object.to_owned(),
+                    source_fact_id: Some(graph_fact.id),
+                    workspace: "w".to_owned(),
+                })
+                .unwrap();
+        }
+
+        let depth_one = handle_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_graph","arguments":{"entity":"Rust","depth":1,"limit":10,"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let depth_one_payload = tool_payload(&depth_one);
+        assert_eq!(depth_one_payload["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(depth_one_payload["edges"].as_array().unwrap().len(), 1);
+
+        let depth_two = handle_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_graph","arguments":{"entity":"Rust","depth":2,"limit":10,"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let depth_two_payload = tool_payload(&depth_two);
+        assert_eq!(depth_two_payload["nodes"].as_array().unwrap().len(), 3);
+        assert_eq!(depth_two_payload["edges"].as_array().unwrap().len(), 2);
+
+        let graph_rrf = handle_line(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_facts","arguments":{"query":"Rust","limit":10,"profile":"implementation","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let graph_rrf_payload = tool_payload(&graph_rrf);
+        assert_eq!(graph_rrf_payload["retrieval_mode"], "rrf_lexical_graph");
+        assert_eq!(graph_rrf_payload["graph_count"], 1);
+        assert_eq!(graph_rrf_payload["facts"][0]["id"], graph_fact.id);
+        assert!(
+            graph_rrf_payload["facts"][0]["graph_score"]
+                .as_f64()
+                .unwrap()
+                > 0.0
+        );
+    }
+
+    #[test]
+    fn compose_recall_expands_one_session_and_refuses_safety_critical_use() {
+        let environment = isolated_provider_environment();
+        std::env::set_var("MEMORY_MCP_RECALL", "1");
+        let store = Store::in_memory().unwrap();
+        let seed = store
+            .remember_fact("compose-target durable fact", "w")
+            .unwrap();
+        let sibling = store
+            .remember_fact("session sibling background fact", "w")
+            .unwrap();
+        store.set_fact_session(seed.id, "session-1", "w").unwrap();
+        store
+            .set_fact_session(sibling.id, "session-1", "w")
+            .unwrap();
+
+        let recall = handle_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"compose_recall","arguments":{"turn_text":"compose-target","limit":1,"session_expand":1,"workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let recall_payload = tool_payload(&recall);
+        assert_eq!(recall_payload["session_expanded"], 1);
+        assert!(recall_payload["block"]
+            .as_str()
+            .unwrap()
+            .contains("session sibling"));
+        assert_eq!(recall_payload["authority_granted"], false);
+
+        let safety = handle_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"compose_recall","arguments":{"turn_text":"compose-target","purpose":"safety_critical","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let safety_payload = tool_payload(&safety);
+        assert_eq!(safety_payload["code"], "advisory_only");
+        assert_eq!(safety_payload["safety_critical_allowed"], false);
+
+        let invalid_purpose = handle_line(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"compose_recall","arguments":{"turn_text":"compose-target","purpose":"unknown","workspace":"w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(invalid_purpose["error"]["code"], -32602);
+        drop(environment);
     }
 
     #[test]

@@ -3,12 +3,67 @@
 //! Python implementation; the durable state remains owned by `Store`.
 
 use crate::providers;
-use crate::store::{EvidenceSpec, Fact, FactMetadata, Store, StoreError, MAX_FACT_TEXT_CHARS};
+use crate::store::{
+    EvidenceSpec, Fact, FactEvidenceSummary, FactMetadata, Store, StoreError, MAX_FACT_TEXT_CHARS,
+};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 const DEFAULT_PROFILE: &str = "balanced";
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RetrievalProfile {
+    pub(crate) name: &'static str,
+    pub(crate) max_hits: usize,
+    pub(crate) max_chars: usize,
+    pub(crate) graph_depth: usize,
+    pub(crate) requires_resolved_evidence: bool,
+}
+
+/// Role-aware retrieval is deliberately a response policy, not an authority
+/// policy.  The caps keep each profile deterministic and the stricter review
+/// profiles refuse facts without at least one resolved evidence anchor.
+pub(crate) fn retrieval_profile(name: &str) -> Option<RetrievalProfile> {
+    match name {
+        "balanced" => Some(RetrievalProfile {
+            name: "balanced",
+            max_hits: 100,
+            max_chars: 12_000,
+            graph_depth: 0,
+            requires_resolved_evidence: false,
+        }),
+        "orientation" => Some(RetrievalProfile {
+            name: "orientation",
+            max_hits: 6,
+            max_chars: 4_000,
+            graph_depth: 0,
+            requires_resolved_evidence: false,
+        }),
+        "implementation" => Some(RetrievalProfile {
+            name: "implementation",
+            max_hits: 12,
+            max_chars: 8_000,
+            graph_depth: 1,
+            requires_resolved_evidence: false,
+        }),
+        "review" => Some(RetrievalProfile {
+            name: "review",
+            max_hits: 20,
+            max_chars: 12_000,
+            graph_depth: 1,
+            requires_resolved_evidence: true,
+        }),
+        "incident" => Some(RetrievalProfile {
+            name: "incident",
+            max_hits: 20,
+            max_chars: 16_000,
+            graph_depth: 2,
+            requires_resolved_evidence: true,
+        }),
+        _ => None,
+    }
+}
 
 pub fn maybe_enrich_fact(
     store: &Store,
@@ -500,6 +555,10 @@ pub fn consolidate(store: &Store, arguments: &Map<String, Value>) -> Result<Valu
 }
 
 pub fn semantic_search(store: &Store, arguments: &Map<String, Value>) -> Result<Value, StoreError> {
+    if let Some(value) = advisory_result(arguments, "search_semantic")? {
+        return Ok(value);
+    }
+    let retrieval_profile = profile_config(arguments)?;
     if !providers::embeddings_enabled() {
         return Ok(disabled("MEMORY_MCP_EMBEDDINGS"));
     }
@@ -507,7 +566,8 @@ pub fn semantic_search(store: &Store, arguments: &Map<String, Value>) -> Result<
     if query.is_empty() {
         return Ok(json!({"error": "query is required"}));
     }
-    let limit = bounded_usize(arguments, "limit", 20, 1, 100)?;
+    let requested_limit = bounded_usize(arguments, "limit", 20, 1, 100)?;
+    let limit = requested_limit.min(retrieval_profile.max_hits);
     let threshold = arguments
         .get("threshold")
         .and_then(Value::as_f64)
@@ -518,52 +578,26 @@ pub fn semantic_search(store: &Store, arguments: &Map<String, Value>) -> Result<
         .into_iter()
         .next()
         .ok_or_else(|| StoreError::Invalid("embedding provider returned no vector".into()))?;
-    let trust_min = string_arg(arguments, "trust_min");
-    let facts = store
-        .fact_embeddings(workspace)?
-        .into_iter()
-        .filter_map(|row| {
-            let metadata = store
-                .fact_search_metadata(row.fact.id, workspace)
-                .ok()
-                .flatten()?;
-            if metadata.archived
-                || row.fact.lifecycle == "forgotten"
-                || (row.fact.validity == "invalid"
-                    && !valid_at_allows(&metadata.invalid_at, arguments.get("valid_at")))
-            {
-                return None;
-            }
-            if let Some(project) = string_arg(arguments, "project") {
-                if row.fact.project != project {
-                    return None;
-                }
-            }
-            if let Some(domain) = string_arg(arguments, "domain") {
-                if row.fact.domain != domain {
-                    return None;
-                }
-            }
-            if let Some(category) = string_arg(arguments, "category") {
-                if metadata.category.as_deref() != Some(category) {
-                    return None;
-                }
-            }
-            if arguments
-                .get("strong_only")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-                && !row.fact.strong
-            {
-                return None;
-            }
-            if !trust_matches(row.fact.trust.as_str(), trust_min) {
-                return None;
-            }
-            let score = providers::cosine(&query_vector, &row.vector);
-            (score >= threshold).then_some((score, row.fact, metadata))
-        })
-        .collect::<Vec<_>>();
+    let mut facts = Vec::new();
+    for row in store.fact_embeddings(workspace)? {
+        let Some(metadata) = store.fact_search_metadata(row.fact.id, workspace)? else {
+            continue;
+        };
+        if !fact_is_eligible(store, &row.fact, workspace, arguments, &retrieval_profile)? {
+            continue;
+        }
+        if metadata.archived
+            || row.fact.lifecycle == "forgotten"
+            || (row.fact.validity == "invalid"
+                && !valid_at_allows(&metadata.invalid_at, arguments.get("valid_at")))
+        {
+            continue;
+        }
+        let score = providers::cosine(&query_vector, &row.vector);
+        if score >= threshold {
+            facts.push((score, row.fact, metadata));
+        }
+    }
     let mut facts = facts;
     facts.sort_by(|left, right| {
         right
@@ -571,20 +605,23 @@ pub fn semantic_search(store: &Store, arguments: &Map<String, Value>) -> Result<
             .total_cmp(&left.0)
             .then_with(|| left.1.id.cmp(&right.1.id))
     });
-    let facts = facts
-        .into_iter()
-        .take(limit)
-        .map(|(score, fact, metadata)| fact_value(&fact, Some(score as f64), Some(metadata)))
-        .collect::<Vec<_>>();
+    let mut values = Vec::new();
+    for (score, fact, metadata) in facts.into_iter().take(limit) {
+        let mut value = fact_value(&fact, Some(score as f64), Some(metadata));
+        annotate_evidence(store, &mut value, fact.id, workspace)?;
+        values.push(value);
+    }
+    let result_status = if values.is_empty() { "empty" } else { "ok" };
     Ok(json!({
-        "count": facts.len(),
+        "count": values.len(),
         "model": providers::embedding_model(),
-        "facts": facts,
+        "facts": values,
         "memory_policy": "advisory_only",
         "safety_critical_allowed": false,
-        "profile": profile(arguments)?,
-        "result_status": if facts.is_empty() { "empty" } else { "ok" },
-        "retrieval_outcome": if facts.is_empty() { "abstained" } else { "matched" },
+        "profile": retrieval_profile.name,
+        "evidence_policy": evidence_policy(&retrieval_profile),
+        "result_status": result_status,
+        "retrieval_outcome": if result_status == "empty" { "abstained" } else { "matched" },
     }))
 }
 
@@ -624,9 +661,19 @@ pub fn hybrid_search(
     arguments: &Map<String, Value>,
     lexical: &[Fact],
 ) -> Result<Value, StoreError> {
+    if let Some(value) = advisory_result(arguments, "search_facts")? {
+        return Ok(value);
+    }
+    let retrieval_profile = profile_config(arguments)?;
     let workspace = string_arg(arguments, "workspace").unwrap_or("");
-    let limit = bounded_usize(arguments, "limit", 20, 1, 100)?;
-    let semantic = if providers::embeddings_enabled() {
+    let requested_limit = bounded_usize(arguments, "limit", 20, 1, 100)?;
+    let limit = requested_limit.min(retrieval_profile.max_hits);
+    let semantic_requested = arguments
+        .get("semantic")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let semantic_enabled = semantic_requested && providers::embeddings_enabled();
+    let semantic = if semantic_enabled {
         semantic_search(store, &json_args(arguments, query, limit))?
     } else {
         Value::Null
@@ -636,45 +683,102 @@ pub fn hybrid_search(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let semantic_index = semantic_rows
-        .iter()
-        .enumerate()
-        .filter_map(|(index, value)| {
-            value
-                .get("id")
-                .and_then(Value::as_i64)
-                .map(|id| (id, index))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut facts = Vec::new();
-    for (index, fact) in lexical.iter().take(limit).enumerate() {
-        let score = semantic_index
-            .get(&fact.id)
-            .map(|semantic_index| {
-                1.0 / (61.0 + index as f64) + 1.0 / (61.0 + *semantic_index as f64)
-            })
-            .unwrap_or(1.0 / (61.0 + index as f64));
-        let metadata = store.fact_search_metadata(fact.id, workspace)?;
-        let mut value = fact_value(fact, None, metadata);
+    let graph_enabled = arguments
+        .get("graph")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || retrieval_profile.graph_depth > 0;
+    let graph_facts = if graph_enabled {
+        graph_facts(
+            store,
+            query,
+            workspace,
+            arguments,
+            &retrieval_profile,
+            limit,
+        )?
+    } else {
+        Vec::new()
+    };
+
+    let mut ranked = BTreeMap::new();
+    for (rank, fact) in lexical.iter().enumerate().take(limit) {
+        if fact_is_eligible(store, fact, workspace, arguments, &retrieval_profile)? {
+            add_ranked_fact(&mut ranked, fact.clone(), RankedSource::Lexical, rank);
+        }
+    }
+    for (rank, value) in semantic_rows.iter().enumerate() {
+        let Some(fact) = value_to_fact(value) else {
+            continue;
+        };
+        if fact_is_eligible(store, &fact, workspace, arguments, &retrieval_profile)? {
+            add_ranked_fact(&mut ranked, fact, RankedSource::Semantic, rank);
+        }
+    }
+    for (rank, fact) in graph_facts.iter().enumerate() {
+        add_ranked_fact(&mut ranked, fact.clone(), RankedSource::Graph, rank);
+    }
+
+    let mut ranked = ranked.into_values().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.fact.id.cmp(&right.fact.id))
+    });
+    let mut values = Vec::new();
+    for candidate in ranked.into_iter().take(limit) {
+        let metadata = store.fact_search_metadata(candidate.fact.id, workspace)?;
+        let mut value = fact_value(&candidate.fact, None, metadata);
+        annotate_evidence(store, &mut value, candidate.fact.id, workspace)?;
         if let Some(object) = value.as_object_mut() {
             object.insert(
+                "rrf_score".into(),
+                json!((candidate.score * 10_000.0).round() / 10_000.0),
+            );
+            object.insert(
+                "lexical_score".into(),
+                json!((candidate.lexical_score * 10_000.0).round() / 10_000.0),
+            );
+            object.insert(
                 "semantic_score".into(),
-                json!((score * 10_000.0).round() / 10_000.0),
+                json!((candidate.semantic_score * 10_000.0).round() / 10_000.0),
+            );
+            object.insert(
+                "graph_score".into(),
+                json!((candidate.graph_score * 10_000.0).round() / 10_000.0),
             );
         }
-        facts.push(value);
+        values.push(value);
     }
-    if facts.is_empty() {
-        facts = semantic_rows.into_iter().take(limit).collect();
-    }
-    Ok(
-        json!({"count": facts.len(), "model": providers::embedding_model(), "facts": facts,
-              "memory_policy": "advisory_only", "safety_critical_allowed": false,
-              "profile": profile(arguments)?, "result_status": if facts.is_empty() { "empty" } else { "ok" }}),
-    )
+    let retrieval_mode = match (semantic_enabled, graph_enabled) {
+        (true, true) => "rrf_lexical_semantic_graph",
+        (true, false) => "rrf_lexical_semantic",
+        (false, true) => "rrf_lexical_graph",
+        (false, false) => "lexical",
+    };
+    let result_status = if values.is_empty() { "empty" } else { "ok" };
+    Ok(json!({
+        "count": values.len(),
+        "model": providers::embedding_model(),
+        "facts": values,
+        "memory_policy": "advisory_only",
+        "safety_critical_allowed": false,
+        "profile": retrieval_profile.name,
+        "evidence_policy": evidence_policy(&retrieval_profile),
+        "retrieval_mode": retrieval_mode,
+        "semantic_count": semantic_rows.len(),
+        "graph_count": graph_facts.len(),
+        "result_status": result_status,
+        "retrieval_outcome": if result_status == "empty" { "abstained" } else { "matched" },
+    }))
 }
 
 pub fn compose_recall(store: &Store, arguments: &Map<String, Value>) -> Result<Value, StoreError> {
+    if let Some(value) = advisory_result(arguments, "compose_recall")? {
+        return Ok(value);
+    }
+    let retrieval_profile = profile_config(arguments)?;
     if !providers::recall_enabled() {
         return Ok(disabled("MEMORY_MCP_RECALL"));
     }
@@ -683,59 +787,310 @@ pub fn compose_recall(store: &Store, arguments: &Map<String, Value>) -> Result<V
         return Ok(json!({"error": "turn_text is required"}));
     }
     let workspace = string_arg(arguments, "workspace").unwrap_or("");
-    let limit = bounded_usize(arguments, "limit", 8, 1, 20)?;
+    let requested_limit = bounded_usize(arguments, "limit", 8, 1, 20)?;
+    let limit = requested_limit.min(retrieval_profile.max_hits);
     // Store search intentionally treats a multi-term query as an AND query.
     // Recall's direct-turn contract is broader: each meaningful turn term is
     // an OR candidate, then duplicate facts are collapsed deterministically.
     let mut lexical = Vec::new();
     for term in lexical_terms(&turn_text) {
         for fact in store.search_facts(&term, workspace)? {
-            if !lexical.iter().any(|existing: &Fact| existing.id == fact.id) {
+            if fact_is_eligible(store, &fact, workspace, arguments, &retrieval_profile)?
+                && !lexical.iter().any(|existing: &Fact| existing.id == fact.id)
+            {
                 lexical.push(fact);
             }
         }
     }
-    let mut hits = lexical.into_iter().take(limit).collect::<Vec<_>>();
-    if arguments
+    let semantic_requested = arguments
         .get("semantic")
         .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let semantic_enabled = semantic_requested && providers::embeddings_enabled();
+    let graph_enabled = arguments
+        .get("graph")
+        .and_then(Value::as_bool)
         .unwrap_or(false)
-        && providers::embeddings_enabled()
-    {
-        let semantic = semantic_search(store, &json_args(arguments, &turn_text, limit))?;
-        hits = semantic
+        || retrieval_profile.graph_depth > 0;
+    let (mut hits, graph_count) = if semantic_enabled || graph_enabled {
+        let retrieval = hybrid_search(store, &turn_text, arguments, &lexical)?;
+        let graph_count = retrieval
+            .get("graph_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        let hits: Vec<Fact> = retrieval
             .get("facts")
             .and_then(Value::as_array)
             .map(|rows| rows.iter().filter_map(value_to_fact).take(limit).collect())
-            .unwrap_or(hits);
+            .unwrap_or_else(|| lexical.iter().take(limit).cloned().collect());
+        (hits, graph_count)
+    } else {
+        (lexical.into_iter().take(limit).collect(), 0)
+    };
+    let session_expand = bounded_usize(arguments, "session_expand", 0, 0, 20)?;
+    let mut session_expanded = 0usize;
+    if session_expand > 0 {
+        let seeds = hits.clone();
+        for fact in seeds {
+            if session_expanded >= session_expand || fact.session_id.trim().is_empty() {
+                break;
+            }
+            for sibling in store.facts_for_session(&fact.session_id, workspace)? {
+                if session_expanded >= session_expand {
+                    break;
+                }
+                if hits.iter().any(|existing| existing.id == sibling.id)
+                    || !fact_is_eligible(store, &sibling, workspace, arguments, &retrieval_profile)?
+                {
+                    continue;
+                }
+                hits.push(sibling);
+                session_expanded += 1;
+            }
+        }
     }
-    let chars = bounded_usize(arguments, "chars", 0, 0, 1_000_000)?;
+    let requested_chars = bounded_usize(arguments, "chars", 1_400, 0, 1_000_000)?;
+    let chars = if requested_chars == 0 {
+        retrieval_profile.max_chars
+    } else {
+        requested_chars.min(retrieval_profile.max_chars)
+    };
     let mut block = String::from("<memory-recall>\n");
+    let mut rendered = 0usize;
     for fact in &hits {
+        let evidence = evidence_status(store, fact.id, workspace)?;
         let line = format!(
-            "- id={} trust={} type={}\n  fact: {}\n",
-            fact.id, fact.trust, fact.domain, fact.text
+            "- id={} trust={} type={} evidence={}\n  fact: {}\n",
+            fact.id,
+            fact.trust,
+            fact.domain,
+            evidence.status(),
+            fact.text
         );
-        if chars > 0 && block.len() + line.len() + 14 > chars {
+        if chars > 0 && block.chars().count() + line.chars().count() + 14 > chars {
             break;
         }
         block.push_str(&line);
+        rendered += 1;
     }
     block.push_str("</memory-recall>");
+    let retrieval_outcome = if hits.is_empty() {
+        "abstained"
+    } else {
+        "matched"
+    };
+    let abstention_reason = if hits.is_empty() && retrieval_profile.requires_resolved_evidence {
+        "no_resolved_evidence"
+    } else if hits.is_empty() {
+        "no_matching_facts"
+    } else {
+        ""
+    };
     Ok(json!({
         "count": hits.len(),
         "authoritative": hits.iter().filter(|fact| fact.strong).count(),
         "background": hits.iter().filter(|fact| !fact.strong).count(),
-        "graph": 0,
-        "session_expanded": 0,
+        "authority_granted": false,
+        "graph": graph_count,
+        "session_expanded": session_expanded,
+        "rendered": rendered,
         "chars": block.len(),
         "block": block,
-        "query_mode": "direct_turn",
+        "query_mode": if semantic_enabled || graph_enabled { "direct_turn_rrf" } else { "direct_turn" },
         "memory_policy": "advisory_only",
         "safety_critical_allowed": false,
-        "profile": profile(arguments)?,
-        "retrieval_outcome": if hits.is_empty() { "abstained" } else { "matched" },
+        "profile": retrieval_profile.name,
+        "evidence_policy": evidence_policy(&retrieval_profile),
+        "retrieval_outcome": retrieval_outcome,
+        "abstention_reason": abstention_reason,
     }))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RankedSource {
+    Lexical,
+    Semantic,
+    Graph,
+}
+
+#[derive(Debug, Clone)]
+struct RankedFact {
+    fact: Fact,
+    score: f64,
+    lexical_score: f64,
+    semantic_score: f64,
+    graph_score: f64,
+}
+
+fn add_ranked_fact(
+    ranked: &mut BTreeMap<i64, RankedFact>,
+    fact: Fact,
+    source: RankedSource,
+    rank: usize,
+) {
+    let contribution = 1.0 / (61.0 + rank as f64);
+    let entry = ranked.entry(fact.id).or_insert_with(|| RankedFact {
+        fact,
+        score: 0.0,
+        lexical_score: 0.0,
+        semantic_score: 0.0,
+        graph_score: 0.0,
+    });
+    entry.score += contribution;
+    match source {
+        RankedSource::Lexical => entry.lexical_score += contribution,
+        RankedSource::Semantic => entry.semantic_score += contribution,
+        RankedSource::Graph => entry.graph_score += contribution,
+    }
+}
+
+fn graph_facts(
+    store: &Store,
+    query: &str,
+    workspace: &str,
+    arguments: &Map<String, Value>,
+    retrieval_profile: &RetrievalProfile,
+    limit: usize,
+) -> Result<Vec<Fact>, StoreError> {
+    let depth = retrieval_profile.graph_depth.max(1);
+    let graph_limit = limit.clamp(1, 200);
+    let mut relation_ids = HashSet::new();
+    let mut fact_ids = Vec::new();
+    for term in lexical_terms(query) {
+        let graph = store.graph_neighborhood(&term, depth, graph_limit, workspace)?;
+        for relation in graph.relations {
+            if !relation_ids.insert(relation.id) {
+                continue;
+            }
+            let Some(fact_id) = relation.source_fact_id else {
+                continue;
+            };
+            if !fact_ids.contains(&fact_id) {
+                fact_ids.push(fact_id);
+            }
+            if fact_ids.len() >= limit {
+                break;
+            }
+        }
+        if fact_ids.len() >= limit {
+            break;
+        }
+    }
+
+    let mut facts = Vec::new();
+    for fact_id in fact_ids {
+        let Some(fact) = store.fact_by_id_for_pipeline(fact_id, workspace)? else {
+            continue;
+        };
+        if fact_is_eligible(store, &fact, workspace, arguments, retrieval_profile)? {
+            facts.push(fact);
+        }
+        if facts.len() >= limit {
+            break;
+        }
+    }
+    Ok(facts)
+}
+
+pub(crate) fn fact_is_eligible(
+    store: &Store,
+    fact: &Fact,
+    workspace: &str,
+    arguments: &Map<String, Value>,
+    retrieval_profile: &RetrievalProfile,
+) -> Result<bool, StoreError> {
+    let Some(metadata) = store.fact_search_metadata(fact.id, workspace)? else {
+        return Ok(false);
+    };
+    if metadata.archived || fact.lifecycle == "forgotten" {
+        return Ok(false);
+    }
+    if fact.validity == "invalid"
+        && !valid_at_allows(&metadata.invalid_at, arguments.get("valid_at"))
+    {
+        return Ok(false);
+    }
+    if let Some(project) = string_arg(arguments, "project") {
+        if fact.project != project {
+            return Ok(false);
+        }
+    }
+    if let Some(domain) = string_arg(arguments, "domain") {
+        if fact.domain != domain {
+            return Ok(false);
+        }
+    }
+    if let Some(category) = string_arg(arguments, "category") {
+        if metadata.category.as_deref() != Some(category) {
+            return Ok(false);
+        }
+    }
+    if arguments
+        .get("strong_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && !fact.strong
+    {
+        return Ok(false);
+    }
+    if !trust_matches(fact.trust.as_str(), string_arg(arguments, "trust_min")) {
+        return Ok(false);
+    }
+    if retrieval_profile.requires_resolved_evidence
+        && store.fact_evidence_summary(fact.id, workspace)?.resolved == 0
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn evidence_status(
+    store: &Store,
+    fact_id: i64,
+    workspace: &str,
+) -> Result<FactEvidenceSummary, StoreError> {
+    store.fact_evidence_summary(fact_id, workspace)
+}
+
+fn annotate_evidence(
+    store: &Store,
+    value: &mut Value,
+    fact_id: i64,
+    workspace: &str,
+) -> Result<(), StoreError> {
+    let summary = evidence_status(store, fact_id, workspace)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("evidence_count".into(), json!(summary.total));
+        object.insert("evidence_status".into(), json!(summary.status()));
+        object.insert("resolved_evidence_count".into(), json!(summary.resolved));
+    }
+    Ok(())
+}
+
+fn evidence_policy(retrieval_profile: &RetrievalProfile) -> &'static str {
+    if retrieval_profile.requires_resolved_evidence {
+        "resolved_anchor_required"
+    } else {
+        "advisory_metadata"
+    }
+}
+
+fn advisory_result(
+    arguments: &Map<String, Value>,
+    operation: &str,
+) -> Result<Option<Value>, StoreError> {
+    match string_arg(arguments, "purpose").unwrap_or("advisory") {
+        "advisory" => Ok(None),
+        "safety_critical" => Ok(Some(json!({
+            "error": format!("{operation} is advisory-only and cannot authorize safety-critical work"),
+            "code": "advisory_only",
+            "memory_policy": "advisory_only",
+            "safety_critical_allowed": false,
+        }))),
+        _ => Err(StoreError::Invalid(
+            "purpose must be advisory or safety_critical".to_owned(),
+        )),
+    }
 }
 
 pub fn auto_orient(
@@ -743,6 +1098,9 @@ pub fn auto_orient(
     arguments: &Map<String, Value>,
     already_oriented: bool,
 ) -> Result<Value, StoreError> {
+    if let Some(value) = advisory_result(arguments, "auto_orient")? {
+        return Ok(value);
+    }
     if already_oriented {
         return Ok(
             json!({"oriented": false, "skipped": "already_oriented", "count": 0,
@@ -1085,18 +1443,15 @@ fn bounded_usize(
     Ok(value)
 }
 
-fn profile(arguments: &Map<String, Value>) -> Result<String, StoreError> {
-    let value = string_arg(arguments, "profile").unwrap_or(DEFAULT_PROFILE);
-    if matches!(
-        value,
-        "balanced" | "orientation" | "implementation" | "review" | "incident"
-    ) {
-        Ok(value.to_owned())
-    } else {
-        Err(StoreError::Invalid(
+fn profile_config(arguments: &Map<String, Value>) -> Result<RetrievalProfile, StoreError> {
+    let value = string_arg(arguments, "profile")
+        .unwrap_or(DEFAULT_PROFILE)
+        .trim();
+    retrieval_profile(value).ok_or_else(|| {
+        StoreError::Invalid(
             "profile must be one of balanced, orientation, implementation, review, incident".into(),
-        ))
-    }
+        )
+    })
 }
 
 fn lexical_terms(text: &str) -> Vec<String> {
