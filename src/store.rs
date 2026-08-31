@@ -238,6 +238,28 @@ pub struct Evidence {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FactEvidenceSummary {
+    pub total: usize,
+    pub resolved: usize,
+    pub stale: usize,
+    pub unresolved: usize,
+}
+
+impl FactEvidenceSummary {
+    pub fn status(self) -> &'static str {
+        if self.resolved > 0 {
+            "resolved"
+        } else if self.stale > 0 {
+            "stale"
+        } else if self.unresolved > 0 {
+            "unresolved"
+        } else {
+            "missing"
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct MemoryExport {
     pub facts: Vec<Fact>,
@@ -4081,6 +4103,121 @@ impl Store {
         })
     }
 
+    /// Return a bounded breadth-first neighborhood for the modern graph tool.
+    /// The legacy search_graph query remains substring based; this adapter
+    /// resolves an exact entity first and then walks only the requested
+    /// number of relation hops in both directions.
+    pub fn graph_neighborhood(
+        &self,
+        query: &str,
+        depth: usize,
+        limit: usize,
+        workspace: &str,
+    ) -> Result<GraphSearch, StoreError> {
+        validate_graph_workspace(workspace)?;
+        if query.trim().is_empty() {
+            return Ok(GraphSearch {
+                entities: Vec::new(),
+                relations: Vec::new(),
+            });
+        }
+        if !(1..=2).contains(&depth) || !(1..=200).contains(&limit) {
+            return Err(StoreError::Invalid(
+                "depth or limit is outside the supported range".to_owned(),
+            ));
+        }
+
+        let entities = self.list_entities(workspace)?;
+        let normalized_query = canonical_name(query);
+        let query_lower = query.to_lowercase();
+        let root = entities
+            .iter()
+            .find(|entity| {
+                entity.canonical_name == normalized_query
+                    || canonical_name(&entity.name) == normalized_query
+                    || entity
+                        .aliases
+                        .iter()
+                        .any(|alias| canonical_name(alias) == normalized_query)
+            })
+            .or_else(|| {
+                entities.iter().find(|entity| {
+                    entity.name.to_lowercase().contains(&query_lower)
+                        || entity.canonical_name.contains(&normalized_query)
+                        || entity
+                            .aliases
+                            .iter()
+                            .any(|alias| alias.to_lowercase().contains(&query_lower))
+                })
+            });
+        let Some(root) = root else {
+            return Ok(GraphSearch {
+                entities: Vec::new(),
+                relations: Vec::new(),
+            });
+        };
+        let root = root.clone();
+
+        let relations = self.list_relations(workspace)?;
+        let entity_by_id = entities
+            .iter()
+            .map(|entity| (entity.id, entity.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut selected_ids = std::collections::HashSet::from([root.id]);
+        let mut frontier = vec![root.id];
+        let mut selected_relation_ids = std::collections::HashSet::new();
+        let mut selected_relations = Vec::new();
+
+        for _ in 0..depth {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next_frontier = Vec::new();
+            for relation in &relations {
+                let neighbor = if frontier.contains(&relation.subject_id) {
+                    Some(relation.object_id)
+                } else if frontier.contains(&relation.object_id) {
+                    Some(relation.subject_id)
+                } else {
+                    None
+                };
+                let Some(neighbor) = neighbor else {
+                    continue;
+                };
+                if !entity_by_id.contains_key(&neighbor) {
+                    continue;
+                }
+                if !selected_ids.contains(&neighbor) && selected_relations.len() >= limit {
+                    continue;
+                }
+                if !selected_ids.contains(&neighbor) {
+                    if selected_ids.len() >= limit {
+                        continue;
+                    }
+                    selected_ids.insert(neighbor);
+                    next_frontier.push(neighbor);
+                }
+                if selected_relation_ids.insert(relation.id) && selected_relations.len() < limit {
+                    selected_relations.push(relation.clone());
+                }
+            }
+            frontier = next_frontier;
+        }
+
+        let mut selected_entities = Vec::with_capacity(selected_ids.len());
+        selected_entities.push(root.clone());
+        selected_entities.extend(
+            entities
+                .into_iter()
+                .filter(|entity| entity.id != root.id && selected_ids.contains(&entity.id))
+                .take(limit.saturating_sub(1)),
+        );
+        Ok(GraphSearch {
+            entities: selected_entities,
+            relations: selected_relations,
+        })
+    }
+
     pub fn record_decision(&self, spec: &DecisionSpec) -> Result<Decision, StoreError> {
         validate_decision_spec(spec)?;
         if let Some(parent_id) = spec.parent_id {
@@ -4351,6 +4488,39 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)?;
         Ok(rows)
+    }
+
+    /// Return only bounded provenance counters for retrieval policy checks.
+    /// Unlike get_provenance, this accepts the shared empty workspace used by
+    /// facts and applies the normal shared-pool visibility rule.
+    pub fn fact_evidence_summary(
+        &self,
+        fact_id: i64,
+        workspace: &str,
+    ) -> Result<FactEvidenceSummary, StoreError> {
+        validate_graph_workspace(workspace)?;
+        let mut statement = self.connection.prepare(
+            "SELECT resolution_status
+             FROM evidence
+             WHERE fact_id = ?1 AND (workspace_id = '' OR workspace_id = ?2)
+             ORDER BY id",
+        )?;
+        let statuses = statement
+            .query_map(params![fact_id, workspace], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)?;
+        let mut summary = FactEvidenceSummary {
+            total: statuses.len(),
+            ..FactEvidenceSummary::default()
+        };
+        for status in statuses {
+            match status.as_str() {
+                "resolved" => summary.resolved += 1,
+                "stale" => summary.stale += 1,
+                _ => summary.unresolved += 1,
+            }
+        }
+        Ok(summary)
     }
 
     pub fn list_evidence(&self, workspace: &str) -> Result<Vec<Evidence>, StoreError> {

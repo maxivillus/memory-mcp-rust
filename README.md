@@ -52,6 +52,10 @@ cargo build --release
 
 The binary is written to `target/release/memory-mcp-rust`.
 
+For a host rollout and MCP client registration, see
+[`DEPLOYMENT.md`](DEPLOYMENT.md). Keep the previous launcher available until
+the native smoke check and database cutover checks pass.
+
 ### Run the stdio server
 
 The server creates `data/facts.db` relative to its working directory unless
@@ -202,11 +206,11 @@ or `workspace_id`; context operations require an explicit non-empty workspace.
 | `remember_fact` | Upsert a durable fact, deduplicated by SHA-256 of its text; fact text is capped at 16,000 characters and strict admission stores only evidence hashes/metadata. |
 | `absorb` | Preview or explicitly commit a bounded batch of candidate facts; exact duplicates are no-ops and related/update/contradiction candidates remain review-only. |
 | `chunk_fact` | Read one active fact as bounded, offset-addressable chunks instead of returning its full text in one payload. |
-| `search_facts` | Advisory FTS5 search over facts with bounded results; optional `semantic=true` merges lexical and embedding rankings when embeddings are enabled. |
-| `search_semantic` | Advisory embedding search over stored facts; requires `MEMORY_MCP_EMBEDDINGS=1` and cannot authorize safety-critical work. |
+| `search_facts` | Advisory FTS5 search over facts with a bounded role-aware profile; optional `semantic=true` and graph expansion are merged with lexical results through deterministic RRF. |
+| `search_semantic` | Advisory embedding search over stored facts with the same bounded profiles; `review` and `incident` require a resolved evidence anchor, and the tool cannot authorize safety-critical work. |
 | `embed_backfill` | Compute missing fact embeddings after embeddings have been enabled. |
 | `ingest_turn` | Extract candidate facts from a conversation transcript through the configured LLM provider; model authority stays unconfirmed until review. |
-| `compose_recall` | Build an advisory `<memory-recall>` block focused on the latest user intent; rejects `purpose="safety_critical"` and requires `MEMORY_MCP_RECALL=1`. |
+| `compose_recall` | Build an advisory `<memory-recall>` block focused on the latest user intent; profiles cap hits/chars, optional graph/session sources stay bounded, and `purpose="safety_critical"` is rejected before recall. Requires `MEMORY_MCP_RECALL=1`. |
 | `auto_orient` | Build one bounded first-input recall block for a runtime session, capped at six hits and 2.5 seconds, with silent degradation on failure. |
 | `search_guard` | Return a non-blocking hint after repeated external searches without a memory lookup; use `action="memory"` after consulting memory. |
 | `sweep_freshness` | Archive facts older than their type-specific retention window while keeping strong facts; requires `MEMORY_MCP_RECALL=1`. |
@@ -228,6 +232,18 @@ or `workspace_id`; context operations require an explicit non-empty workspace.
 | `list_forgotten` | List forgotten facts in an explicit workspace for direct review. |
 | `restore_fact` | Return a forgotten or degraded fact to the active lifecycle and reset its revival counter. |
 | `export` | Export all facts, including archived rows, as JSON for migration or backup. |
+
+Retrieval profiles are deterministic response policies, never authority signals:
+`balanced` keeps the broad legacy limits (100 hits/12,000 characters),
+`orientation` is capped at 6 hits/4,000 characters, `implementation` at 12
+hits/8,000 characters with one graph hop, `review` at 20 hits/12,000
+characters with one graph hop and resolved evidence required, and `incident` at
+20 hits/16,000 characters with two graph hops and resolved evidence required.
+Graph facts are merged as a third RRF source when graph expansion is enabled;
+`compose_recall` can additionally pull a caller-bounded number of sibling facts
+from matching sessions. Every retrieval response exposes evidence counters and
+status. Feedback remains observational, while efficacy stays `not_claimed`
+until paired aggregate measurements reach their configured sample threshold.
 
 ### Immutable contexts and local documents
 
@@ -373,6 +389,9 @@ The repository layout follows the runtime boundary:
 | `docs/decisions/` | Architecture decisions for Redis-first storage and pointwise replication. |
 | `docs/documentation-roadmap.md` | Scope and verification record for the documentation set. |
 | `docs/tech-radar.md` | Architecture patterns, dependencies, and implementation map. |
+| `DEPLOYMENT.md` | Native host installation, MCP registration, cutover, and rollback. |
+| `docs/pilot-workflow.md` | Synthetic issue-shaped pilot and bounded measurement flow. |
+| `skills/memory-mcp/SKILL.md` | Repository mirror of the live memory-mcp agent skill. |
 
 ## Further reading
 
@@ -387,3 +406,9 @@ The repository layout follows the runtime boundary:
   scope, source baseline, and verification record.
 - [`docs/tech-radar.md`](docs/tech-radar.md) — implementation patterns and
   dependency map.
+- [`DEPLOYMENT.md`](DEPLOYMENT.md) — native host rollout, MCP registration, and
+  rollback procedure.
+- [`docs/pilot-workflow.md`](docs/pilot-workflow.md) — bounded issue-shaped
+  pilot composition and measurement contract.
+- [`skills/memory-mcp/SKILL.md`](skills/memory-mcp/SKILL.md) — synchronized
+  memory-mcp skill mirror for repository consumers.

@@ -92,6 +92,26 @@ handler alias and is not advertised.
 - Database and backup protocol responses expose names, sizes, and bounded
   generated file names only; absolute filesystem paths remain internal.
 
+## Retrieval policy
+
+Retrieval profiles are bounded response policies and never grant authority to
+write, accept, route, lock, or hash. `balanced` preserves the broad legacy
+budget (100 hits, 12,000 characters); `orientation` uses 6 hits and 4,000
+characters; `implementation` uses 12 hits and 8,000 characters with one graph
+hop; `review` uses 20 hits and 12,000 characters with one graph hop plus a
+resolved evidence anchor; and `incident` uses 20 hits and 16,000 characters
+with two graph hops plus a resolved evidence anchor. Explicit graph requests
+use one hop for profiles without a graph depth; graph-derived facts are a
+bounded third RRF source alongside lexical and semantic results.
+
+`compose_recall` applies the selected hit/character budget, supports a caller
+bound of at most 20 session siblings, and reports graph/session counts plus
+evidence status. The block is advisory and returns an explicit abstention when
+a strict evidence profile has no resolved anchor. `purpose=safety_critical`
+is rejected before provider or recall work, and unknown purpose values fail
+closed. Feedback only records aggregate observations; measurement summaries
+remain `not_claimed` until both baseline and memory variants meet `min_pairs`.
+
 ## Persistence contract
 
 - The active SQLite path is `MEMORY_MCP_DB`; without it the default is
