@@ -52,6 +52,10 @@ cargo build --release
 
 The binary is written to `target/release/memory-mcp-rust`.
 
+For a host rollout and MCP client registration, see
+[`DEPLOYMENT.md`](DEPLOYMENT.md). Keep the previous launcher available until
+the native smoke check and database cutover checks pass.
+
 ### Run the stdio server
 
 The server creates `data/facts.db` relative to its working directory unless
@@ -385,6 +389,8 @@ The repository layout follows the runtime boundary:
 | `docs/decisions/` | Architecture decisions for Redis-first storage and pointwise replication. |
 | `docs/documentation-roadmap.md` | Scope and verification record for the documentation set. |
 | `docs/tech-radar.md` | Architecture patterns, dependencies, and implementation map. |
+| `DEPLOYMENT.md` | Native host installation, MCP registration, cutover, and rollback. |
+| `docs/pilot-workflow.md` | Synthetic issue-shaped pilot and bounded measurement flow. |
 
 ## Further reading
 
@@ -399,3 +405,7 @@ The repository layout follows the runtime boundary:
   scope, source baseline, and verification record.
 - [`docs/tech-radar.md`](docs/tech-radar.md) — implementation patterns and
   dependency map.
+- [`DEPLOYMENT.md`](DEPLOYMENT.md) — native host rollout, MCP registration, and
+  rollback procedure.
+- [`docs/pilot-workflow.md`](docs/pilot-workflow.md) — bounded issue-shaped
+  pilot composition and measurement contract.

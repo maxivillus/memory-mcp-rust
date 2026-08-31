@@ -598,7 +598,6 @@ pub fn semantic_search(store: &Store, arguments: &Map<String, Value>) -> Result<
             facts.push((score, row.fact, metadata));
         }
     }
-    let mut facts = facts;
     facts.sort_by(|left, right| {
         right
             .0

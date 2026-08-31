@@ -3,17 +3,19 @@
 ## Scope
 
 This refresh covers the public Markdown documentation for the current Rust
-repository. The audiences are users starting the stdio server and developers
-maintaining its protocol, storage, and backend integration.
+repository. The audiences are users starting or deploying the stdio server and
+developers maintaining its protocol, storage, backend integration, and
+issue-shaped pilot.
 
-The included surfaces are `README.md` and the directly related documents under
-`docs/`. Source files, generated contract data, and repository helper files are
-out of scope for content changes. Non-current public pages may be removed when
-their links are updated; repository history remains the recovery mechanism.
+The included surfaces are `README.md`, `DEPLOYMENT.md`, and the directly
+related documents under `docs/`. Source files, generated contract data, and
+repository helper files are out of scope for content changes. Non-current
+public pages may be removed when their links are updated; repository history
+remains the recovery mechanism.
 
 ## Source baseline
 
-The baseline is `origin/main` at `6f5d8b4e8f5086b47c6c7ecfbf7f74130867eea7`.
+The baseline is the current Rust implementation at `da109e7`.
 Facts were checked against the current source and tests, especially:
 
 - `src/main.rs`, `src/protocol.rs`, and `src/tools.rs` for the executable,
@@ -21,7 +23,8 @@ Facts were checked against the current source and tests, especially:
 - `src/store.rs`, `src/backend.rs`, and `src/redis.rs` for persistence,
   fallback, and replication behavior;
 - `Cargo.toml` and the repository test configuration for supported checks;
-- the architecture decisions and performance notes under `docs/`.
+- the architecture decisions, performance notes, pilot workflow, and
+  deployment instructions under `docs/` and the repository root.
 
 ## Audit findings and remediation plan
 
@@ -32,6 +35,8 @@ Facts were checked against the current source and tests, especially:
    issues when they describe live fields or operations.
 4. Verify internal links, stale terminology, source-sensitive paths, and the
    Rust formatting, test, and lint commands.
+5. Keep the native host rollout, rollback path, retrieval profiles, and
+   repository skill contract aligned with the live server behavior.
 
 The repeat audit recorded seven findings. This remediation pass resolves them
 without changing executable behavior:
@@ -45,10 +50,14 @@ without changing executable behavior:
 | The tech radar and roadmap were not discoverable from the landing page. | README now links both documents from its project map and Further reading. |
 | README omitted `MEMORY_MCP_CONTEXT_MAX_BYTES`. | README now documents its default and allowed range. |
 | The current contract implied schemas were listed inline. | The wording now links the checked-in JSON schema reference and keeps Rust descriptors authoritative. |
+| The memory skill referenced a missing pilot document. | `docs/pilot-workflow.md` now records the bounded issue-shaped sequence and profile limits. |
+| Host installation guidance was outside the Rust repository. | `DEPLOYMENT.md` now documents native installation, MCP registration, cutover, smoke checks, and rollback. |
+| Retrieval policy was easy to miss during deployment. | README, current contract, deployment, pilot, and the live skill use the same bounded profile/evidence/safety vocabulary. |
 
 ## Verification
 
 The refresh is complete when the public docs describe only the current Rust
-workflow, contain no links to removed material, and pass the repository-native
-checks. The generated contract data and helper files remain intentionally
-untouched because the Rust build and source code consume them.
+workflow, contain no links to removed material, the deployment and pilot docs
+match the live descriptors, and repository-native checks pass. The generated
+contract data and helper files remain intentionally untouched unless a public
+schema changes; the Rust build and source code consume them.
