@@ -391,6 +391,7 @@ The repository layout follows the runtime boundary:
 | `docs/tech-radar.md` | Architecture patterns, dependencies, and implementation map. |
 | `DEPLOYMENT.md` | Native host installation, MCP registration, cutover, and rollback. |
 | `docs/pilot-workflow.md` | Synthetic issue-shaped pilot and bounded measurement flow. |
+| `skills/memory-mcp/SKILL.md` | Repository mirror of the live memory-mcp agent skill. |
 
 ## Further reading
 
@@ -409,3 +410,5 @@ The repository layout follows the runtime boundary:
   rollback procedure.
 - [`docs/pilot-workflow.md`](docs/pilot-workflow.md) — bounded issue-shaped
   pilot composition and measurement contract.
+- [`skills/memory-mcp/SKILL.md`](skills/memory-mcp/SKILL.md) — synchronized
+  memory-mcp skill mirror for repository consumers.

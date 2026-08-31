@@ -7,11 +7,12 @@ repository. The audiences are users starting or deploying the stdio server and
 developers maintaining its protocol, storage, backend integration, and
 issue-shaped pilot.
 
-The included surfaces are `README.md`, `DEPLOYMENT.md`, and the directly
-related documents under `docs/`. Source files, generated contract data, and
-repository helper files are out of scope for content changes. Non-current
-public pages may be removed when their links are updated; repository history
-remains the recovery mechanism.
+The included surfaces are `README.md`, `DEPLOYMENT.md`, the repository skill
+mirror at `skills/memory-mcp/SKILL.md`, and the directly related documents
+under `docs/`. Source files, generated contract data, and repository helper
+files are out of scope for content changes. Non-current public pages may be
+removed when their links are updated; repository history remains the recovery
+mechanism.
 
 ## Source baseline
 
@@ -45,7 +46,7 @@ without changing executable behavior:
 | --- | --- |
 | ADR-0001 mixed decision-time and current implementation claims. | Its status now labels the checkpoints as historical and points to the current contract. |
 | ADR-0002 remained `Proposed` although its mechanics were implemented. | Its status now records the implemented refinement without making a performance claim. |
-| The roadmap baseline referenced an older commit. | The source baseline is `6f5d8b4e8f5086b47c6c7ecfbf7f74130867eea7`. |
+| The roadmap baseline referenced an older commit. | The source baseline is the current Rust implementation at `da109e7`. |
 | The migration command and launcher were hard to discover. | README now documents the copy-first command, safety behavior, report, and preflight helper. |
 | The tech radar and roadmap were not discoverable from the landing page. | README now links both documents from its project map and Further reading. |
 | README omitted `MEMORY_MCP_CONTEXT_MAX_BYTES`. | README now documents its default and allowed range. |
@@ -53,6 +54,7 @@ without changing executable behavior:
 | The memory skill referenced a missing pilot document. | `docs/pilot-workflow.md` now records the bounded issue-shaped sequence and profile limits. |
 | Host installation guidance was outside the Rust repository. | `DEPLOYMENT.md` now documents native installation, MCP registration, cutover, smoke checks, and rollback. |
 | Retrieval policy was easy to miss during deployment. | README, current contract, deployment, pilot, and the live skill use the same bounded profile/evidence/safety vocabulary. |
+| The project repository had no skill mirror. | `skills/memory-mcp/SKILL.md` now matches the live registry skill hash and is listed from README. |
 
 ## Verification
 
