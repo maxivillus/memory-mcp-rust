@@ -579,6 +579,9 @@ const MAX_EVENT_METADATA_BYTES: usize = 16 * 1024;
 const MAX_RUN_FILES_BYTES: usize = 64 * 1024;
 const MAX_RUN_DIFF_BYTES: usize = 128 * 1024;
 const MAX_DATABASE_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
+// Snapshots carry this marker so restore can avoid repeating the full FTS5
+// migration when the source schema is already current.
+const SQLITE_SCHEMA_VERSION: i64 = 1;
 static SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct ConnectionSlot {
@@ -719,6 +722,10 @@ impl Store {
             .and_then(|_| self.connection.restore(&path).map_err(StoreError::from));
         let _ = fs::remove_file(&path);
         result.and_then(|_| {
+            // Backup restore replaces the complete database, including its
+            // schema. Upgrade it before reading the memory catalog or serving
+            // any data queries from the restored connection.
+            self.migrate_if_needed()?;
             self.adopt_memory_catalog_if_present()?;
             if self.memory_database_name.borrow().is_some() {
                 self.initialize_memory_catalog()?;
@@ -1083,6 +1090,18 @@ impl Store {
              END;
              INSERT INTO facts_fts(facts_fts) VALUES ('rebuild');",
         )?;
+        self.connection
+            .pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)?;
+        Ok(())
+    }
+
+    fn migrate_if_needed(&self) -> Result<(), StoreError> {
+        let version = self
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+        if version < SQLITE_SCHEMA_VERSION {
+            self.migrate()?;
+        }
         Ok(())
     }
 
@@ -7101,6 +7120,52 @@ mod tests {
         );
         assert_eq!(store.query_decisions("legacy", "legacy").unwrap().len(), 1);
         assert_eq!(store.list_evidence("legacy").unwrap().len(), 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn restoring_legacy_snapshot_migrates_before_serving_calls() {
+        let path = std::env::temp_dir().join(format!(
+            "memory-mcp-rust-legacy-snapshot-{}.db",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        {
+            let connection = Connection::open(&path).expect("legacy snapshot db");
+            connection
+                .execute_batch(
+                    "CREATE TABLE facts (
+                        id INTEGER PRIMARY KEY,
+                        text TEXT NOT NULL,
+                        sha256 TEXT NOT NULL
+                    );
+                    INSERT INTO facts (text, sha256)
+                    VALUES ('legacy snapshot fact', 'legacy-snapshot-hash');
+                    CREATE TABLE memory_database_state (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        name TEXT NOT NULL
+                    );
+                    INSERT INTO memory_database_state (id, name)
+                    VALUES (1, 'memory');
+                    CREATE TABLE memory_database_catalog (
+                        name TEXT PRIMARY KEY,
+                        archived INTEGER NOT NULL DEFAULT 0,
+                        snapshot BLOB NOT NULL
+                    );",
+                )
+                .expect("legacy snapshot schema");
+        }
+
+        let snapshot = fs::read(&path).expect("legacy snapshot bytes");
+        let store = Store::in_memory().expect("target store");
+        store
+            .restore_snapshot_bytes(&snapshot)
+            .expect("restore legacy snapshot");
+
+        assert_eq!(store.list_facts("").unwrap().len(), 1);
+        assert_eq!(store.search_facts("legacy snapshot", "").unwrap().len(), 1);
+        assert_eq!(store.stats().unwrap().facts, 1);
+
         let _ = fs::remove_file(path);
     }
 }
