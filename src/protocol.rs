@@ -4639,10 +4639,7 @@ fn fact_value(fact: &crate::store::Fact) -> Value {
 }
 
 fn exact_stats(store: &Store, arguments: &Map<String, Value>) -> Result<Value, CallError> {
-    let workspace = arguments
-        .get("workspace")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let workspace = optional_workspace(arguments)?;
     let facts = store.list_facts(workspace).map_err(CallError::Execution)?;
     let summary = store
         .summarize_index(workspace)
@@ -4663,16 +4660,31 @@ fn exact_stats(store: &Store, arguments: &Map<String, Value>) -> Result<Value, C
             strong += 1;
         }
     }
-    Ok(json!({
+    // Evidence is an exact-workspace resource. An unscoped stats query sees
+    // only the shared fact pool, so there are no visible evidence rows to
+    // count and it must not fail the whole statistics response.
+    let evidence = if workspace.is_empty() {
+        0
+    } else {
+        store
+            .list_evidence(workspace)
+            .map_err(CallError::Execution)?
+            .len()
+    };
+    let mut result = json!({
         "total": facts.len(), "strong": strong, "by_trust": by_trust, "by_domain": by_domain,
         "counts": {"entities": store.list_entities(workspace).map_err(CallError::Execution)?.len(),
                    "relations": store.list_relations(workspace).map_err(CallError::Execution)?.len(),
                    "decisions": store.list_decisions(workspace).map_err(CallError::Execution)?.len(),
-                   "evidence": store.list_evidence(workspace).map_err(CallError::Execution)?.len(),
+                   "evidence": evidence,
                    "runs": summary.runs, "measurements": summary.measurements, "feedback": summary.feedback},
         "access": {"events": 0, "by_site": {}, "last_at": "", "pull_events": 0,
                    "pull_hits": 0, "pull_misses": 0, "hit_rate": 0.0},
-    }))
+    });
+    if workspace.is_empty() {
+        result["notice"] = json!("workspace omitted; showing shared fact pool");
+    }
+    Ok(result)
 }
 
 fn exact_chunk_fact(store: &Store, arguments: &Map<String, Value>) -> Result<Value, CallError> {
@@ -5403,6 +5415,31 @@ mod tests {
             -32601
         );
         assert!(handle_line(r#"{"jsonrpc":"2.0","method":"tools/list"}"#, &store).is_none());
+    }
+
+    #[test]
+    fn unscoped_stats_returns_a_notice_instead_of_an_execution_error() {
+        let store = Store::in_memory().unwrap();
+        let unscoped = handle_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stats","arguments":{}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(unscoped["result"]["isError"], false);
+        let payload = tool_payload(&unscoped);
+        assert_eq!(
+            payload["notice"],
+            "workspace omitted; showing shared fact pool"
+        );
+        assert_eq!(payload["total"], 0);
+
+        let scoped = handle_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"stats","arguments":{"workspace":"workspace-a"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(scoped["result"]["isError"], false);
+        assert!(tool_payload(&scoped).get("notice").is_none());
     }
 
     #[test]
