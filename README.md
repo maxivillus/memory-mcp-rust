@@ -285,7 +285,7 @@ until paired aggregate measurements reach their configured sample threshold.
 | `query_anchored` | Advisory lookup of facts and decisions attached to a repository path or symbol; it cannot authorize safety-critical work. |
 | `record_feedback` | Record one retry-safe aggregate usage signal without free-text notes or raw payloads. |
 | `query_feedback` | Return bounded aggregate feedback counts and metadata for one exact workspace. |
-| `stats` | Return bounded store statistics, provenance/run/measurement counts, access counts, and pull hit-rate telemetry. |
+| `stats` | Return bounded store statistics, provenance/run/measurement counts, access counts, and pull hit-rate telemetry; an omitted workspace reads the shared fact pool and returns a notice. |
 
 ### Graph, decisions, provenance, and export
 

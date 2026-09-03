@@ -18,8 +18,11 @@ surface.
   item. `isError` is true when the result has a top-level `error` key.
 - Parse errors use JSON-RPC code `-32700`; invalid requests use `-32600`;
   invalid params use `-32602`; unknown methods with an id use `-32601`.
-  Notifications produce no response. A tool exception is logged to stderr and
-  returns the generic client payload `{"error":"tool execution failed"}`.
+  Notifications produce no response. An execution failure is logged to stderr
+  and returns the generic client payload `{"error":"tool execution failed"}`.
+  `stats` without `workspace` is not an execution failure: it reads the shared
+  fact pool and includes the notice `workspace omitted; showing shared fact
+  pool`.
 - The `add_fact` alias is handled by the server but is not advertised by
   `tools/list`.
 
