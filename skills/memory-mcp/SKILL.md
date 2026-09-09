@@ -64,30 +64,30 @@ The native 84-tool list in the server contract above is the operational
 catalog. Schemas, parameters, enum values, limits, and descriptions still come
 from the live MCP `tools/list` response.
 
-## Диагностические tools
+## Diagnostic tools
 
-`capabilities_doctor` требует явный `workspace` и возвращает bounded read-only
-состояние сервера, advertised tool inventory, hash scope, allowlisted provider
-state, schema/migration/FTS5 readiness и aggregate telemetry readiness.
+`capabilities_doctor` requires an explicit `workspace` and returns bounded read-only
+server state, advertised tool inventory, scope hash, allowlisted provider state,
+schema/migration/FTS5 readiness, and aggregate telemetry readiness.
 
-`search_diagnose` возвращает один безопасный статус (`no_match`, `abstained`,
+`search_diagnose` returns one safe status (`no_match`, `abstained`,
 `unavailable`, `timeout`, `unsupported`, `stale`, `conflicting`,
-`scope_mismatch` или `matched`), SHA-256 `query_hash`, bounded counters,
-fallback и один `next_action`. Raw query не возвращается. Если semantic provider
-отключён, результатом становится `unsupported` с lexical fallback; ошибка
-SQLite/FTS5 не превращается в `no_match`.
+`scope_mismatch`, or `matched`), a SHA-256 `query_hash`, bounded counters,
+fallback, and one `next_action`. The raw query is not returned. If the semantic provider
+is disabled, the result is `unsupported` with lexical fallback; SQLite/FTS5 errors
+do not become `no_match`.
 
-`audit_coverage` читает только aggregate `memory-access` metadata из
-`lifecycle_events` и показывает attempted/succeeded/fallback/failed, bounded
-latency, issue/run mapping и `telemetry_gap`. `capture_event` для
-`event_kind=memory-access` принимает только bounded opaque references, outcome,
-fallback, result count, latency и optional SHA-256 query hash; raw prompt,
-comment, query и payload fields отклоняются.
+`audit_coverage` reads only aggregate `memory-access` metadata from
+`lifecycle_events` and shows attempted/succeeded/fallback/failed, bounded
+latency, issue/run mapping, and `telemetry_gap`. `capture_event` for
+`event_kind=memory-access` accepts only bounded opaque references, outcome,
+fallback, result count, latency, and an optional SHA-256 query hash; raw prompt,
+comment, query, and payload fields are rejected.
 
-`measurement_status` показывает baseline/memory observations и missing pairs.
-Он всегда сохраняет `status=not_claimed`, `efficacy=not_claimed` и
-`independent_check=not_run`; порог по умолчанию — 10 полных пар, после чего
-нужна независимая QA-проверка.
+`measurement_status` shows baseline/memory observations and missing pairs.
+It always preserves `status=not_claimed`, `efficacy=not_claimed`, and
+`independent_check=not_run`; the default threshold is 10 complete pairs, after which
+an independent QA check is required.
 
 ## Repository and host alignment
 
