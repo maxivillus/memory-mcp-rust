@@ -30,7 +30,8 @@ library.
 ## Project map
 
 - `src/main.rs`: owns the stdio process and creates one `BackendCoordinator`.
-- `src/protocol.rs`: validates JSON-RPC and maps all 80 advertised tools plus
+- `src/protocol.rs`: validates JSON-RPC and maps all 84 advertised tools (80
+  upstream compatibility tools plus 4 native diagnostics) plus
   the `add_fact` alias to the coordinator route.
 - `src/backend.rs`: owns backend selection, SQLite standby, durable outbox,
   recovery reconciliation, watcher lifecycle, and safe status counters.

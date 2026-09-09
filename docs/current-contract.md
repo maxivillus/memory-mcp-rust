@@ -11,7 +11,8 @@ surface.
 - `initialize` echoes the requested `protocolVersion` (default
   `2024-11-05`) and returns `capabilities.tools.listChanged=false` plus
   `serverInfo.name=memory-mcp` and `serverInfo.version=0.23.0`.
-- `tools/list` returns the 80 advertised tools below, each with its exact
+- `tools/list` returns the 84 advertised tools below: 80 upstream compatibility
+  tools plus 4 native read-only diagnostics tools, each with its exact
   `description` and JSON `inputSchema`.
 - `tools/call` requires a string `params.name` and an object
   `params.arguments`. The handler result is serialized as one MCP text content
@@ -25,9 +26,11 @@ surface.
 
 ## Public tool inventory
 
-The names are grouped here for review. Exact parameter schemas are available in
-[`docs/upstream-tools.json`](upstream-tools.json); the Rust tool descriptor set
-remains authoritative for every parameter, default, enum, and bound.
+The names are grouped here for review. Exact upstream parameter schemas are
+available in [`docs/upstream-tools.json`](upstream-tools.json), and the
+diagnostic schemas are in [`docs/diagnostic-tools.json`](diagnostic-tools.json).
+The Rust tool descriptor set remains authoritative for every parameter,
+default, enum, and bound.
 
 ### Facts, retrieval, lifecycle, and review
 
@@ -67,8 +70,45 @@ remains authoritative for every parameter, default, enum, and bound.
 `current_database`, `reset_database`, `create_workspace`, `list_workspaces`,
 `reset_workspace`, `archive_workspace`, `backup_workspace`.
 
-The descriptor set contains 80 advertised tool names. `add_fact` remains a
+The descriptor set contains 84 advertised tool names. `add_fact` remains a
 handler alias and is not advertised.
+
+### Read-only diagnostics
+
+The additive diagnostic surface contains four advertised tools:
+`capabilities_doctor`, `search_diagnose`, `audit_coverage`, and
+`measurement_status`. The server also accepts the non-advertised spellings
+`capabilities/doctor`, `search diagnose`, `search/diagnose`, `audit coverage`,
+`audit/coverage`, `measurement status`, and `measurement/status`.
+
+`capabilities_doctor` requires an explicit workspace and returns only a bounded
+workspace hash, tool inventory, allowlisted provider state, schema/migration and
+FTS5 readiness, safe backend counters when the coordinator supplies them, and
+aggregate telemetry readiness. It never returns a database path, payload,
+provider credential, or `authority` field.
+
+`search_diagnose` returns one safe status for the requested scope:
+`no_match`, `abstained`, `unavailable`, `timeout`, `unsupported`, `stale`,
+`conflicting`, `scope_mismatch`, or `matched`. The response contains a
+SHA-256 `query_hash`, bounded counters, fallback state, and one `next_action`;
+the raw query is not returned. A disabled semantic provider is reported as
+`unsupported` with a lexical fallback, and SQLite/FTS5 read errors are
+reported as `unavailable` rather than as an empty match.
+
+`audit_coverage` reads only aggregate `memory-access` metadata from
+`lifecycle_events`. It reports attempted/succeeded/fallback/failed counts,
+bounded latency summaries, issue/run mapping counts, and `telemetry_gap` for an
+empty, unmapped, or truncated sample. Raw prompts, comments, queries, payloads,
+paths, and secrets are not part of this read path.
+
+`measurement_status` reports baseline/memory observation counts and missing
+pairs for one measurement. It always returns `status=not_claimed` and
+`efficacy=not_claimed`; the readiness marker becomes `ready_for_review` only
+after the configured minimum of 10 complete pairs by default, while
+`independent_check` remains `not_run` until QA supplies that check.
+
+The public-contract decision and its acceptance boundary are recorded in
+[`docs/decisions/ADR-0003-read-only-diagnostics.md`](decisions/ADR-0003-read-only-diagnostics.md).
 
 ## Resource and security bounds
 
@@ -79,6 +119,11 @@ handler alias and is not advertised.
   credential-shaped strings, URLs, and filesystem paths, honor `exclude_paths`,
   and are limited to 16 KiB after sanitization. Event identifiers containing
   restricted data are rejected.
+- `memory-access` telemetry is stricter than the general lifecycle envelope:
+  only bounded opaque issue/run/site references, an allowlisted outcome,
+  fallback, result count, latency, and an optional SHA-256 query hash are
+  accepted. Unknown fields and raw prompt/comment/query-shaped fields are
+  rejected before persistence.
 - Document ingestion requires a caller-supplied root plus a relative path and
   reads at most 16 MiB through a bounded stream; the root is never persisted.
 - Explicit backup arguments are file names resolved below a mode-0700 private
@@ -152,9 +197,7 @@ duplicating the SQL implementation.
 | `lifecycle_events` | Idempotency key, event metadata, unique immutable `context_ref`, workspace, payload hash/size/truncation, timestamp; unique `(workspace_id, idempotency_key)`. |
 | `handoffs` | Immutable context ref, owner/session/source, workspace, sharing flag, TTL, idempotency key, acceptance/cancellation audit fields; state is `open\|accepted\|cancelled\|expired`. |
 | `workspaces` | Named scope id, status `active\|archived\|reset`, timestamps. |
-| `activity_days` | One row per UTC day with at least one `tools/call`; decay uses this activity signal. |
 | `runs` | Client-supplied run/issue/PR/session/Git facts, bounded files/diff, state `open\|closed`, workspace, timestamps; unique `(workspace_id, run_id)`. The server never shells out to Git. |
-| `memory_access_events` | Bounded pull/push telemetry: workspace, site, query hash, result count, latency, timestamp; no payloads. |
 | `memory_feedback` | Opaque feedback id, site, item type/ref, signal, query hash, workspace, timestamp; signals are `helpful\|not_helpful\|stale\|irrelevant\|unsafe`, unique `(workspace_id, feedback_id)`. |
 | `measurement_observations` | Aggregate baseline/memory metrics keyed by workspace, measurement, sample, and variant; no prompt or free-text payload; numeric range checks and unique pair key. |
 | `fact_embeddings` | Optional fact vector BLOB, model, timestamp; FK to `facts`. Created even when embeddings are disabled. |
@@ -171,7 +214,7 @@ backends:
 - Redis stores a bounded, namespaced SQLite state snapshot and a monotonic
   revision; `WATCH`/`MULTI`/`EXEC` protects the revision-checked publish.
 - While Redis is healthy, the coordinator restores a private in-memory
-  materialization from the Redis snapshot and executes all 80 advertised tools
+  materialization from the Redis snapshot and executes all 84 advertised tools
   plus the `add_fact` alias against that Redis-owned state. The file-backed
   SQLite store is updated by bounded background replay and is used as
   standby/fallback.
@@ -254,7 +297,7 @@ uses `handle_line_with_coordinator`.
   rewrite the complete dataset on every tick.
 - The Redis watcher shares the coordinator's connection and lifecycle, avoids a
   busy loop, uses bounded timeouts, and stops cleanly with the process.
-- The full 80-tool route is an acceptance gate: every advertised tool and the
+- The full 84-tool route is an acceptance gate: every advertised tool and the
   `add_fact` alias must cross the same coordinator, with no direct dispatcher
   path that silently bypasses Redis, the standby, or the outbox.
 - Redis may be configured with an explicit `MEMORY_MCP_REDIS_URL`/`REDIS_URL`

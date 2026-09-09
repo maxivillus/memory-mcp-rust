@@ -50,7 +50,8 @@ printf '%s\n' \
   | MEMORY_MCP_DB=/path/to/smoke/facts.db /path/to/host/.local/bin/memory-mcp-rust
 ```
 
-The smoke response must identify `memory-mcp`, expose 80 advertised tools, and
+The smoke response must identify `memory-mcp`, expose 84 advertised tools (80
+upstream compatibility tools plus 4 native diagnostics tools), and
 include the retrieval tools. Do not put real credentials or production data in
 the smoke database. `purpose="safety_critical"` must remain fail-closed, and
 retrieval results remain advisory rather than authorization.
