@@ -63,6 +63,33 @@ RRF source alongside lexical and semantic candidates. `purpose:
 purpose is invalid. Empty or unresolved strict retrieval abstains; it is not
 evidence that a fact does not exist.
 
+## Пилот связывания кандидатов
+
+Проверку связей соседних областей выполняйте отдельной опциональной веткой:
+передайте `candidate_linking: true` в `remember_fact`, `ingest_turn`, `absorb`
+или `search_facts`, либо вызовите `suggest_relation_candidates` для явного
+ограниченного запроса. Кандидаты ограничиваются `candidate_limit`,
+`candidate_scan_limit` и `candidate_min_score`, привязаны к точному
+`workspace` и содержат provenance, confidence, ID исходного и целевого факта и
+evidence IDs.
+
+Результат со `status: candidate` или `status: conflict` предназначен только
+для проверки. Он не участвует в `search_graph`, `search_facts` или hybrid RRF.
+Для проверенного кандидата вызовите `confirm_relation_candidate` либо
+`remember_relation` с `candidate_id` и `action: "confirm"`; только после этого
+создаётся обычная `relation` и становится возможным ограниченное расширение
+графа.
+`reject_relation_candidate` оставляет связь вне графа. Ошибка, недоступность или
+отключённая функция должны возвращать базовый результат с
+`retrieval_impact: "none"`.
+
+Для пилота фиксируйте paired baseline/memory observations с одинаковым
+`sample_key`: `recall_at_k`, `precision_at_k`,
+`time_to_first_useful_fact_ms`, `useful_cross_domain_findings`,
+`false_positive_rate` и `candidate_linking_latency_ms`. До десяти полных пар
+измерительный контракт обязан оставаться `status: "not_claimed"`; пилот не
+делает выводов о качестве по одному кандидату или по similarity score.
+
 ## Optional code-context view and rollback
 
 `context_map` is disabled by default. Enable it only for a bounded pilot with

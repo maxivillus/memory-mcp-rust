@@ -159,7 +159,7 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
             "tools/call arguments must be an object".to_owned(),
         ));
     }
-    if !tools::is_advertised(name) && name != "add_fact" {
+    if !tools::is_supported(name) {
         return Err(CallError::Execution(StoreError::Invalid(format!(
             "unknown tool: {name}"
         ))));
@@ -231,6 +231,10 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
                 || arguments.contains_key("dry_run")
                 || arguments.contains_key("commit")
                 || arguments.contains_key("verify")
+                || arguments.contains_key("candidate_linking")
+                || arguments.contains_key("candidate_limit")
+                || arguments.contains_key("candidate_scan_limit")
+                || arguments.contains_key("candidate_min_score")
             {
                 pipeline::absorb(store, arguments).map_err(CallError::Execution)?
             } else {
@@ -1302,9 +1306,21 @@ fn exact_compatibility_route(
             Some(exact_categorize_pending(store, arguments)?)
         }
         "remember_entity" => Some(exact_remember_entity(store, arguments)?),
-        "remember_relation" if arguments.contains_key("subject") => {
+        "remember_relation"
+            if arguments.contains_key("subject")
+                || arguments.contains_key("candidate_id")
+                || arguments.contains_key("candidate") =>
+        {
             Some(exact_remember_relation(store, arguments)?)
         }
+        "suggest_relations" | "suggest_relation_candidates" => {
+            Some(exact_suggest_relation_candidates(store, arguments)?)
+        }
+        "relation_candidates" | "list_relation_candidates" | "review_relation_candidates" => {
+            Some(exact_list_relation_candidates(store, arguments)?)
+        }
+        "confirm_relation_candidate" => Some(exact_confirm_relation_candidate(store, arguments)?),
+        "reject_relation_candidate" => Some(exact_reject_relation_candidate(store, arguments)?),
         "record_feedback" if arguments.contains_key("feedback_id") => {
             Some(exact_record_feedback(store, arguments)?)
         }
@@ -1404,7 +1420,11 @@ fn exact_compatibility_route(
         "context_map" if arguments.contains_key("repo") && arguments.contains_key("anchors") => {
             Some(exact_context_map(store, arguments)?)
         }
-        "search_graph" if !arguments.contains_key("query") => {
+        "search_graph"
+            if !arguments.contains_key("query")
+                || arguments.contains_key("include_candidates")
+                || arguments.contains_key("candidate_linking") =>
+        {
             Some(exact_search_graph(store, arguments)?)
         }
         "record_decision" if arguments.contains_key("scenario") => {
@@ -2817,6 +2837,12 @@ fn exact_record_measurement(
         "wall_time_ms",
         "time_to_first_useful_ms",
         "memory_latency_ms",
+        "recall_at_k",
+        "precision_at_k",
+        "time_to_first_useful_fact_ms",
+        "useful_cross_domain_findings",
+        "false_positive_rate",
+        "candidate_linking_latency_ms",
         "duplicate_rate",
         "conflict_rate",
         "reference_resolution_rate",
@@ -3102,12 +3128,14 @@ fn decision_value(decision: &crate::store::Decision) -> Value {
 }
 
 fn exact_search_graph(store: &Store, arguments: &Map<String, Value>) -> Result<Value, CallError> {
-    let workspace = arguments
-        .get("workspace")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let entity = required_string(arguments, "entity")?.trim();
-    if entity.is_empty() {
+    let workspace = optional_workspace(arguments)?;
+    let include_candidates = optional_bool(arguments, &["include_candidates"], false)?
+        || optional_bool(arguments, &["candidate_linking"], false)?;
+    let entity = optional_string(arguments, "entity")?
+        .or(optional_string(arguments, "query")?)
+        .unwrap_or("")
+        .trim();
+    if entity.is_empty() && !include_candidates {
         return Ok(json!({"error": "entity is required", "nodes": [], "edges": []}));
     }
     let depth = optional_usize(arguments, &["depth"], 1)?;
@@ -3117,17 +3145,24 @@ fn exact_search_graph(store: &Store, arguments: &Map<String, Value>) -> Result<V
             "depth or limit is outside the supported range".to_owned(),
         ));
     }
-    let graph = store
-        .graph_neighborhood(entity, depth, limit, workspace)
-        .map_err(CallError::Execution)?;
-    if graph.entities.is_empty() {
+    let graph = if entity.is_empty() {
+        crate::store::GraphSearch {
+            entities: Vec::new(),
+            relations: Vec::new(),
+        }
+    } else {
+        store
+            .graph_neighborhood(entity, depth, limit, workspace)
+            .map_err(CallError::Execution)?
+    };
+    if graph.entities.is_empty() && !entity.is_empty() && !include_candidates {
         return Ok(
             json!({"error": format!("entity {entity:?} not found"), "nodes": [], "edges": []}),
         );
     }
-    let root_entity = graph.entities.first().expect("graph is non-empty");
-    let root =
-        json!({"id": root_entity.id, "name": root_entity.name, "type": root_entity.entity_type});
+    let root = graph.entities.first().map(|root_entity| {
+        json!({"id": root_entity.id, "name": root_entity.name, "type": root_entity.entity_type})
+    });
     let nodes = graph
         .entities
         .iter()
@@ -3139,24 +3174,65 @@ fn exact_search_graph(store: &Store, arguments: &Map<String, Value>) -> Result<V
         .iter()
         .map(|entity| (entity.id, entity.name.clone()))
         .collect::<HashMap<_, _>>();
+    let root_id = graph.entities.first().map(|entity| entity.id);
     let edges = graph
         .relations
         .iter()
         .take(limit)
-        .map(|relation| json!({
-            "subject": names.get(&relation.subject_id).cloned().unwrap_or_else(|| relation.subject_id.to_string()),
-            "predicate": relation.predicate,
-            "object": names.get(&relation.object_id).cloned().unwrap_or_else(|| relation.object_id.to_string()),
-            "direction": if relation.subject_id == root_entity.id {
+        .map(|relation| {
+            let subject = names
+                .get(&relation.subject_id)
+                .cloned()
+                .unwrap_or_else(|| relation.subject_id.to_string());
+            let object = names
+                .get(&relation.object_id)
+                .cloned()
+                .unwrap_or_else(|| relation.object_id.to_string());
+            let direction = if root_id == Some(relation.subject_id) {
                 "out"
-            } else if relation.object_id == root_entity.id {
+            } else if root_id == Some(relation.object_id) {
                 "in"
             } else {
                 "through"
-            },
-        }))
+            };
+            json!({
+                "relation_id": relation.id,
+                "subject": subject,
+                "predicate": relation.predicate,
+                "object": object,
+                "source_fact_id": relation.source_fact_id,
+                "direction": direction,
+                "hops": if direction == "through" { 2 } else { 1 },
+                "path": [subject, relation.predicate, object],
+            })
+        })
         .collect::<Vec<_>>();
-    Ok(json!({"root": root, "nodes": nodes, "edges": edges, "depth": depth}))
+    let mut result = json!({
+        "root": root,
+        "nodes": nodes,
+        "edges": edges,
+        "depth": depth,
+        "candidate_linking": include_candidates,
+        "retrieval_impact": "confirmed_relations_only",
+    });
+    if include_candidates {
+        let candidate_status = optional_string(arguments, "candidate_status")?
+            .map(str::trim)
+            .filter(|status| !status.is_empty());
+        let candidate_limit = optional_usize(arguments, &["candidate_limit"], 50)?;
+        let candidates = store
+            .list_relation_candidates(
+                workspace,
+                candidate_status,
+                (!entity.is_empty()).then_some(entity),
+                candidate_limit,
+            )
+            .map_err(CallError::Execution)?;
+        result["candidates"] = json!(candidates);
+        result["candidate_count"] = json!(candidates.len());
+        result["measurement"] = pipeline::candidate_measurement_contract();
+    }
+    Ok(result)
 }
 
 fn exact_record_decision(
@@ -3583,6 +3659,7 @@ fn fact_id_argument(arguments: &Map<String, Value>) -> Result<i64, CallError> {
 
 fn exact_remember_fact(store: &Store, arguments: &Map<String, Value>) -> Result<Value, CallError> {
     let workspace = optional_workspace(arguments)?;
+    pipeline::validate_candidate_linking_arguments(arguments).map_err(CallError::Execution)?;
     let text = required_string(arguments, "text")?.trim();
     if text.is_empty() {
         return Err(CallError::InvalidParams(
@@ -3667,6 +3744,11 @@ fn exact_remember_fact(store: &Store, arguments: &Map<String, Value>) -> Result<
     }
     if strict {
         result["admission"] = json!("accepted");
+    }
+    if created {
+        result["candidate_linking"] =
+            pipeline::auto_link_new_fact(store, enriched.id, arguments, workspace)
+                .map_err(CallError::Execution)?;
     }
     Ok(result)
 }
@@ -3802,6 +3884,22 @@ fn exact_search_facts(store: &Store, arguments: &Map<String, Value>) -> Result<V
     facts = eligible_facts;
     let effective_limit = limit.min(retrieval_profile.max_hits);
     facts.truncate(effective_limit);
+    let candidate_requested = arguments.contains_key("candidate_linking")
+        || arguments.contains_key("candidate_limit")
+        || arguments.contains_key("candidate_scan_limit")
+        || arguments.contains_key("candidate_min_score")
+        || pipeline::candidate_linking_enabled(arguments).map_err(CallError::Execution)?;
+    let candidate_report = candidate_requested
+        .then(|| {
+            pipeline::auto_link_facts(
+                store,
+                &facts.iter().map(|fact| fact.id).collect::<Vec<_>>(),
+                arguments,
+                workspace,
+            )
+        })
+        .transpose()
+        .map_err(CallError::Execution)?;
     let graph_requested = arguments
         .get("graph")
         .and_then(Value::as_bool)
@@ -3813,8 +3911,12 @@ fn exact_search_facts(store: &Store, arguments: &Map<String, Value>) -> Result<V
         .unwrap_or(false)
         || graph_requested
     {
-        return pipeline::hybrid_search(store, query, arguments, &facts)
-            .map_err(CallError::Execution);
+        let mut result = pipeline::hybrid_search(store, query, arguments, &facts)
+            .map_err(CallError::Execution)?;
+        if let Some(candidate_report) = candidate_report {
+            result["candidate_linking"] = candidate_report;
+        }
+        return Ok(result);
     }
     let chunk_chars = optional_usize(arguments, &["chunk_chars"], 0)?;
     let chunk_overlap = optional_usize(arguments, &["chunk_overlap"], 0)?;
@@ -3833,13 +3935,17 @@ fn exact_search_facts(store: &Store, arguments: &Map<String, Value>) -> Result<V
             Ok::<Value, CallError>(value)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(json!({
+    let mut result = json!({
         "count": values.len(), "facts": values,
         "memory_policy": "advisory_only", "safety_critical_allowed": false,
         "profile": profile, "result_status": if values.is_empty() { "empty" } else { "ok" },
         "retrieval_outcome": if values.is_empty() { "abstained" } else { "matched" },
         "retrieval_mode": "lexical",
-    }))
+    });
+    if let Some(candidate_report) = candidate_report {
+        result["candidate_linking"] = candidate_report;
+    }
+    Ok(result)
 }
 
 fn fact_chunk_values(fact: &crate::store::Fact, chunk_chars: usize, overlap: usize) -> Value {
@@ -4282,6 +4388,37 @@ fn exact_remember_relation(
     arguments: &Map<String, Value>,
 ) -> Result<Value, CallError> {
     let workspace = optional_workspace(arguments)?;
+    if let Some(candidate_id) = optional_i64(arguments, &["candidate_id", "candidate"])? {
+        let action = optional_string(arguments, "action")?.unwrap_or("confirm");
+        let reviewer = optional_string(arguments, "reviewer")?
+            .or(optional_string(arguments, "actor")?)
+            .unwrap_or("");
+        let note = optional_string(arguments, "note")?.unwrap_or("confirmed");
+        let candidate = match action {
+            "confirm" => store
+                .confirm_relation_candidate(candidate_id, reviewer, note, workspace)
+                .map_err(CallError::Execution)?,
+            "reject" => store
+                .reject_relation_candidate(candidate_id, reviewer, note, workspace)
+                .map_err(CallError::Execution)?,
+            _ => {
+                return Err(CallError::InvalidParams(
+                    "action must be confirm or reject".to_owned(),
+                ))
+            }
+        };
+        return Ok(json!({
+            "candidate_id": candidate_id,
+            "action": action,
+            "candidate": candidate,
+            "confirmed": action == "confirm",
+            "retrieval_impact": if action == "confirm" {
+                "confirmed_relation_available_to_graph_retrieval"
+            } else {
+                "none"
+            },
+        }));
+    }
     let subject = required_string(arguments, "subject")?.trim();
     let predicate = required_string(arguments, "predicate")?.trim();
     let object = required_string(arguments, "object")?.trim();
@@ -4319,6 +4456,145 @@ fn exact_remember_relation(
     Ok(json!({"id": relation.id, "subject": subject_entity.name,
               "predicate": relation.predicate, "object": object_entity.name,
               "dedup": false, "relation": relation}))
+}
+
+fn exact_suggest_relation_candidates(
+    store: &Store,
+    arguments: &Map<String, Value>,
+) -> Result<Value, CallError> {
+    let workspace = optional_workspace(arguments)?;
+    let fact_id = if let Some(fact_id) = optional_i64(arguments, &["fact_id", "id"])? {
+        Some(fact_id)
+    } else if arguments.contains_key("text") {
+        let text = optional_string(arguments, "text")?.unwrap_or("").trim();
+        if text.is_empty() {
+            None
+        } else {
+            store
+                .fact_id_for_text(text, workspace)
+                .map_err(CallError::Execution)?
+        }
+    } else {
+        None
+    }
+    .ok_or_else(|| {
+        CallError::InvalidParams(
+            "fact_id or text identifying an existing fact is required".to_owned(),
+        )
+    })?;
+    let candidate_linking = optional_bool(arguments, &["candidate_linking"], true)?;
+    if !candidate_linking {
+        return Ok(json!({
+            "enabled": false,
+            "count": 0,
+            "candidates": [],
+            "result_status": "disabled",
+            "retrieval_impact": "none",
+        }));
+    }
+    let limit = optional_usize(arguments, &["limit", "candidate_limit"], 8)?;
+    if !(1..=50).contains(&limit) {
+        return Err(CallError::InvalidParams(
+            "candidate limit must be between 1 and 50".to_owned(),
+        ));
+    }
+    let scan_limit = optional_usize(arguments, &["candidate_scan_limit"], 200)?;
+    if !(1..=1000).contains(&scan_limit) {
+        return Err(CallError::InvalidParams(
+            "candidate scan limit must be between 1 and 1000".to_owned(),
+        ));
+    }
+    let minimum_score = optional_f64(arguments, "candidate_min_score")?.unwrap_or(0.05);
+    let candidates = store
+        .generate_relation_candidates_with_limits(
+            fact_id,
+            workspace,
+            limit,
+            scan_limit,
+            minimum_score,
+        )
+        .map_err(CallError::Execution)?;
+    Ok(json!({
+        "enabled": true,
+        "fact_id": fact_id,
+        "count": candidates.len(),
+        "candidates": candidates,
+        "result_status": if candidates.is_empty() { "empty" } else { "ok" },
+        "retrieval_impact": "candidates_are_review_only",
+        "measurement": pipeline::candidate_measurement_contract(),
+    }))
+}
+
+fn exact_list_relation_candidates(
+    store: &Store,
+    arguments: &Map<String, Value>,
+) -> Result<Value, CallError> {
+    let workspace = optional_workspace(arguments)?;
+    let status = optional_string(arguments, "status")?
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let query = optional_string(arguments, "query")?
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let limit = optional_usize(arguments, &["limit", "candidate_limit"], 50)?;
+    let candidates = store
+        .list_relation_candidates(workspace, status, query, limit)
+        .map_err(CallError::Execution)?;
+    Ok(json!({
+        "count": candidates.len(),
+        "candidates": candidates,
+        "status": status.unwrap_or("all"),
+        "retrieval_impact": "candidates_are_review_only",
+        "measurement": pipeline::candidate_measurement_contract(),
+    }))
+}
+
+fn exact_confirm_relation_candidate(
+    store: &Store,
+    arguments: &Map<String, Value>,
+) -> Result<Value, CallError> {
+    let workspace = optional_workspace(arguments)?;
+    let id = required_i64(arguments, "candidate_id")?;
+    let reviewer = optional_string(arguments, "reviewer")?
+        .or(optional_string(arguments, "actor")?)
+        .unwrap_or("");
+    let note = optional_string(arguments, "note")?.unwrap_or("confirmed");
+    let Some(candidate) = store
+        .confirm_relation_candidate(id, reviewer, note, workspace)
+        .map_err(CallError::Execution)?
+    else {
+        return Ok(json!({"error": "relation candidate not found", "candidate_id": id}));
+    };
+    Ok(json!({
+        "candidate_id": id,
+        "confirmed": true,
+        "candidate": candidate,
+        "retrieval_impact": "confirmed_relation_available_to_graph_retrieval",
+    }))
+}
+
+fn exact_reject_relation_candidate(
+    store: &Store,
+    arguments: &Map<String, Value>,
+) -> Result<Value, CallError> {
+    let workspace = optional_workspace(arguments)?;
+    let id = required_i64(arguments, "candidate_id")?;
+    let reviewer = optional_string(arguments, "reviewer")?
+        .or(optional_string(arguments, "actor")?)
+        .unwrap_or("");
+    let note = optional_string(arguments, "note")?.unwrap_or("rejected");
+    let Some(candidate) = store
+        .reject_relation_candidate(id, reviewer, note, workspace)
+        .map_err(CallError::Execution)?
+    else {
+        return Ok(json!({"error": "relation candidate not found", "candidate_id": id}));
+    };
+    Ok(json!({
+        "candidate_id": id,
+        "rejected": true,
+        "candidate": candidate,
+        "retrieval_impact": "none",
+    }))
 }
 
 fn exact_record_feedback(
@@ -6124,6 +6400,258 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("\"outcome\":\"SQLite\""));
+    }
+
+    #[test]
+    fn candidate_linking_is_opt_in_and_confirmation_feeds_bounded_graph_rrf() {
+        let store = Store::in_memory().unwrap();
+        let disabled = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "remember_fact",
+                    "arguments": {"text": "default fact", "workspace": "w"}
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        assert_eq!(
+            tool_payload(&disabled)["candidate_linking"]["enabled"],
+            false
+        );
+
+        let invalid = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": {
+                    "name": "remember_fact",
+                    "arguments": {
+                        "text": "invalid candidate configuration",
+                        "candidate_linking": true,
+                        "candidate_min_score": 2.0,
+                        "workspace": "w"
+                    }
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        assert_eq!(invalid["result"]["isError"].as_bool(), Some(true));
+        assert!(store
+            .fact_id_for_text("invalid candidate configuration", "w")
+            .unwrap()
+            .is_none());
+
+        let source = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "remember_fact",
+                    "arguments": {
+                        "text": "Rust uses SQLite for durable memory",
+                        "domain": "runtime",
+                        "candidate_linking": true,
+                        "workspace": "w"
+                    }
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        let source_id = tool_payload(&source)["id"].as_i64().expect("source id");
+        assert_eq!(tool_payload(&source)["candidate_linking"]["count"], 0);
+        let target = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "remember_fact",
+                    "arguments": {
+                        "text": "SQLite stores durable records for applications",
+                        "domain": "storage",
+                        "candidate_linking": true,
+                        "workspace": "w"
+                    }
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        let target_payload = tool_payload(&target);
+        let candidate_id = target_payload["candidate_linking"]["candidates"][0]["id"]
+            .as_i64()
+            .expect("candidate id");
+
+        let listed = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 31,
+                "method": "tools/call",
+                "params": {
+                    "name": "list_relation_candidates",
+                    "arguments": {"query": "runtime", "workspace": "w"}
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&listed)["count"], 1);
+
+        let disabled_suggestion = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 32,
+                "method": "tools/call",
+                "params": {
+                    "name": "suggest_relation_candidates",
+                    "arguments": {
+                        "fact_id": source_id,
+                        "candidate_linking": false,
+                        "workspace": "w"
+                    }
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        assert_eq!(
+            tool_payload(&disabled_suggestion)["result_status"],
+            "disabled"
+        );
+
+        let search_candidates = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 33,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_facts",
+                    "arguments": {
+                        "query": "SQLite",
+                        "candidate_linking": true,
+                        "workspace": "w"
+                    }
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        assert_eq!(
+            tool_payload(&search_candidates)["candidate_linking"]["count"],
+            1
+        );
+        assert!(store.list_relations("w").unwrap().is_empty());
+
+        let review = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_graph",
+                    "arguments": {"include_candidates": true, "workspace": "w"}
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        let review_payload = tool_payload(&review);
+        assert_eq!(review_payload["candidate_count"], 1);
+        assert!(review_payload["nodes"].as_array().unwrap().is_empty());
+
+        let confirmed = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "confirm_relation_candidate",
+                    "arguments": {"candidate_id": candidate_id, "reviewer": "human", "workspace": "w"}
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&confirmed)["confirmed"], true);
+        assert_eq!(store.list_relations("w").unwrap().len(), 1);
+
+        let graph = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_graph",
+                    "arguments": {"entity": "runtime", "depth": 1, "limit": 2, "workspace": "w"}
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        let graph_payload = tool_payload(&graph);
+        assert_eq!(graph_payload["edges"][0]["hops"], 1);
+        assert!(graph_payload["edges"][0]["path"].is_array());
+
+        let hybrid = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_facts",
+                    "arguments": {"query": "runtime", "profile": "implementation", "workspace": "w"}
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&hybrid)["graph_count"], 1);
+    }
+
+    #[test]
+    fn absorb_candidate_linking_deduplicates_reverse_batch_candidates() {
+        let store = Store::in_memory().unwrap();
+        let response = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "absorb",
+                    "arguments": {
+                        "facts": [
+                            {"text": "Rust uses SQLite for durable memory", "domain": "runtime"},
+                            {"text": "SQLite stores durable records for applications", "domain": "storage"}
+                        ],
+                        "candidate_linking": true,
+                        "commit": true,
+                        "dry_run": false,
+                        "workspace": "w"
+                    }
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        let payload = tool_payload(&response);
+        assert_eq!(payload["created"], 2);
+        assert_eq!(payload["candidate_linking"]["count"], 1);
+        assert_eq!(
+            store
+                .list_relation_candidates("w", None, None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store.list_relations("w").unwrap().is_empty());
     }
 
     #[test]

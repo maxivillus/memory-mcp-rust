@@ -11,6 +11,12 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 
 const DEFAULT_PROFILE: &str = "balanced";
+const DEFAULT_CANDIDATE_LIMIT: usize = 8;
+const MAX_CANDIDATE_LIMIT: usize = 50;
+const DEFAULT_CANDIDATE_SCAN_LIMIT: usize = 200;
+const MAX_CANDIDATE_SCAN_LIMIT: usize = 1000;
+const DEFAULT_CANDIDATE_MIN_SCORE: f64 = 0.05;
+const MAX_CANDIDATE_SOURCE_FACTS: usize = 8;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RetrievalProfile {
@@ -65,6 +71,158 @@ pub(crate) fn retrieval_profile(name: &str) -> Option<RetrievalProfile> {
     }
 }
 
+pub fn candidate_linking_enabled(arguments: &Map<String, Value>) -> Result<bool, StoreError> {
+    if let Some(value) = arguments.get("candidate_linking") {
+        return value
+            .as_bool()
+            .ok_or_else(|| StoreError::Invalid("candidate_linking must be a boolean".to_owned()));
+    }
+    Ok(std::env::var("MEMORY_MCP_CANDIDATE_LINKING")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes")))
+}
+
+pub fn validate_candidate_linking_arguments(
+    arguments: &Map<String, Value>,
+) -> Result<(), StoreError> {
+    candidate_linking_enabled(arguments)?;
+    bounded_usize(
+        arguments,
+        "candidate_limit",
+        candidate_limit_from_env(),
+        1,
+        MAX_CANDIDATE_LIMIT,
+    )?;
+    bounded_usize(
+        arguments,
+        "candidate_scan_limit",
+        candidate_scan_limit_from_env(),
+        1,
+        MAX_CANDIDATE_SCAN_LIMIT,
+    )?;
+    candidate_min_score(arguments)?;
+    Ok(())
+}
+
+/// Generate review-only links after a fact has been durably stored.  Candidate
+/// failures are intentionally degraded to metadata so fact ingestion and the
+/// existing lexical/semantic retrieval path cannot be made unavailable by
+/// the opt-in feature.
+pub fn auto_link_new_fact(
+    store: &Store,
+    fact_id: i64,
+    arguments: &Map<String, Value>,
+    workspace: &str,
+) -> Result<Value, StoreError> {
+    validate_candidate_linking_arguments(arguments)?;
+    if !candidate_linking_enabled(arguments)? {
+        return Ok(json!({
+            "enabled": false,
+            "count": 0,
+            "candidates": [],
+            "result_status": "disabled",
+            "retrieval_impact": "none",
+        }));
+    }
+    let limit = bounded_usize(
+        arguments,
+        "candidate_limit",
+        candidate_limit_from_env(),
+        1,
+        MAX_CANDIDATE_LIMIT,
+    )?;
+    let scan_limit = bounded_usize(
+        arguments,
+        "candidate_scan_limit",
+        candidate_scan_limit_from_env(),
+        1,
+        MAX_CANDIDATE_SCAN_LIMIT,
+    )?;
+    let minimum_score = candidate_min_score(arguments)?;
+    let candidates = match store.generate_relation_candidates_with_limits(
+        fact_id,
+        workspace,
+        limit,
+        scan_limit,
+        minimum_score,
+    ) {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            eprintln!("memory-mcp candidate linking degraded: {error}");
+            return Ok(json!({
+                "enabled": true,
+                "count": 0,
+                "candidates": [],
+                "result_status": "degraded",
+                "retrieval_impact": "none",
+                "error": "candidate linking unavailable; existing retrieval preserved",
+            }));
+        }
+    };
+    Ok(json!({
+        "enabled": true,
+        "count": candidates.len(),
+        "candidates": candidates,
+        "result_status": if candidates.is_empty() { "empty" } else { "ok" },
+        "retrieval_impact": "candidates_are_review_only",
+        "minimum_score": minimum_score,
+        "limit": limit,
+        "scan_limit": scan_limit,
+        "measurement": candidate_measurement_contract(),
+    }))
+}
+
+pub fn auto_link_facts(
+    store: &Store,
+    fact_ids: &[i64],
+    arguments: &Map<String, Value>,
+    workspace: &str,
+) -> Result<Value, StoreError> {
+    validate_candidate_linking_arguments(arguments)?;
+    if !candidate_linking_enabled(arguments)? {
+        return Ok(json!({
+            "enabled": false,
+            "count": 0,
+            "candidates": [],
+            "result_status": "disabled",
+            "retrieval_impact": "none",
+        }));
+    }
+    let mut candidate_count = 0usize;
+    let mut candidate_items = Vec::new();
+    let mut candidate_ids = HashSet::new();
+    for fact_id in fact_ids.iter().copied().take(MAX_CANDIDATE_SOURCE_FACTS) {
+        let report = auto_link_new_fact(store, fact_id, arguments, workspace)?;
+        candidate_count +=
+            append_candidate_items(&report, &mut candidate_ids, &mut candidate_items);
+    }
+    Ok(json!({
+        "enabled": true,
+        "source_fact_count": fact_ids.len().min(MAX_CANDIDATE_SOURCE_FACTS),
+        "count": candidate_count,
+        "candidates": candidate_items,
+        "result_status": if candidate_items.is_empty() { "empty" } else { "ok" },
+        "retrieval_impact": "candidates_are_review_only",
+        "measurement": candidate_measurement_contract(),
+    }))
+}
+
+pub fn candidate_measurement_contract() -> Value {
+    json!({
+        "status": "not_claimed",
+        "min_pairs": 10,
+        "metrics": [
+            "recall_at_k",
+            "precision_at_k",
+            "time_to_first_useful_fact_ms",
+            "useful_cross_domain_findings",
+            "false_positive_rate",
+            "candidate_linking_latency_ms"
+        ],
+        "paired_variants": ["baseline", "memory"]
+    })
+}
+
 pub fn maybe_enrich_fact(
     store: &Store,
     fact: &Fact,
@@ -111,6 +269,7 @@ pub fn ingest_turn(store: &Store, arguments: &Map<String, Value>) -> Result<Valu
     if !providers::extraction_enabled() {
         return Ok(disabled("MEMORY_MCP_EXTRACT"));
     }
+    validate_candidate_linking_arguments(arguments)?;
     let transcript = required_string(arguments, "transcript")?.trim().to_owned();
     if transcript.is_empty() {
         return Ok(json!({"error": "transcript is required"}));
@@ -253,6 +412,24 @@ pub fn ingest_turn(store: &Store, arguments: &Map<String, Value>) -> Result<Valu
         "deduped": deduped,
         "failed": failed,
     });
+    let mut candidate_count = 0usize;
+    let mut candidate_items = Vec::new();
+    let mut candidate_ids = HashSet::new();
+    for (fact_id, _, fact_workspace) in &new_facts {
+        let report = auto_link_new_fact(store, *fact_id, arguments, fact_workspace)?;
+        candidate_count +=
+            append_candidate_items(&report, &mut candidate_ids, &mut candidate_items);
+    }
+    if candidate_items.len() > MAX_CANDIDATE_LIMIT {
+        candidate_items.truncate(MAX_CANDIDATE_LIMIT);
+    }
+    result["candidate_linking"] = json!({
+        "enabled": candidate_linking_enabled(arguments)?,
+        "count": candidate_count,
+        "candidates": candidate_items,
+        "retrieval_impact": "candidates_are_review_only",
+        "measurement": candidate_measurement_contract(),
+    });
     if providers::verification_enabled() && !new_facts.is_empty() {
         result["verification"] = verify_new_facts(store, &new_facts)?;
     }
@@ -260,6 +437,7 @@ pub fn ingest_turn(store: &Store, arguments: &Map<String, Value>) -> Result<Valu
 }
 
 pub fn absorb(store: &Store, arguments: &Map<String, Value>) -> Result<Value, StoreError> {
+    validate_candidate_linking_arguments(arguments)?;
     let Some(raw_facts) = arguments.get("facts").or_else(|| arguments.get("text")) else {
         return Ok(json!({"error": "facts must be a non-empty array"}));
     };
@@ -386,6 +564,7 @@ pub fn absorb(store: &Store, arguments: &Map<String, Value>) -> Result<Value, St
         result["result_status"] = json!("preview");
         return Ok(result);
     }
+    let mut new_facts = Vec::new();
     for (index, (_, args, classification)) in planned.iter().enumerate() {
         if classification != "new" {
             continue;
@@ -404,9 +583,26 @@ pub fn absorb(store: &Store, arguments: &Map<String, Value>) -> Result<Value, St
             item["id"] = json!(fact.id);
         }
         result["created"] = json!(result["created"].as_i64().unwrap_or(0) + 1);
+        new_facts.push((fact.id, workspace.to_owned()));
     }
     result["committed"] = json!(true);
     result["result_status"] = json!("committed");
+    let mut candidate_count = 0usize;
+    let mut candidate_items = Vec::new();
+    let mut candidate_ids = HashSet::new();
+    for (fact_id, fact_workspace) in new_facts {
+        let report = auto_link_new_fact(store, fact_id, arguments, &fact_workspace)?;
+        candidate_count +=
+            append_candidate_items(&report, &mut candidate_ids, &mut candidate_items);
+    }
+    candidate_items.truncate(MAX_CANDIDATE_LIMIT);
+    result["candidate_linking"] = json!({
+        "enabled": candidate_linking_enabled(arguments)?,
+        "count": candidate_count,
+        "candidates": candidate_items,
+        "retrieval_impact": "candidates_are_review_only",
+        "measurement": candidate_measurement_contract(),
+    });
     Ok(result)
 }
 
@@ -1412,6 +1608,74 @@ fn required_string<'a>(
 
 fn string_arg<'a>(arguments: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     arguments.get(key).and_then(Value::as_str)
+}
+
+fn candidate_limit_from_env() -> usize {
+    std::env::var("MEMORY_MCP_CANDIDATE_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=MAX_CANDIDATE_LIMIT).contains(value))
+        .unwrap_or(DEFAULT_CANDIDATE_LIMIT)
+}
+
+fn candidate_scan_limit_from_env() -> usize {
+    std::env::var("MEMORY_MCP_CANDIDATE_SCAN_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=MAX_CANDIDATE_SCAN_LIMIT).contains(value))
+        .unwrap_or(DEFAULT_CANDIDATE_SCAN_LIMIT)
+}
+
+fn candidate_min_score_from_env() -> Option<f64> {
+    std::env::var("MEMORY_MCP_CANDIDATE_MIN_SCORE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+}
+
+fn append_candidate_items(
+    report: &Value,
+    candidate_ids: &mut HashSet<i64>,
+    candidate_items: &mut Vec<Value>,
+) -> usize {
+    report
+        .get("candidates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|candidate| {
+            candidate
+                .get("id")
+                .and_then(Value::as_i64)
+                .map(|id| (id, candidate))
+        })
+        .filter(|(id, _)| candidate_ids.insert(*id))
+        .map(|(_, candidate)| {
+            if candidate_items.len() < MAX_CANDIDATE_LIMIT {
+                candidate_items.push(candidate.clone());
+            }
+            1
+        })
+        .sum()
+}
+
+fn candidate_min_score(arguments: &Map<String, Value>) -> Result<f64, StoreError> {
+    let value = arguments
+        .get("candidate_min_score")
+        .map(|value| {
+            value.as_f64().ok_or_else(|| {
+                StoreError::Invalid("candidate_min_score must be a number".to_owned())
+            })
+        })
+        .transpose()?
+        .or_else(candidate_min_score_from_env)
+        .unwrap_or(DEFAULT_CANDIDATE_MIN_SCORE);
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(StoreError::Invalid(
+            "candidate_min_score must be between 0 and 1".to_owned(),
+        ));
+    }
+    Ok(value)
 }
 
 fn bounded_usize(

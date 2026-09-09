@@ -1012,6 +1012,24 @@ pub fn is_advertised(name: &str) -> bool {
     TOOL_NAMES.contains(&name)
 }
 
+/// Compatibility-only candidate endpoints stay out of the pinned upstream
+/// inventory.  The existing advertised graph tools expose the same flow, but
+/// these names make review and confirmation explicit for native clients.
+pub fn is_supported(name: &str) -> bool {
+    is_advertised(name)
+        || matches!(
+            name,
+            "add_fact"
+                | "suggest_relations"
+                | "suggest_relation_candidates"
+                | "relation_candidates"
+                | "list_relation_candidates"
+                | "review_relation_candidates"
+                | "confirm_relation_candidate"
+                | "reject_relation_candidate"
+        )
+}
+
 /// Return whether a tool changes durable memory state.
 ///
 /// The coordinator uses this small explicit table to avoid exporting a full
@@ -1045,6 +1063,10 @@ pub fn is_state_mutating(name: &str) -> bool {
             | "handoff_cancel"
             | "remember_entity"
             | "remember_relation"
+            | "suggest_relations"
+            | "suggest_relation_candidates"
+            | "confirm_relation_candidate"
+            | "reject_relation_candidate"
             | "record_decision"
             | "attach_evidence"
             | "create_database"

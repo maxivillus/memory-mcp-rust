@@ -3,6 +3,7 @@ use rusqlite::{params, Connection, DatabaseName, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::{RefCell, UnsafeCell};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::fs::OpenOptions;
@@ -153,6 +154,59 @@ pub struct Relation {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct RelationCandidateSpec {
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    pub relation_type: String,
+    pub direction: String,
+    pub score: f64,
+    pub confidence: f64,
+    pub source_fact_id: Option<i64>,
+    pub target_fact_id: Option<i64>,
+    pub source_evidence_id: Option<i64>,
+    pub target_evidence_id: Option<i64>,
+    pub provenance: String,
+    pub workspace: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RelationCandidate {
+    pub id: i64,
+    pub subject: String,
+    pub subject_entity_id: Option<i64>,
+    pub predicate: String,
+    pub object: String,
+    pub object_entity_id: Option<i64>,
+    pub relation_type: String,
+    pub direction: String,
+    pub score: f64,
+    pub confidence: f64,
+    pub source_fact_id: Option<i64>,
+    pub target_fact_id: Option<i64>,
+    pub source_evidence_id: Option<i64>,
+    pub target_evidence_id: Option<i64>,
+    pub source_evidence_status: String,
+    pub target_evidence_status: String,
+    pub evidence_status: String,
+    pub provenance: String,
+    pub status: String,
+    pub relation_id: Option<i64>,
+    pub reviewer: String,
+    pub review_note: String,
+    pub workspace: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateScanFact {
+    fact: Fact,
+    area: String,
+    evidence_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct DecisionSpec {
     pub category: String,
     pub subject: String,
@@ -268,6 +322,7 @@ pub struct MemoryExport {
     pub handoffs: Vec<Handoff>,
     pub entities: Vec<Entity>,
     pub relations: Vec<Relation>,
+    pub relation_candidates: Vec<RelationCandidate>,
     pub decisions: Vec<Decision>,
     pub evidence: Vec<Evidence>,
     pub categories: Vec<Category>,
@@ -902,6 +957,38 @@ impl Store {
                 FOREIGN KEY (object_id) REFERENCES entities(id) ON DELETE CASCADE,
                 FOREIGN KEY (source_fact_id) REFERENCES facts(id) ON DELETE SET NULL
             );
+            CREATE TABLE IF NOT EXISTS relation_candidates (
+                id INTEGER PRIMARY KEY,
+                candidate_key TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                subject_entity_id INTEGER,
+                predicate TEXT NOT NULL,
+                object TEXT NOT NULL,
+                object_entity_id INTEGER,
+                relation_type TEXT NOT NULL DEFAULT 'related_to',
+                direction TEXT NOT NULL DEFAULT 'undirected',
+                score REAL NOT NULL,
+                confidence REAL NOT NULL,
+                source_fact_id INTEGER,
+                target_fact_id INTEGER,
+                source_evidence_id INTEGER,
+                target_evidence_id INTEGER,
+                provenance TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'candidate'
+                    CHECK (status IN ('candidate', 'confirmed', 'rejected', 'conflict')),
+                relation_id INTEGER,
+                reviewer TEXT NOT NULL DEFAULT '',
+                review_note TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (workspace_id, candidate_key),
+                FOREIGN KEY (source_fact_id) REFERENCES facts(id) ON DELETE SET NULL,
+                FOREIGN KEY (target_fact_id) REFERENCES facts(id) ON DELETE SET NULL,
+                FOREIGN KEY (source_evidence_id) REFERENCES evidence(id) ON DELETE SET NULL,
+                FOREIGN KEY (target_evidence_id) REFERENCES evidence(id) ON DELETE SET NULL,
+                FOREIGN KEY (relation_id) REFERENCES relations(id) ON DELETE SET NULL
+            );
             CREATE TABLE IF NOT EXISTS decisions (
                 id INTEGER PRIMARY KEY,
                 category TEXT NOT NULL DEFAULT '',
@@ -944,6 +1031,7 @@ impl Store {
         )?;
         self.ensure_entity_columns()?;
         self.ensure_relation_columns()?;
+        self.ensure_relation_candidate_columns()?;
         self.ensure_decision_columns()?;
         self.ensure_evidence_columns()?;
         self.connection.execute_batch(
@@ -1032,6 +1120,12 @@ impl Store {
                 ON relations (workspace_id, subject_id);
              CREATE INDEX IF NOT EXISTS relations_object_idx
                 ON relations (workspace_id, object_id);
+             CREATE INDEX IF NOT EXISTS relation_candidates_workspace_status_idx
+                ON relation_candidates (workspace_id, status, id);
+             CREATE INDEX IF NOT EXISTS relation_candidates_source_fact_idx
+                ON relation_candidates (workspace_id, source_fact_id, id);
+             CREATE INDEX IF NOT EXISTS relation_candidates_target_fact_idx
+                ON relation_candidates (workspace_id, target_fact_id, id);
              CREATE INDEX IF NOT EXISTS decisions_subject_idx
                 ON decisions (workspace_id, subject);
              CREATE INDEX IF NOT EXISTS evidence_fact_idx
@@ -1313,6 +1407,54 @@ impl Store {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    fn ensure_relation_candidate_columns(&self) -> Result<(), StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("PRAGMA table_info(relation_candidates)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let additions = [
+            ("candidate_key", "TEXT NOT NULL DEFAULT ''"),
+            ("subject", "TEXT NOT NULL DEFAULT ''"),
+            ("subject_entity_id", "INTEGER"),
+            ("predicate", "TEXT NOT NULL DEFAULT ''"),
+            ("object", "TEXT NOT NULL DEFAULT ''"),
+            ("object_entity_id", "INTEGER"),
+            ("relation_type", "TEXT NOT NULL DEFAULT 'related_to'"),
+            ("direction", "TEXT NOT NULL DEFAULT 'undirected'"),
+            ("score", "REAL NOT NULL DEFAULT 0"),
+            ("confidence", "REAL NOT NULL DEFAULT 0"),
+            ("source_fact_id", "INTEGER"),
+            ("target_fact_id", "INTEGER"),
+            ("source_evidence_id", "INTEGER"),
+            ("target_evidence_id", "INTEGER"),
+            ("provenance", "TEXT NOT NULL DEFAULT ''"),
+            ("status", "TEXT NOT NULL DEFAULT 'candidate'"),
+            ("relation_id", "INTEGER"),
+            ("reviewer", "TEXT NOT NULL DEFAULT ''"),
+            ("review_note", "TEXT NOT NULL DEFAULT ''"),
+            ("workspace_id", "TEXT NOT NULL DEFAULT ''"),
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+            ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+        ];
+        for (name, definition) in additions {
+            if !columns.iter().any(|column| column == name) {
+                self.connection.execute(
+                    &format!("ALTER TABLE relation_candidates ADD COLUMN {name} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        self.connection.execute(
+            "UPDATE relation_candidates
+             SET updated_at = CURRENT_TIMESTAMP
+             WHERE updated_at = ''",
+            [],
+        )?;
         Ok(())
     }
 
@@ -2118,7 +2260,7 @@ impl Store {
                AND f.validity != 'invalid'
                AND (f.workspace_id = '' OR f.workspace_id = ?1)
                AND NOT EXISTS (SELECT 1 FROM fact_embeddings e WHERE e.fact_id = f.id)
-             ORDER BY f.id
+             ORDER BY id
              LIMIT ?2",
         )?;
         let result = statement
@@ -3222,6 +3364,7 @@ impl Store {
              DELETE FROM evidence;
              DELETE FROM fact_history;
              DELETE FROM fact_embeddings;
+             DELETE FROM relation_candidates;
              DELETE FROM relations;
              DELETE FROM facts;
              DELETE FROM decision_embeddings;
@@ -4038,6 +4181,395 @@ impl Store {
             })
     }
 
+    /// Persist one review-only relation hypothesis.  Candidates are never
+    /// read by graph traversal; only `confirm_relation_candidate` promotes
+    /// one into the confirmed `relations` table.
+    pub fn create_relation_candidate(
+        &self,
+        spec: &RelationCandidateSpec,
+    ) -> Result<RelationCandidate, StoreError> {
+        validate_relation_candidate_spec(spec)?;
+        let subject_entity_id = self.entity_id_for_reference(&spec.subject, &spec.workspace)?;
+        let object_entity_id = self.entity_id_for_reference(&spec.object, &spec.workspace)?;
+        self.validate_candidate_fact_and_evidence(
+            spec.source_fact_id,
+            spec.source_evidence_id,
+            &spec.workspace,
+            "source",
+        )?;
+        self.validate_candidate_fact_and_evidence(
+            spec.target_fact_id,
+            spec.target_evidence_id,
+            &spec.workspace,
+            "target",
+        )?;
+        let candidate_key = relation_candidate_key(spec);
+        if let Some(existing) = self.relation_candidate_by_key(&candidate_key, &spec.workspace)? {
+            if relation_candidate_matches(&existing, spec) {
+                return self.hydrate_relation_candidate(existing, &spec.workspace);
+            }
+            if existing.status != "confirmed" {
+                self.mark_relation_candidate_conflict(
+                    existing.id,
+                    "candidate provenance conflicts with an existing candidate",
+                    &spec.workspace,
+                )?;
+            }
+            return Err(StoreError::Invalid(
+                "relation candidate conflicts with an existing candidate".to_owned(),
+            ));
+        }
+        self.connection.execute(
+            "INSERT INTO relation_candidates
+                (candidate_key, subject, subject_entity_id, predicate, object,
+                 object_entity_id, relation_type, direction, score, confidence,
+                 source_fact_id, target_fact_id, source_evidence_id, target_evidence_id,
+                 provenance, status, workspace_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                     ?11, ?12, ?13, ?14, ?15, 'candidate', ?16)",
+            params![
+                candidate_key,
+                spec.subject,
+                subject_entity_id,
+                spec.predicate,
+                spec.object,
+                object_entity_id,
+                spec.relation_type,
+                spec.direction,
+                spec.score,
+                spec.confidence,
+                spec.source_fact_id,
+                spec.target_fact_id,
+                spec.source_evidence_id,
+                spec.target_evidence_id,
+                spec.provenance,
+                spec.workspace,
+            ],
+        )?;
+        let candidate = self
+            .relation_candidate_by_key(&candidate_key, &spec.workspace)?
+            .ok_or_else(|| {
+                StoreError::Invalid(
+                    "relation candidate insert did not produce a readable row".to_owned(),
+                )
+            })?;
+        self.hydrate_relation_candidate(candidate, &spec.workspace)
+    }
+
+    /// Generate bounded, deterministic cross-domain hypotheses for one fact.
+    /// The lexical score is only a ranking signal and never grants authority.
+    pub fn generate_relation_candidates(
+        &self,
+        fact_id: i64,
+        workspace: &str,
+        limit: usize,
+    ) -> Result<Vec<RelationCandidate>, StoreError> {
+        self.generate_relation_candidates_with_limits(fact_id, workspace, limit, 200, 0.05)
+    }
+
+    pub fn generate_relation_candidates_with_limits(
+        &self,
+        fact_id: i64,
+        workspace: &str,
+        limit: usize,
+        scan_limit: usize,
+        minimum_score: f64,
+    ) -> Result<Vec<RelationCandidate>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        if fact_id <= 0 {
+            return Err(StoreError::Invalid(
+                "candidate source fact id must be positive".to_owned(),
+            ));
+        }
+        if !(1..=50).contains(&limit) || !(1..=1000).contains(&scan_limit) {
+            return Err(StoreError::Invalid(
+                "candidate limit or scan limit is outside the supported range".to_owned(),
+            ));
+        }
+        if !minimum_score.is_finite() || !(0.0..=1.0).contains(&minimum_score) {
+            return Err(StoreError::Invalid(
+                "candidate minimum score must be between 0 and 1".to_owned(),
+            ));
+        }
+        let source = self.fact_by_id(fact_id, workspace)?.ok_or_else(|| {
+            StoreError::Invalid(format!("candidate source fact not found: {fact_id}"))
+        })?;
+        let source_terms = meaningful_fact_terms(&source.text);
+        if source_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (source_area, source_evidence_id) = self
+            .candidate_fact_context(source.id, workspace)?
+            .unwrap_or_else(|| (String::new(), None));
+        let entities = self.candidate_scan_entities(workspace, 1000)?;
+        let source_label = entity_label_for_fact(&source, &entities)
+            .unwrap_or_else(|| fallback_fact_label(&source, &source_area));
+        let mut ranked = Vec::new();
+        for target in self
+            .candidate_scan_facts(workspace, scan_limit)?
+            .into_iter()
+            .filter(|target| target.fact.id != source.id)
+        {
+            let target_fact = target.fact;
+            let target_area = target.area;
+            if !source_area.is_empty()
+                && !target_area.is_empty()
+                && canonical_name(&source_area) == canonical_name(&target_area)
+            {
+                continue;
+            }
+            let target_terms = meaningful_fact_terms(&target_fact.text);
+            if target_terms.is_empty() {
+                continue;
+            }
+            let shared = source_terms.intersection(&target_terms).count();
+            if shared == 0 {
+                continue;
+            }
+            let overlap = shared as f64 / source_terms.len().min(target_terms.len()) as f64;
+            let union = source_terms.union(&target_terms).count();
+            let jaccard = shared as f64 / union.max(1) as f64;
+            let score = (0.5 * overlap + 0.5 * jaccard).clamp(0.0, 1.0);
+            if score < minimum_score {
+                continue;
+            }
+            let target_label = entity_label_for_fact(&target_fact, &entities)
+                .unwrap_or_else(|| fallback_fact_label(&target_fact, &target_area));
+            if canonical_name(&source_label.0) == canonical_name(&target_label.0) {
+                continue;
+            }
+            let (subject, object) =
+                if canonical_name(&source_label.0) <= canonical_name(&target_label.0) {
+                    (source_label.0.clone(), target_label.0.clone())
+                } else {
+                    (target_label.0.clone(), source_label.0.clone())
+                };
+            ranked.push((
+                score,
+                target_fact.id,
+                RelationCandidateSpec {
+                    subject,
+                    predicate: "related_to".to_owned(),
+                    object,
+                    relation_type: "cross_domain".to_owned(),
+                    direction: "undirected".to_owned(),
+                    score,
+                    confidence: score,
+                    source_fact_id: Some(source.id),
+                    target_fact_id: Some(target_fact.id),
+                    source_evidence_id,
+                    target_evidence_id: target.evidence_id,
+                    provenance: "auto:bounded_lexical_overlap".to_owned(),
+                    workspace: workspace.to_owned(),
+                },
+            ));
+        }
+        ranked.sort_by(|left, right| {
+            right
+                .0
+                .total_cmp(&left.0)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        let mut candidates = Vec::new();
+        for (_, _, spec) in ranked.into_iter().take(limit) {
+            candidates.push(self.create_relation_candidate(&spec)?);
+        }
+        Ok(candidates)
+    }
+
+    pub fn list_relation_candidates(
+        &self,
+        workspace: &str,
+        status: Option<&str>,
+        query: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RelationCandidate>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        if !(1..=200).contains(&limit) {
+            return Err(StoreError::Invalid(
+                "candidate list limit must be between 1 and 200".to_owned(),
+            ));
+        }
+        if let Some(status) = status {
+            validate_relation_candidate_status(status)?;
+        }
+        let pattern = query.map(|value| format!("%{}%", value.to_lowercase()));
+        let mut statement = self.connection.prepare(
+            "SELECT id, subject, subject_entity_id, predicate, object,
+                    object_entity_id, relation_type, direction, score, confidence,
+                    source_fact_id, target_fact_id, source_evidence_id, target_evidence_id,
+                    provenance, status, relation_id, reviewer, review_note,
+                    workspace_id, created_at, updated_at
+             FROM relation_candidates
+             WHERE workspace_id = ?1
+               AND (?2 IS NULL OR status = ?2)
+               AND (?3 IS NULL OR lower(subject || ' ' || predicate || ' ' || object) LIKE ?3)
+             ORDER BY score DESC, id
+             LIMIT ?4",
+        )?;
+        let rows = statement
+            .query_map(
+                params![workspace, status, pattern, limit as i64],
+                map_relation_candidate,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        self.hydrate_relation_candidates(rows, workspace)
+    }
+
+    fn list_relation_candidates_all(
+        &self,
+        workspace: &str,
+    ) -> Result<Vec<RelationCandidate>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, subject, subject_entity_id, predicate, object,
+                    object_entity_id, relation_type, direction, score, confidence,
+                    source_fact_id, target_fact_id, source_evidence_id, target_evidence_id,
+                    provenance, status, relation_id, reviewer, review_note,
+                    workspace_id, created_at, updated_at
+             FROM relation_candidates
+             WHERE workspace_id = ?1
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![workspace], map_relation_candidate)?
+            .collect::<Result<Vec<_>, _>>()?;
+        self.hydrate_relation_candidates(rows, workspace)
+    }
+
+    pub fn confirm_relation_candidate(
+        &self,
+        id: i64,
+        reviewer: &str,
+        note: &str,
+        workspace: &str,
+    ) -> Result<Option<RelationCandidate>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        if id <= 0 {
+            return Err(StoreError::Invalid(
+                "candidate id must be positive".to_owned(),
+            ));
+        }
+        let Some(candidate) = self.relation_candidate_by_id(id, workspace)? else {
+            return Ok(None);
+        };
+        match candidate.status.as_str() {
+            "confirmed" => {
+                return self
+                    .hydrate_relation_candidate(candidate, workspace)
+                    .map(Some)
+            }
+            "candidate" => {}
+            state => {
+                return Err(StoreError::Invalid(format!(
+                    "cannot confirm relation candidate in state {state}"
+                )))
+            }
+        }
+        self.validate_candidate_fact_and_evidence(
+            candidate.source_fact_id,
+            candidate.source_evidence_id,
+            workspace,
+            "source",
+        )?;
+        self.validate_candidate_fact_and_evidence(
+            candidate.target_fact_id,
+            candidate.target_evidence_id,
+            workspace,
+            "target",
+        )?;
+        let subject_entity = self.remember_entity(&EntitySpec {
+            name: candidate.subject.clone(),
+            entity_type: "concept".to_owned(),
+            aliases: Vec::new(),
+            workspace: workspace.to_owned(),
+        })?;
+        let object_entity = self.remember_entity(&EntitySpec {
+            name: candidate.object.clone(),
+            entity_type: "concept".to_owned(),
+            aliases: Vec::new(),
+            workspace: workspace.to_owned(),
+        })?;
+        let relation_id = if let Some(existing) = self.relation_by_key(
+            subject_entity.id,
+            &candidate.predicate,
+            object_entity.id,
+            workspace,
+        )? {
+            if existing.source_fact_id != candidate.source_fact_id {
+                let reason = "confirmed candidate conflicts with an existing relation provenance";
+                self.mark_relation_candidate_conflict(id, reason, workspace)?;
+                return Err(StoreError::Invalid(reason.to_owned()));
+            }
+            existing.id
+        } else {
+            self.remember_relation(&RelationSpec {
+                subject: subject_entity.name,
+                predicate: candidate.predicate.clone(),
+                object: object_entity.name,
+                source_fact_id: candidate.source_fact_id,
+                workspace: workspace.to_owned(),
+            })?
+            .id
+        };
+        self.connection.execute(
+            "UPDATE relation_candidates
+             SET status = 'confirmed', relation_id = ?1, reviewer = ?2,
+                 review_note = ?3, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?4 AND workspace_id = ?5",
+            params![relation_id, reviewer, note, id, workspace],
+        )?;
+        self.relation_candidate_by_id(id, workspace)
+            .and_then(|candidate| {
+                candidate.map_or(Ok(None), |candidate| {
+                    self.hydrate_relation_candidate(candidate, workspace)
+                        .map(Some)
+                })
+            })
+    }
+
+    pub fn reject_relation_candidate(
+        &self,
+        id: i64,
+        reviewer: &str,
+        note: &str,
+        workspace: &str,
+    ) -> Result<Option<RelationCandidate>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        if id <= 0 {
+            return Err(StoreError::Invalid(
+                "candidate id must be positive".to_owned(),
+            ));
+        }
+        let Some(candidate) = self.relation_candidate_by_id(id, workspace)? else {
+            return Ok(None);
+        };
+        match candidate.status.as_str() {
+            "candidate" => {
+                self.connection.execute(
+                    "UPDATE relation_candidates
+                     SET status = 'rejected', reviewer = ?1, review_note = ?2,
+                         updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ?3 AND workspace_id = ?4",
+                    params![reviewer, note, id, workspace],
+                )?;
+            }
+            "rejected" => {}
+            state => {
+                return Err(StoreError::Invalid(format!(
+                    "cannot reject relation candidate in state {state}"
+                )))
+            }
+        }
+        self.relation_candidate_by_id(id, workspace)
+            .and_then(|candidate| {
+                candidate.map_or(Ok(None), |candidate| {
+                    self.hydrate_relation_candidate(candidate, workspace)
+                        .map(Some)
+                })
+            })
+    }
+
     pub fn search_graph(&self, query: &str, workspace: &str) -> Result<GraphSearch, StoreError> {
         validate_graph_workspace(workspace)?;
         if query.trim().is_empty() {
@@ -4550,6 +5082,7 @@ impl Store {
             handoffs: self.list_handoffs(workspace)?,
             entities: self.list_entities(workspace)?,
             relations: self.list_relations(workspace)?,
+            relation_candidates: self.list_relation_candidates_all(workspace)?,
             decisions: self.list_decisions(workspace)?,
             evidence: self.list_evidence(workspace)?,
             categories: self.list_categories(workspace)?,
@@ -4573,6 +5106,7 @@ impl Store {
              UNION SELECT DISTINCT workspace_id FROM handoffs WHERE workspace_id <> ''
              UNION SELECT DISTINCT workspace_id FROM entities WHERE workspace_id <> ''
              UNION SELECT DISTINCT workspace_id FROM relations WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM relation_candidates WHERE workspace_id <> ''
              UNION SELECT DISTINCT workspace_id FROM decisions WHERE workspace_id <> ''
              UNION SELECT DISTINCT workspace_id FROM evidence WHERE workspace_id <> ''
              UNION SELECT DISTINCT workspace_id FROM categories WHERE workspace_id <> ''
@@ -4606,6 +5140,7 @@ impl Store {
             handoffs: Vec::new(),
             entities: Vec::new(),
             relations: Vec::new(),
+            relation_candidates: Vec::new(),
             decisions: Vec::new(),
             evidence: Vec::new(),
             categories: Vec::new(),
@@ -4620,6 +5155,9 @@ impl Store {
             export.handoffs.extend(snapshot.handoffs);
             export.entities.extend(snapshot.entities);
             export.relations.extend(snapshot.relations);
+            export
+                .relation_candidates
+                .extend(snapshot.relation_candidates);
             export.decisions.extend(snapshot.decisions);
             export.evidence.extend(snapshot.evidence);
             export.categories.extend(snapshot.categories);
@@ -4803,6 +5341,7 @@ impl Store {
              UNION SELECT DISTINCT workspace_id FROM handoffs WHERE workspace_id <> ''
              UNION SELECT DISTINCT workspace_id FROM entities WHERE workspace_id <> ''
              UNION SELECT DISTINCT workspace_id FROM relations WHERE workspace_id <> ''
+             UNION SELECT DISTINCT workspace_id FROM relation_candidates WHERE workspace_id <> ''
              UNION SELECT DISTINCT workspace_id FROM decisions WHERE workspace_id <> ''
              UNION SELECT DISTINCT workspace_id FROM evidence WHERE workspace_id <> ''
              UNION SELECT DISTINCT workspace_id FROM categories WHERE workspace_id <> ''
@@ -4832,6 +5371,10 @@ impl Store {
         validate_workspace(id)?;
         self.connection
             .execute("DELETE FROM facts WHERE workspace_id = ?1", params![id])?;
+        self.connection.execute(
+            "DELETE FROM relation_candidates WHERE workspace_id = ?1",
+            params![id],
+        )?;
         self.connection
             .execute("DELETE FROM contexts WHERE workspace_id = ?1", params![id])?;
         self.connection.execute(
@@ -4998,6 +5541,281 @@ impl Store {
             )
             .optional()
             .map_err(StoreError::from)
+    }
+
+    fn relation_candidate_by_id(
+        &self,
+        id: i64,
+        workspace: &str,
+    ) -> Result<Option<RelationCandidate>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, subject, subject_entity_id, predicate, object,
+                        object_entity_id, relation_type, direction, score, confidence,
+                        source_fact_id, target_fact_id, source_evidence_id, target_evidence_id,
+                        provenance, status, relation_id, reviewer, review_note,
+                        workspace_id, created_at, updated_at
+                 FROM relation_candidates
+                 WHERE id = ?1 AND workspace_id = ?2",
+                params![id, workspace],
+                map_relation_candidate,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn relation_candidate_by_key(
+        &self,
+        candidate_key: &str,
+        workspace: &str,
+    ) -> Result<Option<RelationCandidate>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, subject, subject_entity_id, predicate, object,
+                        object_entity_id, relation_type, direction, score, confidence,
+                        source_fact_id, target_fact_id, source_evidence_id, target_evidence_id,
+                        provenance, status, relation_id, reviewer, review_note,
+                        workspace_id, created_at, updated_at
+                 FROM relation_candidates
+                 WHERE candidate_key = ?1 AND workspace_id = ?2",
+                params![candidate_key, workspace],
+                map_relation_candidate,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn hydrate_relation_candidate(
+        &self,
+        mut candidate: RelationCandidate,
+        workspace: &str,
+    ) -> Result<RelationCandidate, StoreError> {
+        candidate.source_evidence_status =
+            self.candidate_evidence_status(candidate.source_fact_id, workspace)?;
+        candidate.target_evidence_status =
+            self.candidate_evidence_status(candidate.target_fact_id, workspace)?;
+        candidate.evidence_status = merge_evidence_status(
+            &candidate.source_evidence_status,
+            &candidate.target_evidence_status,
+        )
+        .to_owned();
+        Ok(candidate)
+    }
+
+    fn hydrate_relation_candidates(
+        &self,
+        mut candidates: Vec<RelationCandidate>,
+        workspace: &str,
+    ) -> Result<Vec<RelationCandidate>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        if candidates.is_empty() {
+            return Ok(candidates);
+        }
+        let mut fact_ids = candidates
+            .iter()
+            .flat_map(|candidate| [candidate.source_fact_id, candidate.target_fact_id])
+            .flatten()
+            .collect::<Vec<_>>();
+        fact_ids.sort_unstable();
+        fact_ids.dedup();
+        let mut summaries = BTreeMap::<i64, FactEvidenceSummary>::new();
+        if !fact_ids.is_empty() {
+            let placeholders = fact_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let query = format!(
+                "SELECT fact_id, resolution_status
+                 FROM evidence
+                 WHERE fact_id IN ({placeholders})
+                   AND (workspace_id = '' OR workspace_id = ?)
+                 ORDER BY id"
+            );
+            let mut bind_values = fact_ids
+                .iter()
+                .copied()
+                .map(rusqlite::types::Value::Integer)
+                .collect::<Vec<_>>();
+            bind_values.push(rusqlite::types::Value::Text(workspace.to_owned()));
+            let mut statement = self.connection.prepare(&query)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(bind_values), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (fact_id, status) = row?;
+                let summary = summaries.entry(fact_id).or_default();
+                summary.total += 1;
+                match status.as_str() {
+                    "resolved" => summary.resolved += 1,
+                    "stale" => summary.stale += 1,
+                    _ => summary.unresolved += 1,
+                }
+            }
+        }
+        for candidate in &mut candidates {
+            let source_summary = candidate
+                .source_fact_id
+                .and_then(|fact_id| summaries.get(&fact_id).copied())
+                .unwrap_or_default();
+            let target_summary = candidate
+                .target_fact_id
+                .and_then(|fact_id| summaries.get(&fact_id).copied())
+                .unwrap_or_default();
+            candidate.source_evidence_status = source_summary.status().to_owned();
+            candidate.target_evidence_status = target_summary.status().to_owned();
+            candidate.evidence_status = merge_evidence_status(
+                &candidate.source_evidence_status,
+                &candidate.target_evidence_status,
+            )
+            .to_owned();
+        }
+        Ok(candidates)
+    }
+
+    fn candidate_evidence_status(
+        &self,
+        fact_id: Option<i64>,
+        workspace: &str,
+    ) -> Result<String, StoreError> {
+        let Some(fact_id) = fact_id else {
+            return Ok("missing".to_owned());
+        };
+        Ok(self
+            .fact_evidence_summary(fact_id, workspace)?
+            .status()
+            .to_owned())
+    }
+
+    fn validate_candidate_fact_and_evidence(
+        &self,
+        fact_id: Option<i64>,
+        evidence_id: Option<i64>,
+        workspace: &str,
+        side: &str,
+    ) -> Result<(), StoreError> {
+        if evidence_id.is_some() && fact_id.is_none() {
+            return Err(StoreError::Invalid(format!(
+                "{side} evidence requires a {side} fact"
+            )));
+        }
+        let Some(fact_id) = fact_id else {
+            return Ok(());
+        };
+        if self.fact_by_id(fact_id, workspace)?.is_none() {
+            return Err(StoreError::Invalid(format!(
+                "{side} fact not found: {fact_id}"
+            )));
+        }
+        let Some(evidence_id) = evidence_id else {
+            return Ok(());
+        };
+        let evidence_exists = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM evidence
+                 WHERE id = ?1 AND fact_id = ?2
+                   AND (workspace_id = '' OR workspace_id = ?3)",
+                params![evidence_id, fact_id, workspace],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if evidence_exists.is_none() {
+            return Err(StoreError::Invalid(format!(
+                "{side} evidence not found for fact: {evidence_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn mark_relation_candidate_conflict(
+        &self,
+        id: i64,
+        note: &str,
+        workspace: &str,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE relation_candidates
+             SET status = 'conflict', review_note = ?1,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?2 AND workspace_id = ?3",
+            params![note, id, workspace],
+        )?;
+        Ok(())
+    }
+
+    fn candidate_fact_context(
+        &self,
+        fact_id: i64,
+        workspace: &str,
+    ) -> Result<Option<(String, Option<i64>)>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT CASE WHEN trim(f.domain) <> '' THEN trim(f.domain)
+                              ELSE COALESCE(c.name, '') END,
+                        (SELECT e.id FROM evidence e
+                         WHERE e.fact_id = f.id
+                           AND (e.workspace_id = '' OR e.workspace_id = ?2)
+                         ORDER BY e.id LIMIT 1)
+                 FROM facts f
+                 LEFT JOIN categories c ON c.id = f.category_id
+                 WHERE f.id = ?1 AND (f.workspace_id = '' OR f.workspace_id = ?2)",
+                params![fact_id, workspace],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn candidate_scan_facts(
+        &self,
+        workspace: &str,
+        limit: usize,
+    ) -> Result<Vec<CandidateScanFact>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT f.id, f.text, f.sha256, f.workspace_id, f.lifecycle,
+                    source, project, domain, trust, strong, importance, category_id,
+                    validity, session_id, access_count,
+                    CASE WHEN trim(f.domain) <> '' THEN trim(f.domain)
+                         ELSE COALESCE(c.name, '') END,
+                    (SELECT e.id FROM evidence e
+                     WHERE e.fact_id = f.id
+                       AND (e.workspace_id = '' OR e.workspace_id = ?1)
+                     ORDER BY e.id LIMIT 1)
+             FROM facts f
+             LEFT JOIN categories c ON c.id = f.category_id
+             WHERE (f.workspace_id = '' OR f.workspace_id = ?1)
+               AND f.lifecycle != 'forgotten'
+               AND f.validity != 'invalid'
+             ORDER BY f.id
+             LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(params![workspace, limit as i64], |row| {
+                Ok(CandidateScanFact {
+                    fact: map_fact(row)?,
+                    area: row.get(15)?,
+                    evidence_id: row.get(16)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from);
+        rows
+    }
+
+    fn candidate_scan_entities(
+        &self,
+        workspace: &str,
+        limit: usize,
+    ) -> Result<Vec<Entity>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, name, canonical_name, entity_type, aliases, workspace_id
+             FROM entities
+             WHERE workspace_id = ?1
+             ORDER BY id
+             LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(params![workspace, limit as i64], map_entity)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from);
+        rows
     }
 
     fn decision_by_id(&self, id: i64, workspace: &str) -> Result<Option<Decision>, StoreError> {
@@ -5407,6 +6225,36 @@ fn map_relation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Relation> {
     })
 }
 
+fn map_relation_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<RelationCandidate> {
+    Ok(RelationCandidate {
+        id: row.get(0)?,
+        subject: row.get(1)?,
+        subject_entity_id: row.get(2)?,
+        predicate: row.get(3)?,
+        object: row.get(4)?,
+        object_entity_id: row.get(5)?,
+        relation_type: row.get(6)?,
+        direction: row.get(7)?,
+        score: row.get(8)?,
+        confidence: row.get(9)?,
+        source_fact_id: row.get(10)?,
+        target_fact_id: row.get(11)?,
+        source_evidence_id: row.get(12)?,
+        target_evidence_id: row.get(13)?,
+        source_evidence_status: "missing".to_owned(),
+        target_evidence_status: "missing".to_owned(),
+        evidence_status: "missing".to_owned(),
+        provenance: row.get(14)?,
+        status: row.get(15)?,
+        relation_id: row.get(16)?,
+        reviewer: row.get(17)?,
+        review_note: row.get(18)?,
+        workspace: row.get(19)?,
+        created_at: row.get(20)?,
+        updated_at: row.get(21)?,
+    })
+}
+
 fn map_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<Decision> {
     Ok(Decision {
         id: row.get(0)?,
@@ -5637,6 +6485,162 @@ fn validate_relation_spec(spec: &RelationSpec) -> Result<(), StoreError> {
         ));
     }
     Ok(())
+}
+
+fn validate_relation_candidate_spec(spec: &RelationCandidateSpec) -> Result<(), StoreError> {
+    validate_graph_workspace(&spec.workspace)?;
+    for (value, label) in [
+        (&spec.subject, "candidate subject"),
+        (&spec.predicate, "candidate predicate"),
+        (&spec.object, "candidate object"),
+        (&spec.relation_type, "candidate relation type"),
+        (&spec.direction, "candidate direction"),
+        (&spec.provenance, "candidate provenance"),
+    ] {
+        if value.trim().is_empty() {
+            return Err(StoreError::Invalid(format!("{label} must not be empty")));
+        }
+    }
+    if !matches!(spec.direction.as_str(), "out" | "in" | "undirected") {
+        return Err(StoreError::Invalid(
+            "candidate direction must be out, in, or undirected".to_owned(),
+        ));
+    }
+    for (value, label) in [
+        (spec.score, "candidate score"),
+        (spec.confidence, "candidate confidence"),
+    ] {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(StoreError::Invalid(format!(
+                "{label} must be between 0 and 1"
+            )));
+        }
+    }
+    for (value, label) in [
+        (spec.source_fact_id, "candidate source fact id"),
+        (spec.target_fact_id, "candidate target fact id"),
+        (spec.source_evidence_id, "candidate source evidence id"),
+        (spec.target_evidence_id, "candidate target evidence id"),
+    ] {
+        if value.is_some_and(|id| id <= 0) {
+            return Err(StoreError::Invalid(format!(
+                "{label} must be positive when provided"
+            )));
+        }
+    }
+    if spec.source_fact_id == spec.target_fact_id && spec.source_fact_id.is_some() {
+        return Err(StoreError::Invalid(
+            "candidate source and target facts must differ".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_relation_candidate_status(status: &str) -> Result<(), StoreError> {
+    if matches!(status, "candidate" | "confirmed" | "rejected" | "conflict") {
+        Ok(())
+    } else {
+        Err(StoreError::Invalid(
+            "candidate status must be candidate, confirmed, rejected, or conflict".to_owned(),
+        ))
+    }
+}
+
+fn relation_candidate_key(spec: &RelationCandidateSpec) -> String {
+    let (source_fact_id, target_fact_id) = if spec.direction == "undirected" {
+        canonical_candidate_fact_ids(spec.source_fact_id, spec.target_fact_id)
+    } else {
+        (spec.source_fact_id, spec.target_fact_id)
+    };
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        canonical_name(&spec.subject),
+        canonical_name(&spec.predicate),
+        canonical_name(&spec.object),
+        canonical_name(&spec.relation_type),
+        spec.direction,
+        source_fact_id.unwrap_or_default(),
+        target_fact_id.unwrap_or_default(),
+    )
+}
+
+fn canonical_candidate_fact_ids(
+    source_fact_id: Option<i64>,
+    target_fact_id: Option<i64>,
+) -> (Option<i64>, Option<i64>) {
+    if source_fact_id <= target_fact_id {
+        (source_fact_id, target_fact_id)
+    } else {
+        (target_fact_id, source_fact_id)
+    }
+}
+
+fn relation_candidate_matches(existing: &RelationCandidate, spec: &RelationCandidateSpec) -> bool {
+    existing.subject == spec.subject
+        && existing.predicate == spec.predicate
+        && existing.object == spec.object
+        && existing.relation_type == spec.relation_type
+        && existing.direction == spec.direction
+        && existing.score.to_bits() == spec.score.to_bits()
+        && existing.confidence.to_bits() == spec.confidence.to_bits()
+        && (existing.source_fact_id == spec.source_fact_id
+            && existing.target_fact_id == spec.target_fact_id
+            && existing.source_evidence_id == spec.source_evidence_id
+            && existing.target_evidence_id == spec.target_evidence_id
+            || spec.direction == "undirected"
+                && existing.source_fact_id == spec.target_fact_id
+                && existing.target_fact_id == spec.source_fact_id
+                && existing.source_evidence_id == spec.target_evidence_id
+                && existing.target_evidence_id == spec.source_evidence_id)
+        && existing.provenance == spec.provenance
+}
+
+fn meaningful_fact_terms(text: &str) -> BTreeSet<String> {
+    const STOP_WORDS: &[&str] = &[
+        "about", "after", "also", "from", "have", "into", "more", "that", "their", "there",
+        "these", "this", "using", "with", "will", "would",
+    ];
+    text.split(|character: char| !character.is_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|term| term.chars().count() >= 4)
+        .filter(|term| !STOP_WORDS.contains(&term.as_str()))
+        .collect()
+}
+
+fn entity_label_for_fact(fact: &Fact, entities: &[Entity]) -> Option<(String, Option<i64>)> {
+    let text = fact.text.to_lowercase();
+    entities
+        .iter()
+        .filter_map(|entity| {
+            let references = std::iter::once(entity.canonical_name.as_str())
+                .chain(entity.aliases.iter().map(String::as_str));
+            references
+                .filter(|reference| reference.chars().count() >= 3)
+                .find(|reference| text.contains(&reference.to_lowercase()))
+                .map(|reference| (reference.chars().count(), entity.id, entity.name.clone()))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)))
+        .map(|(_, id, name)| (name, Some(id)))
+}
+
+fn fallback_fact_label(fact: &Fact, area: &str) -> (String, Option<i64>) {
+    if !area.trim().is_empty() {
+        (area.trim().to_owned(), None)
+    } else {
+        (format!("fact:{}", fact.id), None)
+    }
+}
+
+fn merge_evidence_status(source: &str, target: &str) -> &'static str {
+    if source == "resolved" || target == "resolved" {
+        "resolved"
+    } else if source == "stale" || target == "stale" {
+        "stale"
+    } else if source == "unresolved" || target == "unresolved" {
+        "unresolved"
+    } else {
+        "missing"
+    }
 }
 
 fn validate_decision_spec(spec: &DecisionSpec) -> Result<(), StoreError> {
@@ -6630,6 +7634,223 @@ mod tests {
         let verification = store.verify_facts("workspace-a").unwrap();
         assert!(!verification.valid);
         assert_eq!(verification.invalid_ids, vec![important.id]);
+    }
+
+    #[test]
+    fn relation_candidates_are_review_only_bounded_and_workspace_scoped() {
+        let store = Store::in_memory().expect("fresh store");
+        let source = store
+            .remember_fact_with_metadata(
+                "Rust uses SQLite for durable memory",
+                "workspace-a",
+                &FactMetadata {
+                    domain: "runtime".to_owned(),
+                    ..FactMetadata::default()
+                },
+            )
+            .expect("source fact");
+        let target = store
+            .remember_fact_with_metadata(
+                "SQLite stores durable records for applications",
+                "workspace-a",
+                &FactMetadata {
+                    domain: "storage".to_owned(),
+                    ..FactMetadata::default()
+                },
+            )
+            .expect("target fact");
+        let other_workspace_target = store
+            .remember_fact_with_metadata(
+                "SQLite stores durable records for another workspace",
+                "workspace-b",
+                &FactMetadata {
+                    domain: "storage".to_owned(),
+                    ..FactMetadata::default()
+                },
+            )
+            .expect("other workspace target fact");
+        let source_evidence = store
+            .attach_evidence(&EvidenceSpec {
+                fact_id: source.id,
+                source_ref: "test:source".to_owned(),
+                source: "test".to_owned(),
+                checksum: "source-checksum".to_owned(),
+                fetched_at: None,
+                repository_ref: String::new(),
+                path: String::new(),
+                symbol: String::new(),
+                line_start: None,
+                line_end: None,
+                column_start: None,
+                column_end: None,
+                selected_text: source.text.clone(),
+                resolution_status: "resolved".to_owned(),
+                workspace: "workspace-a".to_owned(),
+            })
+            .expect("source evidence");
+        let target_evidence = store
+            .attach_evidence(&EvidenceSpec {
+                fact_id: target.id,
+                source_ref: "test:target".to_owned(),
+                source: "test".to_owned(),
+                checksum: "target-checksum".to_owned(),
+                fetched_at: None,
+                repository_ref: String::new(),
+                path: String::new(),
+                symbol: String::new(),
+                line_start: None,
+                line_end: None,
+                column_start: None,
+                column_end: None,
+                selected_text: target.text.clone(),
+                resolution_status: "unresolved".to_owned(),
+                workspace: "workspace-a".to_owned(),
+            })
+            .expect("target evidence");
+        let candidates = store
+            .generate_relation_candidates(source.id, "workspace-a", 1)
+            .expect("candidates");
+        assert_eq!(candidates.len(), 1);
+        let candidate = candidates[0].clone();
+        assert_eq!(candidate.status, "candidate");
+        assert_eq!(candidate.direction, "undirected");
+        assert_eq!(candidate.relation_type, "cross_domain");
+        assert_eq!(candidate.source_fact_id, Some(source.id));
+        assert_eq!(candidate.target_fact_id, Some(target.id));
+        assert_eq!(candidate.source_evidence_id, Some(source_evidence.id));
+        assert_eq!(candidate.target_evidence_id, Some(target_evidence.id));
+        assert_eq!(candidate.source_evidence_status, "resolved");
+        assert_eq!(candidate.target_evidence_status, "unresolved");
+        assert_eq!(candidate.evidence_status, "resolved");
+        assert!(candidate.score > 0.0 && candidate.score <= 1.0);
+        assert_eq!(
+            store
+                .search_graph("runtime", "workspace-a")
+                .unwrap()
+                .relations
+                .len(),
+            0
+        );
+        assert_ne!(candidate.target_fact_id, Some(other_workspace_target.id));
+        assert_eq!(
+            store
+                .list_relation_candidates("workspace-a", None, Some("runtime"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let duplicate = store
+            .generate_relation_candidates(source.id, "workspace-a", 1)
+            .expect("duplicate candidate");
+        assert_eq!(duplicate[0].id, candidate.id);
+        let reverse_duplicate = store
+            .generate_relation_candidates(target.id, "workspace-a", 1)
+            .expect("reverse duplicate candidate");
+        assert_eq!(reverse_duplicate[0].id, candidate.id);
+        assert_eq!(
+            store
+                .list_relation_candidates("workspace-b", None, None, 10)
+                .unwrap(),
+            Vec::new()
+        );
+
+        let confirmed = store
+            .confirm_relation_candidate(candidate.id, "reviewer", "supported", "workspace-a")
+            .expect("confirmation")
+            .expect("confirmed candidate");
+        assert_eq!(confirmed.status, "confirmed");
+        assert!(confirmed.relation_id.is_some());
+        assert_eq!(store.list_relations("workspace-a").unwrap().len(), 1);
+        assert_eq!(
+            store
+                .search_graph("runtime", "workspace-a")
+                .unwrap()
+                .relations
+                .len(),
+            1
+        );
+        let export = store
+            .export_snapshot("workspace-a")
+            .expect("candidate export");
+        assert_eq!(export.relation_candidates.len(), 1);
+        let snapshot = store.snapshot_bytes().expect("candidate snapshot");
+        let restored = Store::in_memory().expect("restored store");
+        restored
+            .restore_snapshot_bytes(&snapshot)
+            .expect("restore candidate snapshot");
+        assert_eq!(
+            restored
+                .list_relation_candidates("workspace-a", Some("confirmed"), None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store
+            .confirm_relation_candidate(candidate.id, "reviewer", "repeat", "workspace-b")
+            .unwrap()
+            .is_none());
+
+        let conflict = store.create_relation_candidate(&RelationCandidateSpec {
+            subject: candidate.subject,
+            predicate: candidate.predicate,
+            object: candidate.object,
+            relation_type: candidate.relation_type,
+            direction: candidate.direction,
+            score: (candidate.score + 0.1).min(1.0),
+            confidence: candidate.confidence,
+            source_fact_id: candidate.source_fact_id,
+            target_fact_id: candidate.target_fact_id,
+            source_evidence_id: candidate.source_evidence_id,
+            target_evidence_id: candidate.target_evidence_id,
+            provenance: candidate.provenance,
+            workspace: "workspace-a".to_owned(),
+        });
+        assert!(conflict.is_err());
+        assert_eq!(
+            store
+                .list_relation_candidates("workspace-a", Some("conflict"), None, 10)
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn rejected_relation_candidate_remains_outside_graph() {
+        let store = Store::in_memory().expect("fresh store");
+        let candidate = store
+            .create_relation_candidate(&RelationCandidateSpec {
+                subject: "area-a".to_owned(),
+                predicate: "related_to".to_owned(),
+                object: "area-b".to_owned(),
+                relation_type: "cross_domain".to_owned(),
+                direction: "undirected".to_owned(),
+                score: 0.8,
+                confidence: 0.4,
+                source_fact_id: None,
+                target_fact_id: None,
+                source_evidence_id: None,
+                target_evidence_id: None,
+                provenance: "test:manual".to_owned(),
+                workspace: "workspace-a".to_owned(),
+            })
+            .expect("candidate");
+        let rejected = store
+            .reject_relation_candidate(candidate.id, "reviewer", "not supported", "workspace-a")
+            .expect("rejection")
+            .expect("rejected candidate");
+        assert_eq!(rejected.status, "rejected");
+        assert_eq!(rejected.reviewer, "reviewer");
+        assert_eq!(rejected.review_note, "not supported");
+        assert!(store.list_relations("workspace-a").unwrap().is_empty());
+        assert_eq!(
+            store
+                .list_relation_candidates("workspace-a", Some("rejected"), Some("area-a"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
