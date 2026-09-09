@@ -54,10 +54,11 @@ mirror or a full snapshot read when recovery/checkpoint work requires it. The
 256-revision checkpoint amortizes compatibility-state backup cost while
 keeping a restart's possible replay window bounded.
 
-The compatibility `Store` still supplies the complete 80-tool semantics, so
-native Redis records are a durable pointwise projection and not yet an
-independent native execution engine. A complete snapshot is therefore still
-required at attach/rebuild and at the explicit recovery boundary. Performance
+The compatibility `Store` still supplies the complete 80-tool compatibility
+semantics and the additive diagnostics route, so native Redis records are a
+durable pointwise projection and not yet an independent native execution
+engine. A complete snapshot is therefore still required at attach/rebuild and
+at the explicit recovery boundary. Performance
 efficacy remains `not_claimed` until the paired real-service baseline records
 p50/p95 latency, CPU, Redis wire bytes, SQLite mirror cost, and recovery lag.
 
@@ -71,4 +72,4 @@ p50/p95 latency, CPU, Redis wire bytes, SQLite mirror cost, and recovery lag.
 - The checkpoint policy keeps the snapshot out of the normal per-operation
   transaction and exercises the full compatibility backup only at the bounded
   256-revision interval.
-- The 80-tool route, AppSec, artifact, QA, and PM gates remain unchanged.
+- The 84-tool route, AppSec, artifact, QA, and PM gates remain unchanged.

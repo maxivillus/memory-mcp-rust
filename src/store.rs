@@ -338,6 +338,40 @@ pub struct LifecycleEvent {
     pub created_at: String,
 }
 
+/// Aggregate-only memory access telemetry decoded from a sanitized lifecycle
+/// event. Raw queries, prompts, comments, and payloads are deliberately not
+/// represented by this type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccessTelemetry {
+    pub issue_ref: String,
+    pub run_id: String,
+    pub site: String,
+    pub outcome: String,
+    pub fallback: bool,
+    pub result_count: i64,
+    pub latency_ms: f64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccessTelemetryPage {
+    pub events: Vec<AccessTelemetry>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SchemaDiagnostics {
+    pub schema_version: i64,
+    pub sqlite_user_version: i64,
+    pub required_tables: i64,
+    pub present_tables: i64,
+    pub missing_tables: Vec<String>,
+    pub facts_fts_present: bool,
+    pub facts_fts_readable: bool,
+    pub decisions_fts_present: bool,
+    pub decisions_fts_readable: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandoffSpec {
     pub idempotency_key: String,
@@ -579,6 +613,8 @@ const MAX_EVENT_METADATA_BYTES: usize = 16 * 1024;
 const MAX_RUN_FILES_BYTES: usize = 64 * 1024;
 const MAX_RUN_DIFF_BYTES: usize = 128 * 1024;
 const MAX_DATABASE_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
+const DIAGNOSTIC_SCHEMA_VERSION: i64 = 1;
+const MAX_ACCESS_TELEMETRY_QUERY: usize = 1_000;
 static SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct ConnectionSlot {
@@ -2132,6 +2168,7 @@ impl Store {
 
     /// Read the current vector set without exposing SQLite internals to the
     /// provider or protocol modules.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn fact_embeddings(&self, workspace: &str) -> Result<Vec<FactEmbedding>, StoreError> {
         validate_graph_workspace(workspace)?;
         let mut statement = self.connection.prepare(
@@ -3332,6 +3369,58 @@ impl Store {
         Ok(())
     }
 
+    /// Search the same FTS5/LIKE surface as normal fact retrieval while
+    /// retaining lifecycle states for diagnostics. Callers must not expose
+    /// the returned fact text; this method exists only to classify outcomes.
+    pub fn search_facts_for_diagnostics(
+        &self,
+        query: &str,
+        workspace: &str,
+    ) -> Result<Vec<Fact>, StoreError> {
+        validate_graph_workspace(workspace)?;
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let fts_query = query
+            .split_whitespace()
+            .map(|term| format!("\"{}\"", term.replace('"', "")))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let mut statement = self.connection.prepare(
+            "SELECT f.id, f.text, f.sha256, f.workspace_id, f.lifecycle,
+                    f.source, f.project, f.domain, f.trust, f.strong, f.importance,
+                    f.category_id, f.validity, f.session_id, f.access_count
+             FROM facts_fts
+             JOIN facts f ON f.id = facts_fts.rowid
+             WHERE facts_fts MATCH ?1
+               AND (f.workspace_id = '' OR f.workspace_id = ?2)
+             ORDER BY f.id
+             LIMIT 1000",
+        )?;
+        let rows = statement
+            .query_map(params![fts_query, workspace], map_fact)?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !rows.is_empty() {
+            return Ok(rows);
+        }
+        let like = format!("%{}%", query);
+        let mut fallback = self.connection.prepare(
+            "SELECT id, text, sha256, workspace_id, lifecycle,
+                    source, project, domain, trust, strong, importance, category_id,
+                    validity, session_id, access_count
+             FROM facts
+             WHERE text LIKE ?1
+               AND (workspace_id = '' OR workspace_id = ?2)
+             ORDER BY id
+             LIMIT 1000",
+        )?;
+        let rows = fallback
+            .query_map(params![like, workspace], map_fact)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)?;
+        Ok(rows)
+    }
+
     pub fn search_facts(&self, query: &str, workspace: &str) -> Result<Vec<Fact>, StoreError> {
         self.search_facts_with_filters(query, workspace, &FactFilters::default())
     }
@@ -3834,6 +3923,54 @@ impl Store {
             .query_map(params![workspace], map_lifecycle_event)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Read only the sanitized aggregate metadata used by `audit_coverage`.
+    /// Filtering stays parameterized and the payload-bearing context is never
+    /// selected by this query.
+    pub fn query_access_telemetry(
+        &self,
+        workspace: &str,
+        issue_ref: &str,
+        run_id: &str,
+        site: &str,
+        limit: usize,
+    ) -> Result<AccessTelemetryPage, StoreError> {
+        validate_context_workspace(workspace)?;
+        if !(1..=MAX_ACCESS_TELEMETRY_QUERY).contains(&limit) {
+            return Err(StoreError::Invalid(
+                "access telemetry limit must be between 1 and 1000".to_owned(),
+            ));
+        }
+        let fetch_limit = (limit + 1) as i64;
+        let mut statement = self.connection.prepare(
+            "SELECT metadata, created_at
+             FROM lifecycle_events
+             WHERE workspace_id = ?1
+               AND event_type = 'memory-access'
+               AND (?2 = '' OR json_extract(metadata, '$.telemetry.issue_ref') = ?2)
+               AND (?3 = '' OR json_extract(metadata, '$.telemetry.run_id') = ?3)
+               AND (?4 = '' OR json_extract(metadata, '$.telemetry.site') = ?4)
+             ORDER BY id DESC
+             LIMIT ?5",
+        )?;
+        let rows = statement
+            .query_map(
+                params![workspace, issue_ref, run_id, site, fetch_limit],
+                |row| {
+                    let metadata = row.get::<_, String>(0)?;
+                    let created_at = row.get::<_, String>(1)?;
+                    Ok((metadata, created_at))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let truncated = rows.len() > limit;
+        let events = rows
+            .into_iter()
+            .take(limit)
+            .map(|(metadata, created_at)| parse_access_telemetry(&metadata, created_at))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(AccessTelemetryPage { events, truncated })
     }
 
     pub fn begin_handoff(&self, spec: &HandoffSpec) -> Result<Handoff, StoreError> {
@@ -4670,6 +4807,107 @@ impl Store {
         Ok(Stats { facts, contexts })
     }
 
+    /// Check the read-only schema surface without exposing the database path
+    /// or any stored payload. The table names are a fixed allowlist so this
+    /// probe cannot turn caller input into SQL identifiers.
+    pub fn diagnostic_schema(&self) -> Result<SchemaDiagnostics, StoreError> {
+        const REQUIRED_TABLES: [&str; 19] = [
+            "facts",
+            "contexts",
+            "workspaces",
+            "memory_database_state",
+            "memory_database_catalog",
+            "context_lineage",
+            "lifecycle_events",
+            "handoffs",
+            "entities",
+            "relations",
+            "decisions",
+            "evidence",
+            "categories",
+            "fact_history",
+            "fact_embeddings",
+            "decision_embeddings",
+            "runs",
+            "measurement_observations",
+            "memory_feedback",
+        ];
+        let mut missing_tables = Vec::new();
+        for table in REQUIRED_TABLES {
+            let present: bool = self.connection.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = ?1
+                 )",
+                params![table],
+                |row| row.get(0),
+            )?;
+            if !present {
+                missing_tables.push(table.to_owned());
+            }
+        }
+        let table_present = |name: &str| -> Result<bool, StoreError> {
+            self.connection
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                         WHERE type = 'table' AND name = ?1
+                     )",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .map_err(StoreError::from)
+        };
+        let facts_fts_present = table_present("facts_fts")?;
+        let decisions_fts_present = table_present("decisions_fts")?;
+        let facts_fts_readable = if facts_fts_present {
+            self.connection
+                .query_row("SELECT 1 FROM facts_fts LIMIT 1", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .optional()
+                .is_ok_and(|row| row.is_some())
+                || self
+                    .connection
+                    .query_row("SELECT COUNT(*) FROM facts_fts", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .is_ok()
+        } else {
+            false
+        };
+        let decisions_fts_readable = if decisions_fts_present {
+            self.connection
+                .query_row("SELECT 1 FROM decisions_fts LIMIT 1", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .optional()
+                .is_ok_and(|row| row.is_some())
+                || self
+                    .connection
+                    .query_row("SELECT COUNT(*) FROM decisions_fts", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .is_ok()
+        } else {
+            false
+        };
+        let sqlite_user_version = self
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        Ok(SchemaDiagnostics {
+            schema_version: DIAGNOSTIC_SCHEMA_VERSION,
+            sqlite_user_version,
+            required_tables: REQUIRED_TABLES.len() as i64,
+            present_tables: (REQUIRED_TABLES.len() - missing_tables.len()) as i64,
+            missing_tables,
+            facts_fts_present,
+            facts_fts_readable,
+            decisions_fts_present,
+            decisions_fts_readable,
+        })
+    }
+
     pub fn forget_fact(&self, id: i64, workspace: &str) -> Result<Option<Fact>, StoreError> {
         self.update_fact_lifecycle(id, workspace, "forgotten")
     }
@@ -5297,6 +5535,76 @@ fn sha256(text: &str) -> String {
     encode(Sha256::digest(text.as_bytes()))
 }
 
+fn parse_access_telemetry(
+    metadata: &str,
+    created_at: String,
+) -> Result<AccessTelemetry, StoreError> {
+    let value: serde_json::Value = serde_json::from_str(metadata).map_err(|_| {
+        StoreError::Invalid("memory access telemetry metadata is invalid".to_owned())
+    })?;
+    let telemetry = value
+        .get("telemetry")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            StoreError::Invalid("memory access telemetry metadata is incomplete".to_owned())
+        })?;
+    let string_field = |key: &str| {
+        telemetry
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    };
+    let outcome = string_field("outcome");
+    if !matches!(
+        outcome.as_str(),
+        "succeeded"
+            | "fallback"
+            | "failed"
+            | "abstained"
+            | "timeout"
+            | "unsupported"
+            | "unavailable"
+    ) {
+        return Err(StoreError::Invalid(
+            "memory access telemetry outcome is invalid".to_owned(),
+        ));
+    }
+    let fallback = telemetry
+        .get("fallback")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            StoreError::Invalid("memory access telemetry fallback is invalid".to_owned())
+        })?;
+    let result_count = telemetry
+        .get("result_count")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            StoreError::Invalid("memory access telemetry result count is invalid".to_owned())
+        })?;
+    let latency_ms = telemetry
+        .get("latency_ms")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| {
+            StoreError::Invalid("memory access telemetry latency is invalid".to_owned())
+        })?;
+    if result_count < 0 || !latency_ms.is_finite() || latency_ms < 0.0 {
+        return Err(StoreError::Invalid(
+            "memory access telemetry values are out of range".to_owned(),
+        ));
+    }
+    Ok(AccessTelemetry {
+        issue_ref: string_field("issue_ref"),
+        run_id: string_field("run_id"),
+        site: string_field("site"),
+        outcome,
+        fallback,
+        result_count,
+        latency_ms,
+        created_at,
+    })
+}
+
 fn map_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Fact> {
     Ok(Fact {
         id: row.get(0)?,
@@ -5921,6 +6229,18 @@ mod tests {
             .put_context("too-large", "Too large", &long_context, "workspace-a")
             .is_err());
         assert!(store.context("too-large", "workspace-a").unwrap().is_none());
+    }
+
+    #[test]
+    fn diagnostic_fact_search_surfaces_fts_read_errors() {
+        let store = Store::in_memory().expect("fresh store");
+        store
+            .connection
+            .execute("DROP TABLE facts_fts", [])
+            .expect("drop test FTS table");
+        assert!(store
+            .search_facts_for_diagnostics("read failure", "workspace-a")
+            .is_err());
     }
 
     #[test]

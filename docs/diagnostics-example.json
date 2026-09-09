@@ -1,0 +1,95 @@
+{
+  "capabilities_doctor": {
+    "status": "ok",
+    "server": {
+      "name": "memory-mcp",
+      "version": "0.23.0"
+    },
+    "tools": {
+      "count": 84,
+      "bounded": true
+    },
+    "scope": {
+      "workspace_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "explicit": true,
+      "requires_explicit": true
+    },
+    "memory_policy": "advisory_only",
+    "next_action": "run search_diagnose for the requested workspace"
+  },
+  "search_diagnose": {
+    "status": "no_match",
+    "reason_code": "no_matching_facts",
+    "bounded": true,
+    "query_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "scope": {
+      "workspace_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "explicit": true
+    },
+    "matches": {
+      "total": 0,
+      "active": 0,
+      "stale": 0,
+      "conflicts": 0
+    },
+    "fallback": {
+      "attempted": false,
+      "used": false,
+      "selected": "lexical"
+    },
+    "memory_policy": "advisory_only",
+    "next_action": "broaden the query or consult reviewed evidence"
+  },
+  "audit_coverage": {
+    "status": "ok",
+    "bounded": true,
+    "scope": {
+      "workspace_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "issue_ref": "NTSI-893",
+      "run_id": "run-example",
+      "site": "search"
+    },
+    "coverage": {
+      "attempted": 2,
+      "succeeded": 1,
+      "fallback": 1,
+      "failed": 0,
+      "latency_ms": {
+        "count": 2,
+        "min": 12,
+        "median": 18,
+        "p95": 24,
+        "max": 24
+      }
+    },
+    "mapping": {
+      "issue": 2,
+      "run": 2,
+      "unmapped": 0
+    },
+    "telemetry_gap": false,
+    "memory_policy": "advisory_only",
+    "next_action": "continue collecting independent coverage samples"
+  },
+  "measurement_status": {
+    "status": "not_claimed",
+    "reason": "not_claimed",
+    "bounded": true,
+    "measurement_id": "measurement-example",
+    "min_pairs": 10,
+    "observations": {
+      "baseline": 6,
+      "memory": 5,
+      "paired_samples": 4
+    },
+    "missing_pairs": {
+      "baseline": 4,
+      "memory": 5
+    },
+    "readiness": "insufficient_pairs",
+    "independent_check": "not_run",
+    "efficacy": "not_claimed",
+    "memory_policy": "advisory_only",
+    "next_action": "collect the missing baseline and memory pairs"
+  }
+}

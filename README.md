@@ -1,7 +1,8 @@
 # memory-mcp-rust
 
 `memory-mcp-rust` is a Rust MCP server: one executable, newline-delimited
-JSON-RPC 2.0, and 80 advertised tools for durable, searchable memory.
+JSON-RPC 2.0, and 84 advertised tools for durable, searchable memory (80
+upstream compatibility tools plus 4 native diagnostics tools).
 
 The default backend is bundled SQLite with FTS5. When a supported loopback
 Redis endpoint is configured and reachable, Redis becomes the primary backend
@@ -15,8 +16,9 @@ decision source.
   response per request with an id. Notifications produce no response;
   diagnostics go to stderr.
 - The server identity `memory-mcp` version `0.23.0` during initialization.
-- Exactly 80 tools in `tools/list`; the compatibility alias `add_fact` is
-  callable but intentionally not advertised.
+- Exactly 84 tools in `tools/list`: 80 upstream compatibility tools and 4 native
+  read-only diagnostics tools. The compatibility alias `add_fact` is callable
+  but intentionally not advertised.
 - Durable facts, immutable context artifacts, lifecycle events, typed
   handoffs, run records, measurements, provenance, graphs, decisions,
   databases, and workspaces.
@@ -263,13 +265,27 @@ until paired aggregate measurements reach their configured sample threshold.
 
 | Tool | Purpose |
 | --- | --- |
-| `capture_event` | Capture one sanitized, byte-bounded lifecycle envelope behind an immutable context ref with idempotent retries. |
+| `capture_event` | Capture one sanitized, byte-bounded lifecycle envelope behind an immutable context ref with idempotent retries. `event_kind=memory-access` accepts aggregate telemetry only: opaque issue/run/site references, outcome, fallback, result count, latency, and an optional query hash. |
 | `list_events` | List lifecycle-event metadata in one exact workspace. |
 | `read_event` | Read one bounded sanitized lifecycle envelope by event reference or idempotency key. |
 | `handoff_begin` | Create an expiring typed handoff over one immutable context with owner, workspace, checksum, and optional idempotency. |
 | `list_handoffs` | List typed handoff metadata and materialize expired open rows as expired before readback. |
 | `handoff_accept` | Atomically accept one open handoff once and return one bounded payload slice after owner/shared, workspace, cwd, and expiry checks. |
 | `handoff_cancel` | Cancel one open handoff exactly once; only the owner may cancel it and terminal rows remain auditable. |
+
+### Диагностика
+
+| Tool | Назначение |
+| --- | --- |
+| `capabilities_doctor` | Возвращает bounded read-only состояние сервера, 84 advertised tools, workspace hash, optional provider state, schema/migration/FTS5 readiness и aggregate telemetry readiness. |
+| `search_diagnose` | Классифицирует результат lexical/semantic/hybrid поиска как `no_match`, `abstained`, `unavailable`, `timeout`, `unsupported`, `stale`, `conflicting`, `scope_mismatch` или `matched`; возвращает только query hash, safe counters, fallback и один `next_action`. |
+| `audit_coverage` | Агрегирует `attempted`, `succeeded`, `fallback`, `failed` и latency для `memory-access` telemetry, связанной с opaque `issue_ref`/`run_id`; при отсутствии или неполноте возвращает `telemetry_gap`. |
+| `measurement_status` | Показывает количество baseline/memory observations и недостающих пар; результат остаётся `not_claimed`, `independent_check` остаётся `not_run`, а efficacy не вычисляется. |
+
+Точные public schemas находятся в [`docs/diagnostic-tools.json`](docs/diagnostic-tools.json),
+а безопасный пример ответа — в [`docs/diagnostics-example.json`](docs/diagnostics-example.json).
+Человеко-читаемые варианты `capabilities/doctor`, `search diagnose`, `audit coverage`
+и `measurement status` поддерживаются как неadvertised compatibility aliases.
 
 ### Runs, measurements, summaries, and feedback
 
@@ -281,6 +297,7 @@ until paired aggregate measurements reach their configured sample threshold.
 | `query_run` | Read one run or a bounded filtered list by state or issue reference. |
 | `record_measurement` | Record one aggregate-only baseline or memory observation for a paired sample; prompts and payloads are rejected. |
 | `query_measurement` | Summarize complete baseline/memory pairs with bounded median and p95 metrics; remains `not_claimed` until the required pairs exist. |
+| `measurement_status` | Show the read-only pair readiness and missing baseline/memory coverage; no efficacy is claimed before 10 complete pairs and an independent check. |
 | `prepare_summary` | Assemble a ready-to-post Markdown summary from the run's own records; it never posts the result. |
 | `query_anchored` | Advisory lookup of facts and decisions attached to a repository path or symbol; it cannot authorize safety-critical work. |
 | `record_feedback` | Record one retry-safe aggregate usage signal without free-text notes or raw payloads. |

@@ -1,4 +1,5 @@
-use crate::backend::{BackendCoordinator, BackendToolError};
+use crate::backend::{BackendCoordinator, BackendStatus, BackendToolError};
+use crate::diagnostics;
 use crate::pipeline;
 use crate::providers;
 use crate::store::{
@@ -143,6 +144,14 @@ enum CallError {
 }
 
 fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> {
+    call_tool_with_backend(params, store, None)
+}
+
+fn call_tool_with_backend(
+    params: Option<&Value>,
+    store: &Store,
+    backend_status: Option<&BackendStatus>,
+) -> Result<Value, CallError> {
     let params = params.and_then(Value::as_object).ok_or_else(|| {
         CallError::InvalidParams("tools/call params must be an object".to_owned())
     })?;
@@ -159,13 +168,13 @@ fn call_tool(params: Option<&Value>, store: &Store) -> Result<Value, CallError> 
             "tools/call arguments must be an object".to_owned(),
         ));
     }
-    if !tools::is_advertised(name) && name != "add_fact" {
+    if !tools::is_supported(name) && name != "add_fact" {
         return Err(CallError::Execution(StoreError::Invalid(format!(
             "unknown tool: {name}"
         ))));
     }
     let arguments = arguments.as_object().expect("object checked above");
-    if let Some(result) = exact_compatibility_route(name, arguments, store)? {
+    if let Some(result) = exact_compatibility_route(name, arguments, store, backend_status)? {
         return Ok(tool_result(result));
     }
     let workspace = arguments
@@ -1278,8 +1287,21 @@ fn exact_compatibility_route(
     name: &str,
     arguments: &Map<String, Value>,
     store: &Store,
+    backend_status: Option<&BackendStatus>,
 ) -> Result<Option<Value>, CallError> {
     let result = match name {
+        "capabilities_doctor" | "capabilities/doctor" => {
+            Some(exact_capabilities_doctor(store, arguments, backend_status)?)
+        }
+        diagnostics::SEARCH_DIAGNOSE | "search diagnose" | "search/diagnose" => {
+            Some(exact_search_diagnose(store, arguments)?)
+        }
+        diagnostics::AUDIT_COVERAGE | "audit coverage" | "audit/coverage" => {
+            Some(exact_audit_coverage(store, arguments)?)
+        }
+        diagnostics::MEASUREMENT_STATUS | "measurement status" | "measurement/status" => {
+            Some(exact_measurement_status(store, arguments)?)
+        }
         "remember_fact" => Some(exact_remember_fact(store, arguments)?),
         "fact_history" => Some(exact_fact_history(store, arguments)?),
         "confirm_fact" => Some(exact_confirm_fact(store, arguments)?),
@@ -2344,17 +2366,37 @@ fn exact_capture_event(store: &Store, arguments: &Map<String, Value>) -> Result<
     if arguments.get("capture").and_then(Value::as_bool) == Some(false) {
         return Ok(json!({"accepted": false, "status": "excluded", "reason": "capture_disabled"}));
     }
-    let payload = arguments
-        .get("payload")
-        .or_else(|| arguments.get("content"))
-        .cloned()
-        .ok_or_else(|| CallError::InvalidParams("payload or content is required".to_owned()))?;
-    let exclusions = event_exclusions(arguments)?;
-    let (sanitized_payload, payload_json, payload_truncated) =
-        prepare_sanitized_json(&payload, &exclusions, MAX_EVENT_PAYLOAD_BYTES)?;
+    let access_telemetry = if kind == "memory-access" {
+        Some(diagnostics::access_telemetry(arguments).map_err(CallError::InvalidParams)?)
+    } else {
+        None
+    };
+    let (payload_format, sanitized_payload, payload_json, payload_truncated) =
+        if let Some(telemetry) = access_telemetry.as_ref() {
+            let payload = json!({"telemetry": telemetry});
+            let serialized = serde_json::to_string(&payload).expect("telemetry serializes");
+            ("json", payload, serialized, false)
+        } else {
+            let payload = arguments
+                .get("payload")
+                .or_else(|| arguments.get("content"))
+                .cloned()
+                .ok_or_else(|| {
+                    CallError::InvalidParams("payload or content is required".to_owned())
+                })?;
+            let exclusions = event_exclusions(arguments)?;
+            let (sanitized_payload, payload_json, payload_truncated) =
+                prepare_sanitized_json(&payload, &exclusions, MAX_EVENT_PAYLOAD_BYTES)?;
+            (
+                if payload.is_string() { "text" } else { "json" },
+                sanitized_payload,
+                payload_json,
+                payload_truncated,
+            )
+        };
     let payload_text = event_payload_text(&sanitized_payload, &payload_json);
     let safe_source = sanitize_event_string(source);
-    let metadata_value = json!({
+    let mut metadata_value = json!({
         "event_id": event_id,
         "session_id": session_id,
         "source": source,
@@ -2362,6 +2404,9 @@ fn exact_capture_event(store: &Store, arguments: &Map<String, Value>) -> Result<
         "path": path,
         "tool_name": tool_name,
     });
+    if let Some(telemetry) = access_telemetry.as_ref() {
+        metadata_value["telemetry"] = telemetry.clone();
+    }
     let (_, metadata_text, _) =
         prepare_sanitized_json(&metadata_value, &HashSet::new(), MAX_EVENT_METADATA_BYTES)?;
     if let Some(existing) = store
@@ -2377,7 +2422,7 @@ fn exact_capture_event(store: &Store, arguments: &Map<String, Value>) -> Result<
         "session_id": sanitize_event_string(session_id),
         "source": safe_source.clone(),
         "tool_name": sanitize_event_string(tool_name),
-        "payload_format": if payload.is_string() { "text" } else { "json" },
+        "payload_format": payload_format,
         "payload": sanitized_payload, "truncated": payload_truncated,
         "sanitized": true,
     });
@@ -2896,6 +2941,70 @@ fn exact_query_measurement(
         "variants": {"baseline": {"observations": baseline, "paired_samples": paired, "unpaired_samples": baseline.saturating_sub(paired)},
                      "memory": {"observations": memory, "paired_samples": paired, "unpaired_samples": memory.saturating_sub(paired)}},
     }))
+}
+
+fn exact_capabilities_doctor(
+    store: &Store,
+    arguments: &Map<String, Value>,
+    backend_status: Option<&BackendStatus>,
+) -> Result<Value, CallError> {
+    let workspace = exact_workspace(arguments)?;
+    Ok(diagnostics::capabilities_doctor(
+        store,
+        workspace,
+        backend_status,
+    ))
+}
+
+fn exact_search_diagnose(
+    store: &Store,
+    arguments: &Map<String, Value>,
+) -> Result<Value, CallError> {
+    let query = required_string(arguments, "query")?;
+    let workspace = exact_workspace(arguments)?;
+    diagnostics::search_diagnose(store, query, workspace, arguments)
+        .map_err(CallError::InvalidParams)
+}
+
+fn exact_audit_coverage(store: &Store, arguments: &Map<String, Value>) -> Result<Value, CallError> {
+    let workspace = exact_workspace(arguments)?;
+    let issue_ref = optional_string(arguments, "issue_ref")?.unwrap_or("");
+    let run_id = optional_string(arguments, "run_id")?.unwrap_or("");
+    let site = optional_string(arguments, "site")?.unwrap_or("");
+    for (value, label) in [(issue_ref, "issue_ref"), (run_id, "run_id"), (site, "site")] {
+        diagnostics::validate_reference(value, label).map_err(CallError::InvalidParams)?;
+    }
+    let limit = optional_usize(arguments, &["limit"], 100)?;
+    if !(1..=1_000).contains(&limit) {
+        return Err(CallError::InvalidParams(
+            "limit must be between 1 and 1000".to_owned(),
+        ));
+    }
+    Ok(diagnostics::audit_coverage(
+        store, workspace, issue_ref, run_id, site, limit,
+    ))
+}
+
+fn exact_measurement_status(
+    store: &Store,
+    arguments: &Map<String, Value>,
+) -> Result<Value, CallError> {
+    let workspace = exact_workspace(arguments)?;
+    let measurement_id = required_string(arguments, "measurement_id")?;
+    diagnostics::validate_reference(measurement_id, "measurement_id")
+        .map_err(CallError::InvalidParams)?;
+    let min_pairs = optional_usize(arguments, &["min_pairs"], 10)?;
+    if !(1..=1_000).contains(&min_pairs) {
+        return Err(CallError::InvalidParams(
+            "min_pairs must be between 1 and 1000".to_owned(),
+        ));
+    }
+    Ok(diagnostics::measurement_status(
+        store,
+        workspace,
+        measurement_id,
+        min_pairs,
+    ))
 }
 
 fn exact_context_map(store: &Store, arguments: &Map<String, Value>) -> Result<Value, CallError> {
@@ -4903,12 +5012,21 @@ fn call_tool_with_coordinator(
             "tools/call arguments must be an object".to_owned(),
         ));
     }
+    let backend_status = matches!(
+        name,
+        diagnostics::CAPABILITIES_DOCTOR | "capabilities/doctor"
+    )
+    .then(|| coordinator.status().ok())
+    .flatten();
     let request = json!({"name": name, "arguments": arguments});
     coordinator
         .execute_tool(
             name,
             request["arguments"].as_object().expect("object checked"),
-            |store| call_tool(Some(&request), store).map_err(call_error_to_backend_error),
+            |store| {
+                call_tool_with_backend(Some(&request), store, backend_status.as_ref())
+                    .map_err(call_error_to_backend_error)
+            },
         )
         .map_err(backend_error_to_call_error)
 }
@@ -5251,7 +5369,7 @@ mod tests {
 
         let list =
             handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, &store).unwrap();
-        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 80);
+        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 84);
         assert!(list["result"]["tools"]
             .as_array()
             .unwrap()
@@ -5288,6 +5406,25 @@ mod tests {
             }
         }
 
+        let doctor = match call_tool_with_coordinator(
+            Some(&json!({
+                "name": diagnostics::CAPABILITIES_DOCTOR,
+                "arguments": {"workspace": "coordinator-diagnostics"}
+            })),
+            &coordinator,
+        ) {
+            Ok(value) => value,
+            Err(_) => panic!("diagnostic doctor crosses the coordinator route"),
+        };
+        let doctor_payload: Value = serde_json::from_str(
+            doctor["content"][0]["text"]
+                .as_str()
+                .expect("coordinator tool response contains text"),
+        )
+        .expect("coordinator doctor payload is JSON");
+        assert_eq!(doctor_payload["backend"]["status"], "available");
+        assert_eq!(doctor_payload["backend"]["backend"], "sqlite");
+
         let _ = std::fs::remove_file(&database);
         let _ = std::fs::remove_file(database.with_extension("outbox.jsonl"));
     }
@@ -5308,6 +5445,334 @@ mod tests {
         .unwrap();
         let text = search["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("SQLite fallback"));
+    }
+
+    #[test]
+    fn diagnostics_tools_expose_bounded_doctor_search_audit_and_measurement_status() {
+        let _environment = isolated_provider_environment();
+        let store = Store::in_memory().unwrap();
+        let listed =
+            handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, &store).unwrap();
+        for name in [
+            "capabilities_doctor",
+            "search_diagnose",
+            "audit_coverage",
+            "measurement_status",
+        ] {
+            assert!(listed["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == name));
+        }
+
+        let doctor = handle_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"capabilities_doctor","arguments":{"workspace":"diagnostics-w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let doctor_payload = tool_payload(&doctor);
+        assert_eq!(doctor_payload["status"], "ok");
+        assert_eq!(doctor_payload["memory_policy"], "advisory_only");
+        assert_eq!(doctor_payload["schema"]["migrations"]["status"], "ready");
+        assert_eq!(
+            doctor_payload["scope"]["workspace_hash"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert!(doctor_payload["tools"]["count"].as_u64().unwrap() <= 128);
+        assert!(doctor_payload.get("authority").is_none());
+
+        let no_match = handle_line(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_diagnose","arguments":{"query":"missing-diagnostic-fact","workspace":"diagnostics-w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let no_match_payload = tool_payload(&no_match);
+        assert_eq!(no_match_payload["status"], "no_match");
+        assert_eq!(no_match_payload["query_hash"].as_str().unwrap().len(), 64);
+        assert!(!no_match_payload
+            .to_string()
+            .contains("missing-diagnostic-fact"));
+
+        let injection_shaped_query = "' OR 1=1 --";
+        let injection_response = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 16,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_diagnose",
+                    "arguments": {
+                        "query": injection_shaped_query,
+                        "workspace": "diagnostics-w"
+                    }
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        let injection_payload = tool_payload(&injection_response);
+        assert_ne!(injection_payload["status"], "matched");
+        assert!(!injection_payload
+            .to_string()
+            .contains(injection_shaped_query));
+
+        let abstained = handle_line(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"search_diagnose","arguments":{"query":"   ","workspace":"diagnostics-w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&abstained)["status"], "abstained");
+
+        let unsupported = handle_line(
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"search_diagnose","arguments":{"query":"semantic fact","mode":"semantic","workspace":"diagnostics-w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&unsupported)["status"], "unsupported");
+
+        let timeout = handle_line(
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"search_diagnose","arguments":{"query":"timeout fact","timeout_ms":0,"workspace":"diagnostics-w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&timeout)["status"], "timeout");
+
+        let mismatch = handle_line(
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"search_diagnose","arguments":{"query":"scope fact","expected_workspace":"other-w","workspace":"diagnostics-w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&mismatch)["status"], "scope_mismatch");
+
+        let fact = store
+            .remember_fact("stale diagnostic fact", "diagnostics-w")
+            .unwrap();
+        store
+            .set_fact_validity(fact.id, "pending", "diagnostics-w")
+            .unwrap();
+        let stale = handle_line(
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"search_diagnose","arguments":{"query":"stale diagnostic","workspace":"diagnostics-w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&stale)["status"], "stale");
+
+        for outcome in [
+            "keep the first diagnostic route",
+            "keep the second diagnostic route",
+        ] {
+            store
+                .record_decision(&DecisionSpec {
+                    category: "diagnostics".to_owned(),
+                    subject: "diagnostic route".to_owned(),
+                    scenario: "conflicting diagnostic".to_owned(),
+                    reasoning: "test-only conflicting outcomes".to_owned(),
+                    outcome: outcome.to_owned(),
+                    confidence: None,
+                    decision_maker: "test".to_owned(),
+                    issue_ref: "NTSI-893".to_owned(),
+                    path: "".to_owned(),
+                    symbol: "".to_owned(),
+                    parent_id: None,
+                    workspace: "diagnostics-w".to_owned(),
+                })
+                .unwrap();
+        }
+        let conflicting = handle_line(
+            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"search_diagnose","arguments":{"query":"conflicting diagnostic","workspace":"diagnostics-w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&conflicting)["status"], "conflicting");
+
+        for (id, outcome, fallback) in [(10, "succeeded", false), (11, "fallback", true)] {
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "capture_event",
+                    "arguments": {
+                        "idempotency_key": format!("diagnostic-access-{id}"),
+                        "event_kind": "memory-access",
+                        "workspace": "diagnostics-w",
+                        "payload": {
+                            "issue_ref": "NTSI-893",
+                            "run_id": "run-diagnostics",
+                            "site": "search",
+                            "outcome": outcome,
+                            "fallback": fallback,
+                            "result_count": id - 8,
+                            "latency_ms": id as f64,
+                            "query_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        }
+                    }
+                }
+            });
+            let response = handle_request(request, &store).unwrap();
+            assert!(!response["result"]["isError"].as_bool().unwrap());
+        }
+        let rejected_raw_telemetry = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "tools/call",
+                "params": {
+                    "name": "capture_event",
+                    "arguments": {
+                        "idempotency_key": "diagnostic-raw-rejected",
+                        "event_kind": "memory-access",
+                        "workspace": "diagnostics-w",
+                        "payload": {"prompt": "do not persist this"}
+                    }
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        assert_eq!(rejected_raw_telemetry["error"]["code"], -32602);
+        assert!(store
+            .list_events("diagnostics-w")
+            .unwrap()
+            .iter()
+            .all(|event| { event.idempotency_key != "diagnostic-raw-rejected" }));
+        let foreign_event = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 15,
+                "method": "tools/call",
+                "params": {
+                    "name": "capture_event",
+                    "arguments": {
+                        "idempotency_key": "diagnostic-access-foreign",
+                        "event_kind": "memory-access",
+                        "workspace": "other-diagnostics-w",
+                        "payload": {
+                            "issue_ref": "NTSI-893",
+                            "run_id": "run-diagnostics",
+                            "site": "search",
+                            "outcome": "succeeded",
+                            "result_count": 99,
+                            "latency_ms": 99.0
+                        }
+                    }
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        assert!(!foreign_event["result"]["isError"].as_bool().unwrap());
+        let coverage = handle_line(
+            r#"{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"audit_coverage","arguments":{"issue_ref":"NTSI-893","run_id":"run-diagnostics","workspace":"diagnostics-w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let coverage_payload = tool_payload(&coverage);
+        assert_eq!(coverage_payload["coverage"]["attempted"], 2);
+        assert_eq!(coverage_payload["coverage"]["succeeded"], 1);
+        assert_eq!(coverage_payload["coverage"]["fallback"], 1);
+        assert_eq!(coverage_payload["telemetry_gap"], false);
+        assert_eq!(coverage_payload["bounded"], true);
+
+        let measurement = handle_line(
+            r#"{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"measurement_status","arguments":{"measurement_id":"diagnostic-measurement","workspace":"diagnostics-w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let measurement_payload = tool_payload(&measurement);
+        assert_eq!(measurement_payload["status"], "not_claimed");
+        assert_eq!(measurement_payload["reason"], "not_claimed");
+        assert_eq!(measurement_payload["missing_pairs"]["baseline"], 10);
+        assert_eq!(measurement_payload["independent_check"], "not_run");
+        assert_eq!(measurement_payload["efficacy"], "not_claimed");
+        assert_eq!(measurement_payload["bounded"], true);
+    }
+
+    #[test]
+    fn diagnostics_surface_sqlite_fts_errors_instead_of_empty_matches() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-mcp-rust-protocol-diagnostics-fts-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("facts.db");
+        let store = Store::open(&path).unwrap();
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute("DROP TABLE facts_fts", [])
+                .expect("drop test FTS table");
+        }
+        let doctor = handle_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"capabilities_doctor","arguments":{"workspace":"diagnostics-w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let doctor_payload = tool_payload(&doctor);
+        assert_eq!(doctor_payload["status"], "degraded");
+        assert_eq!(doctor_payload["schema"]["fts5"]["status"], "degraded");
+        let response = handle_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_diagnose","arguments":{"query":"fts failure","workspace":"diagnostics-w"}}}"#,
+            &store,
+        )
+        .unwrap();
+        let payload = tool_payload(&response);
+        assert_eq!(payload["status"], "unavailable");
+        assert_eq!(payload["reason_code"], "sqlite_fts_read_failed");
+        drop(store);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn diagnostics_aliases_and_fail_closed_outputs_are_supported() {
+        let _environment = isolated_provider_environment();
+        let store = Store::in_memory().unwrap();
+        let aliases = [
+            ("capabilities/doctor", json!({"workspace":"w"}), "status"),
+            (
+                "search diagnose",
+                json!({"query":"","workspace":"w"}),
+                "status",
+            ),
+            ("audit coverage", json!({"workspace":"w"}), "status"),
+            (
+                "measurement status",
+                json!({"measurement_id":"m","workspace":"w"}),
+                "status",
+            ),
+        ];
+        for (id, (name, arguments, key)) in aliases.into_iter().enumerate() {
+            let response = handle_request(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments}
+                }),
+                &store,
+            )
+            .unwrap();
+            assert!(response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(key));
+        }
+        let invalid = handle_request(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": {"name":"search_diagnose","arguments":{"query":"x","mode":"unknown","workspace":"w"}}
+            }),
+            &store,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&invalid)["status"], "unsupported");
     }
 
     #[test]

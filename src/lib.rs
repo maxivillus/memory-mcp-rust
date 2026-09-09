@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod diagnostics;
 pub mod migration;
 pub mod pipeline;
 pub mod protocol;
