@@ -6,8 +6,9 @@ description: >-
   safely absorb candidate facts, read bounded chunks, ingest one reviewed local
   document, select bounded retrieval profiles, anchor facts to local code,
   verify live anchor drift, orient new sessions, detect conflicting outcomes,
-  normalize graph entities, collect fixed usage feedback, collect aggregate
-  paired measurements и проверять ограниченных кандидатов связей — через
+  normalize graph entities, collect fixed usage feedback, and collect aggregate
+  paired measurements, check bounded relation candidates, and diagnose
+  provider/search/telemetry readiness — via the
   memory-mcp MCP tools (shared SQLite+FTS5 store).
 metadata:
   author: local-maintainers
@@ -28,7 +29,8 @@ Use the native `memory-mcp-rust` binary as the MCP stdio server. Do not launch
 this server through Python. The server identifies itself as `memory-mcp` and
 publishes its version and tool schemas through MCP `initialize` and `tools/list`.
 The observed native server version is `0.23.0`.
-The current native tool surface is the following 80 tools:
+The current native tool surface is the following 84 tools: 80 upstream
+compatibility tools plus 4 native read-only diagnostics tools:
 
 ```text
 remember_fact, absorb, chunk_fact, put_context, ingest_document, list_context,
@@ -48,6 +50,7 @@ export, create_database, list_databases, archive_database, backup_database,
 delete_database, select_database, current_database, reset_database,
 create_workspace, list_workspaces, reset_workspace, archive_workspace,
 backup_workspace, decay_sweep, list_forgotten, restore_fact
+capabilities_doctor, search_diagnose, audit_coverage, measurement_status
 ```
 
 The native standalone CLI exposes the migration command
@@ -58,9 +61,34 @@ Python validator invocation in this skill.
 
 ## Tool catalog
 
-The native 80-tool list in the server contract above is the operational
+The native 84-tool list in the server contract above is the operational
 catalog. Schemas, parameters, enum values, limits, and descriptions still come
 from the live MCP `tools/list` response.
+
+## Diagnostic tools
+
+`capabilities_doctor` requires an explicit `workspace` and returns bounded read-only
+server state, advertised tool inventory, scope hash, allowlisted provider state,
+schema/migration/FTS5 readiness, and aggregate telemetry readiness.
+
+`search_diagnose` returns one safe status (`no_match`, `abstained`,
+`unavailable`, `timeout`, `unsupported`, `stale`, `conflicting`,
+`scope_mismatch`, or `matched`), a SHA-256 `query_hash`, bounded counters,
+fallback, and one `next_action`. The raw query is not returned. If the semantic provider
+is disabled, the result is `unsupported` with lexical fallback; SQLite/FTS5 errors
+do not become `no_match`.
+
+`audit_coverage` reads only aggregate `memory-access` metadata from
+`lifecycle_events` and shows attempted/succeeded/fallback/failed, bounded
+latency, issue/run mapping, and `telemetry_gap`. `capture_event` for
+`event_kind=memory-access` accepts only bounded opaque references, outcome,
+fallback, result count, latency, and an optional SHA-256 query hash; raw prompt,
+comment, query, and payload fields are rejected.
+
+`measurement_status` shows baseline/memory observations and missing pairs.
+It always preserves `status=not_claimed`, `efficacy=not_claimed`, and
+`independent_check=not_run`; the default threshold is 10 complete pairs, after which
+an independent QA check is required.
 
 ## Repository and host alignment
 
@@ -76,10 +104,11 @@ from the live MCP `tools/list` response.
   the run/evidence/context/handoff sequence, profile budgets, bounded graph and
   session expansion, and paired-measurement `not_claimed` behavior. Neither
   document grants workflow, routing, lock, gate, or acceptance authority.
-- The server contract remains `memory-mcp` `0.23.0` with 80 tools. Implementation
+- The server contract remains `memory-mcp` `0.23.0` with 84 tools. Implementation
   commits and documentation updates may advance independently, but changes to
   tool names, schemas, limits, profiles, or safety behavior require updating
-  this skill and the project mirror together.
+  this skill, `docs/current-contract.md`, and `docs/diagnostic-tools.json`
+  together.
 
 ## Authority and workspace
 
@@ -332,13 +361,12 @@ is disabled by default and can be rolled back by unsetting
   "safety_critical" is rejected, clipped facts and zero-result telemetry remain
   bounded, and read-only checks return STRONG, WEAK, STALE, REBUILT, or REMOVED
   without overwriting stored resolution_status.
-- Every pull through search_facts, search_semantic, find_precedents,
-  get_provenance, query_anchored and the compose_recall push is recorded in
-  memory_access_events with channel, site, query hash, result count, and
-  latency. Payloads are never stored; retention is capped at
-  MEMORY_MCP_ACCESS_MAX_EVENTS (default 5000 events). stats reports counts, last
-  access, pull hits/misses, and hit_rate. Telemetry is best-effort: a failure
-  never breaks retrieval.
+- `capture_event` with `event_kind=memory-access` stores only aggregate telemetry
+  in `lifecycle_events.metadata`; `audit_coverage` reads it with exact
+  workspace/issue/run/site filters. Payloads are never selected by that audit
+  path, raw prompt/comment/query fields are rejected, and the read is bounded
+  by `limit` (1–1000). Missing, unmapped, truncated, or unreadable telemetry
+  returns `telemetry_gap` or `unavailable`; it never becomes an efficacy claim.
 
 ## Database, workspace, decay, and local boundary
 
@@ -353,14 +381,10 @@ is disabled by default and can be rolled back by unsetting
   databases/; backups/ holds backup artifacts. Use create/list/backup database and
   create/list/reset/archive/backup workspace for management. backup_workspace
   writes sensitive local artifacts atomically under 0700 with 0600 files.
-- Facts age only on ACTIVE days in activity_days (user downtime never ages
-  them). Score = importance x 0.95^active_days since the last search hit:
-  active (score >= 0.25), degraded (score < 0.25; hidden from plain search
-  but reachable through graph/session chains and revived after 3 matching searches
-  (3 matching searches)), forgotten (score <= 0.1; excluded from search and chains,
-  visible only via list_forgotten and restore_fact). Strong and confirmed
-  facts never decay. decay_sweep recomputes lifecycle; active search hits
-  refresh last_accessed_at.
+- `decay_sweep` compares bounded fact timestamps with the requested age limit
+  and moves eligible active facts to `degraded`; strong and confirmed facts do
+  not decay. Retrieval remains scoped and lifecycle states stay visible through
+  the documented review tools.
 - The core is local stdlib/SQLite. absorb, chunk_fact, ingest_document, and
   code-local evidence anchors need no UI, cloud sync, separate code graph,
   or external product. Optional embedding, extraction, recall, and

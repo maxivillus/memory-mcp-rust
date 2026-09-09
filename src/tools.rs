@@ -1,10 +1,11 @@
 use serde_json::{json, Value};
 
-/// The advertised names from the pinned upstream `TOOLS` map.
+/// The advertised names from the pinned upstream `TOOLS` map plus the native
+/// diagnostics extension.
 ///
 /// `add_fact` is intentionally absent: upstream keeps it as a compatibility
 /// handler alias but does not advertise it to clients.
-pub const TOOL_NAMES: [&str; 80] = [
+pub const TOOL_NAMES: [&str; 84] = [
     "remember_fact",
     "absorb",
     "chunk_fact",
@@ -85,11 +86,20 @@ pub const TOOL_NAMES: [&str; 80] = [
     "decay_sweep",
     "list_forgotten",
     "restore_fact",
+    "capabilities_doctor",
+    "search_diagnose",
+    "audit_coverage",
+    "measurement_status",
 ];
 
 pub fn advertised_tools() -> Vec<Value> {
-    serde_json::from_str(include_str!("../docs/upstream-tools.json"))
-        .expect("embedded upstream tool contract is valid JSON")
+    let mut tools: Vec<Value> = serde_json::from_str(include_str!("../docs/upstream-tools.json"))
+        .expect("embedded upstream tool contract is valid JSON");
+    let diagnostics: Vec<Value> =
+        serde_json::from_str(include_str!("../docs/diagnostic-tools.json"))
+            .expect("embedded diagnostic tool contract is valid JSON");
+    tools.extend(diagnostics);
+    tools
 }
 
 #[allow(dead_code)]
@@ -1012,9 +1022,9 @@ pub fn is_advertised(name: &str) -> bool {
     TOOL_NAMES.contains(&name)
 }
 
-/// Compatibility-only candidate endpoints stay out of the pinned upstream
-/// inventory.  The existing advertised graph tools expose the same flow, but
-/// these names make review and confirmation explicit for native clients.
+/// Accept compatibility aliases that are intentionally kept out of the
+/// advertised inventory. MCP clients commonly limit tool names to identifier
+/// characters, while these aliases preserve the native and legacy entrypoints.
 pub fn is_supported(name: &str) -> bool {
     is_advertised(name)
         || matches!(
@@ -1027,6 +1037,13 @@ pub fn is_supported(name: &str) -> bool {
                 | "review_relation_candidates"
                 | "confirm_relation_candidate"
                 | "reject_relation_candidate"
+                | "capabilities/doctor"
+                | "search diagnose"
+                | "search/diagnose"
+                | "audit coverage"
+                | "audit/coverage"
+                | "measurement status"
+                | "measurement/status"
         )
 }
 
@@ -1086,10 +1103,12 @@ mod tests {
 
     #[test]
     fn inventory_has_upstream_count_and_excludes_alias() {
-        assert_eq!(TOOL_NAMES.len(), 80);
+        assert_eq!(TOOL_NAMES.len(), 84);
         assert!(!is_advertised("add_fact"));
         assert!(is_advertised("decay_sweep"));
-        assert_eq!(advertised_tools().len(), 80);
+        assert_eq!(advertised_tools().len(), 84);
+        assert!(is_supported("capabilities/doctor"));
+        assert!(!is_advertised("capabilities/doctor"));
         let put_context = advertised_tools()
             .into_iter()
             .find(|tool| tool["name"] == "put_context")
@@ -1120,5 +1139,20 @@ mod tests {
         assert!(is_state_mutating("reset_workspace"));
         assert!(!is_state_mutating("search_facts"));
         assert!(!is_state_mutating("backup_workspace"));
+        for name in [
+            "capabilities_doctor",
+            "capabilities/doctor",
+            "search_diagnose",
+            "search diagnose",
+            "audit_coverage",
+            "audit coverage",
+            "measurement_status",
+            "measurement status",
+        ] {
+            assert!(
+                !is_state_mutating(name),
+                "diagnostic tool must be read-only: {name}"
+            );
+        }
     }
 }

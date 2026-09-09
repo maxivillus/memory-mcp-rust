@@ -1,0 +1,111 @@
+[
+  {
+    "name": "capabilities_doctor",
+    "description": "Return bounded read-only server, tool, workspace, provider, schema, migration, backend, and telemetry readiness diagnostics.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Required exact workspace scope; only its hash is returned."
+        }
+      },
+      "required": ["workspace"]
+    }
+  },
+  {
+    "name": "search_diagnose",
+    "description": "Explain one bounded advisory search outcome with a query hash, safe status, fallback, scope, and next action; the raw query is never returned or stored.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["lexical", "semantic", "hybrid"],
+          "default": "lexical"
+        },
+        "profile": {
+          "type": "string",
+          "enum": ["balanced", "orientation", "implementation", "review", "incident"],
+          "default": "balanced"
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60000,
+          "default": 2500
+        },
+        "expected_workspace": {
+          "type": "string",
+          "description": "Optional scope assertion; a mismatch returns scope_mismatch."
+        },
+        "workspace": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": ["query", "workspace"]
+    }
+  },
+  {
+    "name": "audit_coverage",
+    "description": "Return bounded aggregate attempted, succeeded, fallback, and latency coverage for sanitized memory-access telemetry mapped to an issue or run.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "issue_ref": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "run_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "site": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000,
+          "default": 100
+        },
+        "workspace": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": ["workspace"]
+    }
+  },
+  {
+    "name": "measurement_status",
+    "description": "Show bounded paired baseline and memory coverage, missing pairs, and not_claimed readiness without calculating an efficacy claim.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "measurement_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "min_pairs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000,
+          "default": 10
+        },
+        "workspace": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": ["measurement_id", "workspace"]
+    }
+  }
+]

@@ -62,14 +62,14 @@ health/revision watcher with a configurable interval and bounded timeout, reads
 only a small revision/health value while the revision is unchanged, fetches
 state deltas in bounded batches, and applies exponential backoff after an
 error. It does not perform a full Redis/SQLite scan on every tick. The watcher
-has a clean stop path and exposes only safe counters/lag state. The 80-tool
+has a clean stop path and exposes only safe counters/lag state. The 84-tool
 coverage check is a hard gate: all advertised tools and the `add_fact` alias
 must use the same coordinator path.
 
 ## Implementation checkpoint
 
 The first implementation slice wires `BackendCoordinator` into the shipped
-stdio server and routes the complete 80-tool inventory plus `add_fact` through
+stdio server and routes the complete 84-tool inventory plus `add_fact` through
 it. Redis currently holds a bounded namespaced SQLite snapshot and revision;
 the local `Store` is the materialized execution engine and SQLite hot standby.
 Stateful calls append to a durable JSONL outbox before execution, publish a
@@ -120,7 +120,8 @@ The implementation is staged behind a coverage gate:
 ## Option A implementation checkpoint
 
 The product decision for the next stage is Option A: Redis is the canonical
-primary for the complete 80-tool surface and SQLite is fallback/standby. The
+primary for the complete 84-tool advertised surface (80 upstream compatibility
+tools plus 4 native diagnostics) and SQLite is fallback/standby. The
 coordinator now enforces that boundary at the state layer:
 
 - a Redis-primary process restores a private in-memory compatibility engine
@@ -155,7 +156,7 @@ adapter cannot be used as acceptance evidence for the full backend.
 
 ## Acceptance evidence
 
-- one dispatcher backend contract covers all 80 advertised tools and the
+- one dispatcher backend contract covers all 84 advertised tools and the
   `add_fact` compatibility alias;
 - reachable Redis integration exercises every operation group and verifies
   workspace/database isolation and replay behavior;
@@ -166,7 +167,7 @@ adapter cannot be used as acceptance evidence for the full backend.
   both Redis and the SQLite standby are durable;
 - idle and steady-write watcher measurements stay within the agreed CPU,
   command, byte, and lag budgets, with no unbounded polling or full scan;
-- the machine-readable route matrix covers all 80 advertised tools and the
+- the machine-readable route matrix covers all 84 advertised tools and the
   `add_fact` alias;
 - no credentials appear in logs, reports, fixtures, or protocol responses;
 - QA and AppSec are green before PM acceptance.
