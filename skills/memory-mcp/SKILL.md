@@ -7,11 +7,12 @@ description: >-
   document, select bounded retrieval profiles, anchor facts to local code,
   verify live anchor drift, orient new sessions, detect conflicting outcomes,
   normalize graph entities, collect fixed usage feedback, and collect aggregate
-  paired measurements, and diagnose provider/search/telemetry readiness — via the
+  paired measurements, check bounded relation candidates, and diagnose
+  provider/search/telemetry readiness — via the
   memory-mcp MCP tools (shared SQLite+FTS5 store).
 metadata:
   author: local-maintainers
-  version: "1.10"
+  version: "1.11"
 ---
 
 # Shared Agent Memory (memory-mcp)
@@ -181,6 +182,40 @@ an independent QA check is required.
 - forget_fact archives obsolete facts; sweep_freshness archives stale facts.
   consolidate LLM-merges paraphrased facts but never strong/confirmed facts.
   facts_for_session and list_sessions provide session-scoped views.
+
+### Связывание кандидатов
+
+- Автоматические кандидаты связей включаются явно: передайте
+  `candidate_linking: true` в
+  `remember_fact`, `ingest_turn`, `absorb` или `search_facts`, либо вызовите явный
+  совместимый маршрут `suggest_relation_candidates`. Каждый
+  вызов ограничивайте
+  `candidate_limit` (1..50), `candidate_scan_limit` (1..1000) и
+  `candidate_min_score` (0..1). Флаг
+  `MEMORY_MCP_CANDIDATE_LINKING=1` включает автоматический маршрут по умолчанию;
+  без него функция отключена.
+- Строки кандидатов содержат данные проверки в пределах workspace. В них есть
+  subject/object, direction, тип связи, score, confidence, ID исходного и
+  целевого fact/evidence, provenance и состояние проверки. Строки `candidate`
+  или `conflict` не создают сущности или связи и не передаются в
+  `search_graph`, `search_facts` или hybrid RRF.
+- Проверяйте кандидатов через `list_relation_candidates` или `search_graph` с
+  `include_candidates: true`. Подтверждайте только через
+  `confirm_relation_candidate` или `remember_relation` с `candidate_id` и
+  `action: "confirm"`; отклоняйте через `reject_relation_candidate`.
+  Подтверждение создаёт обычную связь, а обход графа остаётся ограниченным
+  глубиной 1..2 и возвращает `hops`/`path`.
+- Если генерация кандидатов отключена, недоступна, некорректна или завершилась
+  ошибкой, сохраняйте исходный факт и результат поиска. Автоматическая
+  генерация возвращает `retrieval_impact: "none"` или
+  `candidates_are_review_only`; она не повышает similarity кандидата до факта
+  высокого доверия и не трактует similarity как истину.
+- Измеряйте связывание кандидатов парными наблюдениями baseline/memory с
+  помощью `recall_at_k`, `precision_at_k`, `time_to_first_useful_fact_ms`,
+  `useful_cross_domain_findings`, `false_positive_rate` и
+  `candidate_linking_latency_ms`. Контракт измерений сохраняет
+  `status: "not_claimed"`, пока обе ветки не содержат минимум десять полных
+  пар.
 
 ## safe ingestion and bounded context
 

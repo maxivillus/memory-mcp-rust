@@ -157,6 +157,34 @@ is rejected before provider or recall work, and unknown purpose values fail
 closed. Feedback only records aggregate observations; measurement summaries
 remain `not_claimed` until both baseline and memory variants meet `min_pairs`.
 
+### Связывание кандидатов
+
+Связи-кандидаты создаются только при явном `candidate_linking=true` или через
+явный совместимый маршрут `suggest_relation_candidates`. Генерация ограничена
+`candidate_limit` (1..50), `candidate_scan_limit` (1..1000) и
+`candidate_min_score` (0..1); значение по умолчанию — 8 результатов, 200
+проверяемых фактов и score 0.05. Кандидаты хранятся в отдельной таблице,
+содержат направление, тип, score, confidence, исходные fact/evidence IDs и
+provenance и проходят изоляцию workspace.
+
+`candidate` и `conflict` являются состояниями только для проверки: они не расширяют
+`search_graph`, `search_facts` или hybrid RRF и не создают `relation`. Только
+`confirm_relation_candidate` или `remember_relation` с `candidate_id` и
+`action=confirm` переводит кандидат в `confirmed` и создаёт обычную `relation`.
+`search_facts` с тем же opt-in может добавить ограниченный список для
+возвращённых фактов; этот список не меняет lexical/semantic ranking. Графовый
+поиск использует подтверждённые связи, ограничивает `depth` 1..2
+и возвращает ограниченные `hops`/`path` для объяснения маршрута. Если генерация
+кандидатов отключена, недоступна или завершилась ошибкой, базовый факт и
+текущий поиск остаются доступными; автоматически созданные кандидаты не
+являются фактами высокого доверия.
+
+`candidate_linking_latency_ms`, `recall_at_k`, `precision_at_k`,
+`time_to_first_useful_fact_ms`, `useful_cross_domain_findings` и
+`false_positive_rate` записываются как paired baseline/memory observations.
+Измерительный контракт возвращает `status=not_claimed`, пока в обеих ветках
+нет минимум 10 пар.
+
 ## Persistence contract
 
 - The active SQLite path is `MEMORY_MCP_DB`; without it the default is
@@ -189,6 +217,7 @@ duplicating the SQL implementation.
 | `facts_fts` | FTS5 external-content index over `facts.text`, maintained by insert/update/delete triggers. |
 | `entities` | Display name plus normalized `canonical_name`, type, aliases, workspace, timestamps; unique `(name, workspace_id)`, indexed by `(canonical_name, workspace_id)`. |
 | `relations` | Subject/object entity FKs, predicate, optional source fact, workspace, timestamp; unique `(subject_id, predicate, object_id)`. Entity deletion cascades; source-fact deletion sets the source to null. |
+| `relation_candidates` | Отдельные ограниченные гипотезы связи с `subject`/`object`, `relation_type`, `direction`, `score`, `confidence`, фактами/evidence, provenance и состоянием `candidate\|confirmed\|rejected\|conflict`; область — точный `workspace_id`. Неподтверждённые строки не читаются графовым поиском. |
 | `decisions` | Category, subject, scenario, reasoning, outcome, confidence, decision maker, issue ref, code `path`/`symbol` anchors, optional parent, workspace, timestamps. |
 | `decisions_fts` | FTS5 external-content index over decision scenario, reasoning, and category, maintained by triggers. |
 | `evidence` | Fact FK, source/checksum/fetched metadata, repository ref/path/symbol and line/column range, selected-text hash, resolution status, timestamp; unique `(fact_id, source_ref)`. |

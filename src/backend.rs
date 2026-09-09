@@ -1272,6 +1272,14 @@ fn native_projection_for_workspace(
             &relation,
         )?;
     }
+    for candidate in exported.relation_candidates {
+        push_native_entity(
+            &mut entities,
+            "relation_candidate",
+            &candidate.id.to_string(),
+            &candidate,
+        )?;
+    }
     for decision in exported.decisions {
         push_native_entity(
             &mut entities,

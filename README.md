@@ -185,6 +185,7 @@ features are disabled unless their flag is exactly `1`:
 | `MEMORY_MCP_RECALL=1` | `compose_recall` and `sweep_freshness`. | Uses the LLM/embedding settings when the selected operation needs them. |
 | `MEMORY_MCP_VERIFY=1` | `verify_facts`, `consolidate`, and verification during ingestion. | `MEMORY_MCP_VERIFY_MIN_CONFIDENCE` defaults to `0.8`. |
 | `MEMORY_MCP_CATEGORIZE=1` | LLM batch categorization through `categorize_pending`. | Uses `MEMORY_MCP_LLM_*` settings. |
+| `MEMORY_MCP_CANDIDATE_LINKING=1` | Автоматические ограниченные кандидаты междоменных связей после новых фактов. | `MEMORY_MCP_CANDIDATE_LIMIT` по умолчанию равен `8`, `MEMORY_MCP_CANDIDATE_SCAN_LIMIT` — `200`, а `MEMORY_MCP_CANDIDATE_MIN_SCORE` — `0.05`. Кандидаты остаются доступными только для проверки до подтверждения. |
 | `MEMORY_MCP_CONTEXT_MAP=1` | Opt-in `context_map` repository-context manifest. | No model is required. The result remains bounded and advisory. |
 
 The LLM provider defaults to `ollama` with model `qwen2.5:14b`; the embedding
@@ -309,8 +310,8 @@ and `measurement status` are supported as non-advertised compatibility aliases.
 | Tool | Purpose |
 | --- | --- |
 | `remember_entity` | Upsert an entity node with a workspace-local name, type, and optional aliases. |
-| `remember_relation` | Record and deduplicate a subject-predicate-object edge; referenced entities are created automatically. |
-| `search_graph` | Run a bounded breadth-first search over relations in both directions. |
+| `remember_relation` | Сохраняет и устраняет дубликаты ребра subject-predicate-object; указанные сущности создаются автоматически. С `candidate_id` подтверждает или отклоняет кандидата, доступного только для проверки. |
+| `search_graph` | Выполняет ограниченный поиск в ширину по подтверждённым связям в обоих направлениях. `include_candidates` перечисляет ограниченные гипотезы для проверки, не меняя обход. |
 | `record_decision` | Persist a decision with category, scenario, reasoning, outcome, confidence, maker, issue/code anchors, and optional parent. |
 | `query_decisions` | List decisions with filters for category, subject, outcome, maker, issue, path, or symbol. |
 | `find_precedents` | Advisory BM25 lookup of similar decision scenarios; it cannot authorize safety-critical work. |
@@ -319,6 +320,30 @@ and `measurement status` are supported as non-advertised compatibility aliases.
 | `attach_evidence` | Link a fact to a source and optional code-local anchor, deduplicated by fact and source reference. |
 | `detect_conflicts` | Find near-duplicate facts and decisions with the same subject but distinct outcomes. |
 | `export_rdf` | Export bounded W3C PROV-flavoured Turtle records for facts, entities, relations, decisions, evidence, and supersession edges. |
+
+#### Связывание кандидатов
+
+`candidate_linking: true` в `remember_fact`, `absorb` или `search_facts` (либо
+`MEMORY_MCP_CANDIDATE_LINKING=1`) включает детерминированные ограниченные
+предложения для фактов из разных областей `domain`/категории. Каждое
+предложение сохраняет исходный и целевой факты, необязательные evidence IDs,
+score, confidence, direction, provenance, workspace и состояние проверки в
+`relation_candidates`.
+
+Предложения являются гипотезами: они не попадают в обычный поиск фактов или
+графовый RRF. Используйте `search_graph` с `include_candidates: true` для
+проверки, затем вызовите `remember_relation` с `candidate_id` и
+`action: "confirm"` (или `"reject"`). Подтверждение создаёт обычную связь и
+делает её исходный факт доступным для ограниченного расширения графа; `depth`
+остаётся в пределах `1..2`, а `limit` графа — `1..200`. Ответы содержат
+объяснение `path` для подтверждённых рёбер.
+
+Пилот кандидатов предоставляет агрегированный контракт метрик
+`recall_at_k`, `precision_at_k`, `time_to_first_useful_fact_ms`,
+`useful_cross_domain_findings`, `false_positive_rate` и
+`candidate_linking_latency_ms`. Эффективность остаётся `not_claimed`, пока не
+доступны десять пар baseline/memory; ни одна метрика не выводится из scores
+кандидатов.
 
 ### Databases and workspaces
 

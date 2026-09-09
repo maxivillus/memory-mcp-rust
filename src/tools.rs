@@ -1022,14 +1022,22 @@ pub fn is_advertised(name: &str) -> bool {
     TOOL_NAMES.contains(&name)
 }
 
-/// Accept the human-readable subcommand spellings as compatibility aliases.
-/// They are intentionally not advertised because MCP clients commonly limit
-/// tool names to identifier characters.
+/// Accept compatibility aliases that are intentionally kept out of the
+/// advertised inventory. MCP clients commonly limit tool names to identifier
+/// characters, while these aliases preserve the native and legacy entrypoints.
 pub fn is_supported(name: &str) -> bool {
     is_advertised(name)
         || matches!(
             name,
-            "capabilities/doctor"
+            "add_fact"
+                | "suggest_relations"
+                | "suggest_relation_candidates"
+                | "relation_candidates"
+                | "list_relation_candidates"
+                | "review_relation_candidates"
+                | "confirm_relation_candidate"
+                | "reject_relation_candidate"
+                | "capabilities/doctor"
                 | "search diagnose"
                 | "search/diagnose"
                 | "audit coverage"
@@ -1072,6 +1080,10 @@ pub fn is_state_mutating(name: &str) -> bool {
             | "handoff_cancel"
             | "remember_entity"
             | "remember_relation"
+            | "suggest_relations"
+            | "suggest_relation_candidates"
+            | "confirm_relation_candidate"
+            | "reject_relation_candidate"
             | "record_decision"
             | "attach_evidence"
             | "create_database"
