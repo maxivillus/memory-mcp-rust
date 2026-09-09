@@ -273,19 +273,19 @@ until paired aggregate measurements reach their configured sample threshold.
 | `handoff_accept` | Atomically accept one open handoff once and return one bounded payload slice after owner/shared, workspace, cwd, and expiry checks. |
 | `handoff_cancel` | Cancel one open handoff exactly once; only the owner may cancel it and terminal rows remain auditable. |
 
-### Диагностика
+### Diagnostics
 
-| Tool | Назначение |
+| Tool | Purpose |
 | --- | --- |
-| `capabilities_doctor` | Возвращает bounded read-only состояние сервера, 84 advertised tools, workspace hash, optional provider state, schema/migration/FTS5 readiness и aggregate telemetry readiness. |
-| `search_diagnose` | Классифицирует результат lexical/semantic/hybrid поиска как `no_match`, `abstained`, `unavailable`, `timeout`, `unsupported`, `stale`, `conflicting`, `scope_mismatch` или `matched`; возвращает только query hash, safe counters, fallback и один `next_action`. |
-| `audit_coverage` | Агрегирует `attempted`, `succeeded`, `fallback`, `failed` и latency для `memory-access` telemetry, связанной с opaque `issue_ref`/`run_id`; при отсутствии или неполноте возвращает `telemetry_gap`. |
-| `measurement_status` | Показывает количество baseline/memory observations и недостающих пар; результат остаётся `not_claimed`, `independent_check` остаётся `not_run`, а efficacy не вычисляется. |
+| `capabilities_doctor` | Returns bounded read-only server state, 84 advertised tools, workspace hash, optional provider state, schema/migration/FTS5 readiness, and aggregate telemetry readiness. |
+| `search_diagnose` | Classifies a lexical/semantic/hybrid search result as `no_match`, `abstained`, `unavailable`, `timeout`, `unsupported`, `stale`, `conflicting`, `scope_mismatch`, or `matched`; returns only a query hash, safe counters, fallback, and one `next_action`. |
+| `audit_coverage` | Aggregates `attempted`, `succeeded`, `fallback`, `failed`, and latency for `memory-access` telemetry associated with opaque `issue_ref`/`run_id`; returns `telemetry_gap` when coverage is absent or incomplete. |
+| `measurement_status` | Shows baseline/memory observation counts and missing pairs; the result remains `not_claimed`, `independent_check` remains `not_run`, and efficacy is not calculated. |
 
-Точные public schemas находятся в [`docs/diagnostic-tools.json`](docs/diagnostic-tools.json),
-а безопасный пример ответа — в [`docs/diagnostics-example.json`](docs/diagnostics-example.json).
-Человеко-читаемые варианты `capabilities/doctor`, `search diagnose`, `audit coverage`
-и `measurement status` поддерживаются как неadvertised compatibility aliases.
+Exact public schemas are in [`docs/diagnostic-tools.json`](docs/diagnostic-tools.json),
+and a safe response example is in [`docs/diagnostics-example.json`](docs/diagnostics-example.json).
+The human-readable variants `capabilities/doctor`, `search diagnose`, `audit coverage`,
+and `measurement status` are supported as non-advertised compatibility aliases.
 
 ### Runs, measurements, summaries, and feedback
 
